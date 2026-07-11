@@ -165,7 +165,7 @@ export default function ConversationPanel(): JSX.Element {
         />
         {sources.length === 0 ? (
           <div className="upload-welcome">
-            <div className="welcome-kicker">AI 经营工作台</div>
+            <div className="welcome-kicker">AI 经营研究室</div>
             <h1>把资料交给系统，生成一份可交付的产品经营报告</h1>
             <p>
               上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会先清洗归类，再在关键节点停下来让你确认。
