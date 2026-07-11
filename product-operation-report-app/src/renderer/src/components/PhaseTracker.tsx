@@ -63,6 +63,22 @@ export default function PhaseTracker(): JSX.Element {
   }
   const doneCount = analysisTasks.filter((task) => isTaskDone(task.id)).length
   const firstPending = analysisTasks.find((task) => !isTaskDone(task.id))
+  const agentStatus =
+    phase === 'cleaning' || phase === 'analyzing'
+      ? 'running'
+      : phase === 'done'
+        ? 'completed'
+        : phase === 'checkpoint1' || phase === 'checkpoint2'
+          ? 'waiting'
+          : 'idle'
+  const agentStatusText =
+    agentStatus === 'running'
+      ? 'Running'
+      : agentStatus === 'completed'
+        ? 'Completed'
+        : agentStatus === 'waiting'
+          ? 'Waiting for review'
+          : 'Ready'
 
   const getTaskStatus = (id: number): TaskStatus => {
     if (isTaskDone(id)) return 'done'
@@ -78,8 +94,30 @@ export default function PhaseTracker(): JSX.Element {
 
   return (
     <div className="pane phase-pane">
-      <div className="pane-title">研究流程</div>
+      <div className="pane-title">AI Agents</div>
       <div className="pane-body">
+        <div className={`agent-card phase-agent ${agentStatus}`}>
+          <div className="agent-card-head">
+            <span className="agent-icon">AI</span>
+            <div>
+              <b>经营分析代理</b>
+              <span>{agentStatusText}</span>
+            </div>
+          </div>
+          <p>{firstPending ? `当前任务：${firstPending.title}` : '当前任务：报告交付'}</p>
+          <div className="agent-progress">
+            <div style={{ width: `${analysisPercent}%` }} />
+          </div>
+          <div className="agent-metrics">
+            <span>Tasks</span>
+            <b>
+              {doneCount}/{analysisTasks.length}
+            </b>
+            <span>Sources</span>
+            <b>{sources.length}</b>
+          </div>
+        </div>
+
         <div className="macro-list">
           {MACROS.map((m, i) => {
             const status = ai > i ? 'done' : ai === i ? 'active' : 'idle'

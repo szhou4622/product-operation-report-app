@@ -25,7 +25,7 @@ export default function ReportPreview(): JSX.Element {
   return (
     <div className={`pane report-pane ${phase === 'checkpoint2' || phase === 'done' ? 'report-ready' : ''}`} style={{ borderRight: 'none' }}>
       <div className="pane-title report-title-bar">
-        <span>{reportMarkdown ? '报告预览' : '报告大纲'}</span>
+        <span>{reportMarkdown ? '报告智能画布' : '报告生成队列'}</span>
         {reportMarkdown && (
           <span className="export-bar">
             <button className="btn xs primary" onClick={() => void exportReport('html')}>
@@ -72,9 +72,9 @@ export default function ReportPreview(): JSX.Element {
           </div>
         ) : (
           <div className="report-body">
-            <div className="report-placeholder-title">报告生成后会进入文档画布</div>
+            <div className="report-placeholder-title">AI 报告代理正在等待可分析资料</div>
             <div className="report-placeholder-copy">
-              系统会把已确认的资料清洗、卖点、人群和内容策略整合成一份可导出的经营报告。
+              资料确认后，系统会把清洗结果、卖点判断、人群画像和内容策略整合成一份可导出的经营报告。
             </div>
             <div className="report-skeleton-list">
               {['结论摘要', '数据来源与使用范围', '产品基础信息', '一方数据判断', '竞品/素材分析', '人群画像与内容主线', '执行选题表'].map((item) => (
