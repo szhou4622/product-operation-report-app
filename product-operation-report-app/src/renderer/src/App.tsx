@@ -48,8 +48,6 @@ export default function App(): JSX.Element {
     settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
 
   const [columns, setColumns] = useState({ left: 240, right: 380 })
-  const isPrepare = phase === 'idle' && sources.length === 0 && !reportMarkdown
-  const isReportStudio = Boolean(reportMarkdown) && (phase === 'checkpoint2' || phase === 'done')
   const needsPrivacyConsent = Boolean(settings && !settings.privacyAccepted)
 
   const acceptPrivacy = async (): Promise<void> => {
@@ -91,7 +89,7 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <div className={`app ${isPrepare ? 'app-prepare' : isReportStudio ? 'app-report' : 'app-workbench'}`}>
+    <div className="app app-workbench">
       <div className="topbar">
         <div className="brand">
           <span className="brand-mark">经营报</span>
@@ -108,39 +106,26 @@ export default function App(): JSX.Element {
         </div>
       </div>
 
-      {isPrepare ? (
-        <div className="prepare-shell">
-          <ConversationPanel />
-          <PhaseTracker />
-        </div>
-      ) : isReportStudio ? (
-        <div className="report-studio-shell">
-          <PhaseTracker />
-          <ConversationPanel />
-          <ReportPreview />
-        </div>
-      ) : (
+      <div
+        className="panes"
+        style={{ gridTemplateColumns: `${columns.left}px 6px minmax(520px, 1fr) 6px ${columns.right}px` }}
+      >
+        <PhaseTracker />
         <div
-          className="panes"
-          style={{ gridTemplateColumns: `${columns.left}px 6px minmax(520px, 1fr) 6px ${columns.right}px` }}
-        >
-          <PhaseTracker />
-          <div
-            className="pane-resizer"
-            role="separator"
-            aria-label="调整资料栏宽度"
-            onMouseDown={(event) => startResize('left', event.clientX)}
-          />
-          <ConversationPanel />
-          <div
-            className="pane-resizer"
-            role="separator"
-            aria-label="调整报告栏宽度"
-            onMouseDown={(event) => startResize('right', event.clientX)}
-          />
-          <ReportPreview />
-        </div>
-      )}
+          className="pane-resizer"
+          role="separator"
+          aria-label="调整资料栏宽度"
+          onMouseDown={(event) => startResize('left', event.clientX)}
+        />
+        <ConversationPanel />
+        <div
+          className="pane-resizer"
+          role="separator"
+          aria-label="调整报告栏宽度"
+          onMouseDown={(event) => startResize('right', event.clientX)}
+        />
+        <ReportPreview />
+      </div>
 
       <SettingsModal />
 
