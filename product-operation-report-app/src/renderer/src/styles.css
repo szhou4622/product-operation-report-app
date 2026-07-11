@@ -2240,8 +2240,12 @@ select {
 }
 
 .brand-mark {
+  width: auto;
+  min-width: 92px;
+  padding: 0 10px;
   background: linear-gradient(135deg, #2563eb, #7c3aed);
   box-shadow: 0 0 24px rgba(37, 99, 235, 0.28);
+  white-space: nowrap;
 }
 
 .brand-main,

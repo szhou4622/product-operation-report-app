@@ -94,7 +94,7 @@ export default function App(): JSX.Element {
     <div className={`app ${isPrepare ? 'app-prepare' : isReportStudio ? 'app-report' : 'app-workbench'}`}>
       <div className="topbar">
         <div className="brand">
-          <span className="brand-mark">经营报</span>
+          <span className="brand-mark">产品经营报告</span>
           <span className="brand-main">AI 经营研究室</span>
           <span className="sub">上传资料 → 经营分析 → 报告交付</span>
         </div>
