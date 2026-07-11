@@ -2326,3 +2326,266 @@ body {
 .markdown-body h3 {
   color: var(--text);
 }
+
+/* ---------- UI 体系校对层：对齐 ai软件ui2，不改变三栏布局 ---------- */
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --surface: #f8fafc;
+  --border: #e5e7eb;
+  --text: #111827;
+  --text-weak: #667085;
+  --primary: #635bff;
+  --primary-weak: #f1f0ff;
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --danger: #ef4444;
+  --radius: 8px;
+  --shadow: 0 1px 2px rgba(17, 24, 39, 0.04), 0 8px 24px rgba(17, 24, 39, 0.05);
+}
+
+body {
+  letter-spacing: 0;
+}
+
+.app {
+  background: var(--bg);
+}
+
+.topbar {
+  background: #fff;
+  border-bottom-color: var(--border);
+}
+
+.brand-mark {
+  border-radius: 7px;
+  background: #111827;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.brand-main {
+  color: #111827;
+}
+
+.model-pill {
+  background: #fff;
+  color: #475467;
+}
+
+.pane {
+  background: #fff;
+  border-color: var(--border);
+  box-shadow: var(--shadow);
+}
+
+.panes .pane {
+  border-radius: 0;
+}
+
+.panes .pane:first-child {
+  border-top-left-radius: var(--radius);
+  border-bottom-left-radius: var(--radius);
+}
+
+.panes .pane:last-child {
+  border-top-right-radius: var(--radius);
+  border-bottom-right-radius: var(--radius);
+}
+
+.pane-title {
+  color: #344054;
+  font-weight: 800;
+}
+
+.btn {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+  color: #111827;
+  font-weight: 700;
+}
+
+.btn:hover {
+  border-color: #cfd5df;
+  background: #fff;
+}
+
+.btn.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  box-shadow: 0 8px 18px rgba(99, 91, 255, 0.16);
+}
+
+.btn.primary:hover {
+  background: #5247e8;
+}
+
+.btn.ok {
+  background: var(--ok);
+  border-color: var(--ok);
+  box-shadow: 0 8px 18px rgba(16, 185, 129, 0.14);
+}
+
+.macro,
+.analysis-flow,
+.source-health,
+.src-row,
+.report-outline-nav,
+.report-canvas,
+.report-body,
+.checkpoint-row {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.macro.active,
+.analysis-task.active {
+  background: var(--primary-weak);
+  border-color: #c7c3ff;
+}
+
+.macro.done,
+.analysis-task.done {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.macro-num,
+.analysis-task-dot {
+  background: #fff;
+  border-color: var(--border);
+  color: #667085;
+  font-weight: 800;
+}
+
+.macro.active .macro-num,
+.analysis-task.active .analysis-task-dot {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.macro.done .macro-num,
+.analysis-task.done .analysis-task-dot {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #fff;
+}
+
+.analysis-task-title i {
+  background: #fff7ed;
+  color: #f59e0b;
+}
+
+.progress-track,
+.analysis-progress-track {
+  background: #edf0f5;
+  border-color: #edf0f5;
+}
+
+.progress-track div,
+.analysis-progress-track div {
+  background: linear-gradient(90deg, var(--primary), #3b82f6);
+}
+
+.src-attr-toggle,
+.src-select,
+.src-note,
+.composer textarea,
+.field input[type='text'],
+.field input[type='password'],
+.field select {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.src-select:focus,
+.src-note:focus,
+.composer textarea:focus,
+.field input:focus,
+.field select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(99, 91, 255, 0.1);
+}
+
+.src-status.ready,
+.structure-ok,
+.test-result.ok {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.src-status.parsing,
+.warnings,
+.msg.checkpoint {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.src-status.error,
+.msg.error,
+.test-result.err,
+.privacy-error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+
+.msg.user {
+  background: var(--primary);
+}
+
+.msg.assistant,
+.msg.report-block {
+  background: #fff;
+  border-color: var(--border);
+  border-radius: var(--radius);
+}
+
+.welcome-kicker {
+  color: var(--primary);
+}
+
+.upload-welcome h1 {
+  color: #111827;
+  font-size: 26px;
+  line-height: 1.32;
+}
+
+.outline-grid span,
+.report-skeleton-list span {
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+  color: #475467;
+}
+
+.report-canvas {
+  box-shadow: none;
+}
+
+.markdown-body h1 {
+  color: #111827;
+  font-size: 24px;
+  font-weight: 800;
+}
+
+.markdown-body h2 {
+  color: #111827;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.markdown-body h3 {
+  color: #344054;
+  font-weight: 800;
+}
+
+.markdown-body th {
+  background: var(--surface);
+}
