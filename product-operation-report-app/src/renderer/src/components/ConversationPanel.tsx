@@ -165,7 +165,7 @@ export default function ConversationPanel(): JSX.Element {
         />
         {sources.length === 0 ? (
           <div className="upload-welcome">
-            <div className="welcome-kicker">AI Command Center</div>
+            <div className="welcome-kicker">AI 指挥中枢</div>
             <h1>让 AI 经营分析中枢接管资料、判断和成稿链路</h1>
             <p>
               上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会先清洗归类，再在关键节点停下来让你确认。
@@ -175,18 +175,18 @@ export default function ConversationPanel(): JSX.Element {
                 <div className="agent-card-head">
                   <span className="agent-icon">AI</span>
                   <div>
-                    <b>Product Strategy Agent</b>
-                    <span>Waiting for source material</span>
+                    <b>产品策略代理</b>
+                    <span>等待资料接入</span>
                   </div>
                 </div>
                 <div className="agent-progress">
                   <div style={{ width: '18%' }} />
                 </div>
                 <div className="agent-metrics">
-                  <span>Input</span>
+                  <span>输入</span>
                   <b>0</b>
-                  <span>Workflow</span>
-                  <b>Ready</b>
+                  <span>流程</span>
+                  <b>就绪</b>
                 </div>
               </div>
               <div className="workflow-preview" aria-label="AI 工作流">
@@ -241,7 +241,7 @@ export default function ConversationPanel(): JSX.Element {
                     {s.kind === 'image' && s.dataUrl ? (
                       <img className="src-thumb" src={s.dataUrl} alt="" />
                     ) : (
-                      <span className="src-ico">{s.parsing ? 'RUN' : s.error ? 'ERR' : 'DOC'}</span>
+                      <span className="src-ico">{s.parsing ? '解析' : s.error ? '异常' : '文档'}</span>
                     )}
                     <span className="src-name" title={s.error || s.name}>
                       {s.name}

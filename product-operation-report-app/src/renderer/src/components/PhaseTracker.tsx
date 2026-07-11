@@ -73,12 +73,12 @@ export default function PhaseTracker(): JSX.Element {
           : 'idle'
   const agentStatusText =
     agentStatus === 'running'
-      ? 'Running'
+      ? '运行中'
       : agentStatus === 'completed'
-        ? 'Completed'
+        ? '已完成'
         : agentStatus === 'waiting'
-          ? 'Waiting for review'
-          : 'Ready'
+          ? '等待复核'
+          : '已就绪'
 
   const getTaskStatus = (id: number): TaskStatus => {
     if (isTaskDone(id)) return 'done'
@@ -94,7 +94,7 @@ export default function PhaseTracker(): JSX.Element {
 
   return (
     <div className="pane phase-pane">
-      <div className="pane-title">AI Agents</div>
+      <div className="pane-title">AI 代理</div>
       <div className="pane-body">
         <div className={`agent-card phase-agent ${agentStatus}`}>
           <div className="agent-card-head">
@@ -109,11 +109,11 @@ export default function PhaseTracker(): JSX.Element {
             <div style={{ width: `${analysisPercent}%` }} />
           </div>
           <div className="agent-metrics">
-            <span>Tasks</span>
+            <span>任务</span>
             <b>
               {doneCount}/{analysisTasks.length}
             </b>
-            <span>Sources</span>
+            <span>资料</span>
             <b>{sources.length}</b>
           </div>
         </div>

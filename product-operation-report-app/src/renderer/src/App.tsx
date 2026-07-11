@@ -7,11 +7,11 @@ import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
 
 const NAV_ITEMS = [
-  { key: 'home', label: 'Home', icon: 'H' },
-  { key: 'workspace', label: 'Workspace', icon: 'W', active: true },
-  { key: 'agents', label: 'AI Agents', icon: 'A' },
-  { key: 'data', label: 'Data', icon: 'D' },
-  { key: 'tasks', label: 'Tasks', icon: 'T' }
+  { key: 'home', label: '首页', icon: '首' },
+  { key: 'workspace', label: '工作台', icon: '工', active: true },
+  { key: 'agents', label: 'AI 代理', icon: '智' },
+  { key: 'data', label: '数据中心', icon: '数' },
+  { key: 'tasks', label: '任务队列', icon: '任' }
 ]
 
 export default function App(): JSX.Element {
@@ -76,7 +76,7 @@ export default function App(): JSX.Element {
             : phase === 'checkpoint2'
               ? '报告复核'
               : '已定稿'
-  const aiStatusText = running ? 'Running' : phase === 'done' ? 'Completed' : 'Waiting'
+  const aiStatusText = running ? '运行中' : phase === 'done' ? '已完成' : '待命中'
   const aiStatusClass = running ? 'running' : phase === 'done' ? 'completed' : 'waiting'
 
   const acceptPrivacy = async (): Promise<void> => {
@@ -124,10 +124,10 @@ export default function App(): JSX.Element {
           <span className="sidebar-logo">AI</span>
           <div>
             <b>经营研究中枢</b>
-            <span>Product Intelligence</span>
+            <span>产品智能系统</span>
           </div>
         </div>
-        <nav className="sidebar-nav" aria-label="Workspace navigation">
+        <nav className="sidebar-nav" aria-label="工作区导航">
           {NAV_ITEMS.map((item) => (
             <div key={item.key} className={`nav-item ${item.active ? 'active' : ''}`}>
               <span>{item.icon}</span>
@@ -135,20 +135,20 @@ export default function App(): JSX.Element {
             </div>
           ))}
           <button className="nav-item nav-button" type="button" onClick={() => setSettingsOpen(true)}>
-            <span>S</span>
-            <b>Settings</b>
+            <span>设</span>
+            <b>设置</b>
           </button>
         </nav>
         <div className={`assistant-status ${aiStatusClass}`}>
           <div className="assistant-status-head">
             <span className="status-dot" />
-            <b>AI Analyst</b>
+            <b>AI 分析师</b>
           </div>
           <p>{aiStatusText}</p>
           <div className="assistant-meter">
             <div style={{ width: `${workflowPercent}%` }} />
           </div>
-          <span>{workflowPercent}% workflow readiness</span>
+          <span>{workflowPercent}% 分析流程就绪度</span>
         </div>
       </aside>
 
@@ -162,21 +162,21 @@ export default function App(): JSX.Element {
             </div>
           </div>
           <label className="global-search">
-            <span>Search</span>
+            <span>搜索</span>
             <input aria-label="全局搜索" placeholder="搜索资料、任务、报告结论" />
           </label>
           <div className="topbar-metrics">
             <div className="metric-pill">
-              <span>Sources</span>
+              <span>资料</span>
               <b>{sources.length}</b>
             </div>
             <div className="metric-pill">
-              <span>Parsed</span>
+              <span>已解析</span>
               <b>{parsedCount}</b>
             </div>
             <div className="metric-pill">
-              <span>Report</span>
-              <b>{reportMarkdown ? 'Ready' : 'Pending'}</b>
+              <span>报告</span>
+              <b>{reportMarkdown ? '已生成' : '待生成'}</b>
             </div>
           </div>
           <div className="right">
