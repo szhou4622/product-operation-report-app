@@ -165,39 +165,11 @@ export default function ConversationPanel(): JSX.Element {
         />
         {sources.length === 0 ? (
           <div className="upload-welcome">
-            <div className="welcome-kicker">AI 指挥中枢</div>
-            <h1>让 AI 经营分析中枢接管资料、判断和成稿链路</h1>
+            <div className="welcome-kicker">AI 经营工作台</div>
+            <h1>把资料交给系统，生成一份可交付的产品经营报告</h1>
             <p>
               上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会先清洗归类，再在关键节点停下来让你确认。
             </p>
-            <div className="welcome-command-grid">
-              <div className="agent-card hero-agent">
-                <div className="agent-card-head">
-                  <span className="agent-icon">AI</span>
-                  <div>
-                    <b>产品策略代理</b>
-                    <span>等待资料接入</span>
-                  </div>
-                </div>
-                <div className="agent-progress">
-                  <div style={{ width: '18%' }} />
-                </div>
-                <div className="agent-metrics">
-                  <span>输入</span>
-                  <b>0</b>
-                  <span>流程</span>
-                  <b>就绪</b>
-                </div>
-              </div>
-              <div className="workflow-preview" aria-label="AI 工作流">
-                {['输入', '分析', '生成', '复核', '交付'].map((item, index) => (
-                  <div key={item} className={`workflow-node ${index === 0 ? 'active' : ''}`}>
-                    <span>{index + 1}</span>
-                    <b>{item}</b>
-                  </div>
-                ))}
-              </div>
-            </div>
             <div className="welcome-actions">
               <button className="btn primary big" onClick={() => fileRef.current?.click()}>
                 上传产品资料
@@ -241,7 +213,7 @@ export default function ConversationPanel(): JSX.Element {
                     {s.kind === 'image' && s.dataUrl ? (
                       <img className="src-thumb" src={s.dataUrl} alt="" />
                     ) : (
-                      <span className="src-ico">{s.parsing ? '解析' : s.error ? '异常' : '文档'}</span>
+                      <span className="src-ico">{s.parsing ? '⏳' : s.error ? '⚠️' : '📄'}</span>
                     )}
                     <span className="src-name" title={s.error || s.name}>
                       {s.name}

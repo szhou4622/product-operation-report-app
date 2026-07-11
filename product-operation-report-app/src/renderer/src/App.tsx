@@ -1,18 +1,9 @@
 import { useEffect, useState } from 'react'
-import { SOP_STEPS } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
 import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
-
-const NAV_ITEMS = [
-  { key: 'home', label: '首页', icon: '首' },
-  { key: 'workspace', label: '工作台', icon: '工', active: true },
-  { key: 'agents', label: 'AI 代理', icon: '智' },
-  { key: 'data', label: '数据中心', icon: '数' },
-  { key: 'tasks', label: '任务队列', icon: '任' }
-]
 
 export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
@@ -60,24 +51,6 @@ export default function App(): JSX.Element {
   const isPrepare = phase === 'idle' && sources.length === 0 && !reportMarkdown
   const isReportStudio = Boolean(reportMarkdown) && (phase === 'checkpoint2' || phase === 'done')
   const needsPrivacyConsent = Boolean(settings && !settings.privacyAccepted)
-  const running = phase === 'cleaning' || phase === 'analyzing'
-  const completedSteps = Math.min(Object.keys(artifacts).length, SOP_STEPS.length)
-  const workflowPercent = Math.round((completedSteps / Math.max(SOP_STEPS.length, 1)) * 100)
-  const parsedCount = sources.filter((s) => s.dataUrl || s.text).length
-  const phaseLabel =
-    phase === 'idle'
-      ? '资料接入'
-      : phase === 'cleaning'
-        ? '智能清洗'
-        : phase === 'checkpoint1'
-          ? '等待确认'
-          : phase === 'analyzing'
-            ? 'AI 分析中'
-            : phase === 'checkpoint2'
-              ? '报告复核'
-              : '已定稿'
-  const aiStatusText = running ? '运行中' : phase === 'done' ? '已完成' : '待命中'
-  const aiStatusClass = running ? 'running' : phase === 'done' ? 'completed' : 'waiting'
 
   const acceptPrivacy = async (): Promise<void> => {
     if (!settings || privacySaving) return
@@ -119,145 +92,88 @@ export default function App(): JSX.Element {
 
   return (
     <div className={`app ${isPrepare ? 'app-prepare' : isReportStudio ? 'app-report' : 'app-workbench'}`}>
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <span className="sidebar-logo">AI</span>
-          <div>
-            <b>经营研究中枢</b>
-            <span>产品智能系统</span>
-          </div>
+      <div className="topbar">
+        <div className="brand">
+          <span className="brand-mark">经营报</span>
+          <span className="brand-main">AI 经营研究室</span>
+          <span className="sub">上传资料 → 经营分析 → 报告交付</span>
         </div>
-        <nav className="sidebar-nav" aria-label="工作区导航">
-          {NAV_ITEMS.map((item) => (
-            <div key={item.key} className={`nav-item ${item.active ? 'active' : ''}`}>
-              <span>{item.icon}</span>
-              <b>{item.label}</b>
-            </div>
-          ))}
-          <button className="nav-item nav-button" type="button" onClick={() => setSettingsOpen(true)}>
-            <span>设</span>
-            <b>设置</b>
+        <div className="right">
+          <span className="model-pill">
+            {active ? `模型：${active.name}（${active.model}）` : '未配置模型'}
+          </span>
+          <button className="btn" onClick={() => setSettingsOpen(true)}>
+            ⚙ 设置
           </button>
-        </nav>
-        <div className={`assistant-status ${aiStatusClass}`}>
-          <div className="assistant-status-head">
-            <span className="status-dot" />
-            <b>AI 分析师</b>
-          </div>
-          <p>{aiStatusText}</p>
-          <div className="assistant-meter">
-            <div style={{ width: `${workflowPercent}%` }} />
-          </div>
-          <span>{workflowPercent}% 分析流程就绪度</span>
         </div>
-      </aside>
+      </div>
 
-      <main className="app-main">
-        <div className="topbar">
-          <div className="ai-state">
-            <span className={`state-light ${aiStatusClass}`} />
-            <div>
-              <b>{phaseLabel}</b>
-              <span>{running ? '系统正在协同处理任务' : '等待你的下一步指令'}</span>
+      {isPrepare ? (
+        <div className="prepare-shell">
+          <ConversationPanel />
+          <PhaseTracker />
+        </div>
+      ) : isReportStudio ? (
+        <div className="report-studio-shell">
+          <PhaseTracker />
+          <ConversationPanel />
+          <ReportPreview />
+        </div>
+      ) : (
+        <div
+          className="panes"
+          style={{ gridTemplateColumns: `${columns.left}px 6px minmax(520px, 1fr) 6px ${columns.right}px` }}
+        >
+          <PhaseTracker />
+          <div
+            className="pane-resizer"
+            role="separator"
+            aria-label="调整资料栏宽度"
+            onMouseDown={(event) => startResize('left', event.clientX)}
+          />
+          <ConversationPanel />
+          <div
+            className="pane-resizer"
+            role="separator"
+            aria-label="调整报告栏宽度"
+            onMouseDown={(event) => startResize('right', event.clientX)}
+          />
+          <ReportPreview />
+        </div>
+      )}
+
+      <SettingsModal />
+
+      {needsPrivacyConsent && (
+        <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">
+          <div className="privacy-card">
+            <div className="privacy-kicker">首次使用确认</div>
+            <h2 id="privacy-title">上传资料会发送到当前配置的 AI 模型服务商</h2>
+            <p>
+              本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给当前模型接口处理。
+              请确认你有权使用这些资料，并已了解相关商业数据会进入你配置的 AI 服务。
+            </p>
+            <div className="privacy-endpoint">
+              <span>当前模型服务</span>
+              <b>{active ? `${active.name} · ${active.baseURL}` : '尚未配置，稍后将在设置中选择模型服务'}</b>
             </div>
-          </div>
-          <label className="global-search">
-            <span>搜索</span>
-            <input aria-label="全局搜索" placeholder="搜索资料、任务、报告结论" />
-          </label>
-          <div className="topbar-metrics">
-            <div className="metric-pill">
-              <span>资料</span>
-              <b>{sources.length}</b>
+            <ul className="privacy-list">
+              <li>软件会尽量在本机保存配置，但 AI 分析需要调用你配置的模型接口。</li>
+              <li>如果资料包含客户隐私、合同、价格政策等敏感信息，请先确认是否允许上传分析。</li>
+              <li>你可以在设置中更换模型服务商或 API Key。</li>
+            </ul>
+            {privacyError && <div className="privacy-error">{privacyError}</div>}
+            <div className="privacy-actions">
+              <button className="btn" onClick={() => setSettingsOpen(true)}>
+                先去设置模型
+              </button>
+              <button className="btn primary" disabled={privacySaving} onClick={() => void acceptPrivacy()}>
+                {privacySaving ? '保存中…' : '我已知晓，继续使用'}
+              </button>
             </div>
-            <div className="metric-pill">
-              <span>已解析</span>
-              <b>{parsedCount}</b>
-            </div>
-            <div className="metric-pill">
-              <span>报告</span>
-              <b>{reportMarkdown ? '已生成' : '待生成'}</b>
-            </div>
-          </div>
-          <div className="right">
-            <span className="model-pill">
-              {active ? `${active.name} · ${active.model}` : '未配置模型'}
-            </span>
-            <button className="btn" onClick={() => setSettingsOpen(true)}>
-              设置
-            </button>
           </div>
         </div>
-
-        <section className="workspace-shell">
-          {isPrepare ? (
-            <div className="prepare-shell">
-              <ConversationPanel />
-              <PhaseTracker />
-            </div>
-          ) : isReportStudio ? (
-            <div className="report-studio-shell">
-              <PhaseTracker />
-              <ConversationPanel />
-              <ReportPreview />
-            </div>
-          ) : (
-            <div
-              className="panes"
-              style={{ gridTemplateColumns: `${columns.left}px 6px minmax(520px, 1fr) 6px ${columns.right}px` }}
-            >
-              <PhaseTracker />
-              <div
-                className="pane-resizer"
-                role="separator"
-                aria-label="调整资料栏宽度"
-                onMouseDown={(event) => startResize('left', event.clientX)}
-              />
-              <ConversationPanel />
-              <div
-                className="pane-resizer"
-                role="separator"
-                aria-label="调整报告栏宽度"
-                onMouseDown={(event) => startResize('right', event.clientX)}
-              />
-              <ReportPreview />
-            </div>
-          )}
-        </section>
-
-        <SettingsModal />
-
-        {needsPrivacyConsent && (
-          <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">
-            <div className="privacy-card">
-              <div className="privacy-kicker">首次使用确认</div>
-              <h2 id="privacy-title">上传资料会发送到当前配置的 AI 模型服务商</h2>
-              <p>
-                本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给当前模型接口处理。
-                请确认你有权使用这些资料，并已了解相关商业数据会进入你配置的 AI 服务。
-              </p>
-              <div className="privacy-endpoint">
-                <span>当前模型服务</span>
-                <b>{active ? `${active.name} · ${active.baseURL}` : '尚未配置，稍后将在设置中选择模型服务'}</b>
-              </div>
-              <ul className="privacy-list">
-                <li>软件会尽量在本机保存配置，但 AI 分析需要调用你配置的模型接口。</li>
-                <li>如果资料包含客户隐私、合同、价格政策等敏感信息，请先确认是否允许上传分析。</li>
-                <li>你可以在设置中更换模型服务商或 API Key。</li>
-              </ul>
-              {privacyError && <div className="privacy-error">{privacyError}</div>}
-              <div className="privacy-actions">
-                <button className="btn" onClick={() => setSettingsOpen(true)}>
-                  先去设置模型
-                </button>
-                <button className="btn primary" disabled={privacySaving} onClick={() => void acceptPrivacy()}>
-                  {privacySaving ? '保存中…' : '我已知晓，继续使用'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </main>
+      )}
     </div>
   )
 }
