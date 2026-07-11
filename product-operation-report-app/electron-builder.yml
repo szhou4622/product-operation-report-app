@@ -1,0 +1,21 @@
+appId: com.example.product-operation-report
+productName: 产品经营报告
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**/*
+  - assets/**/*
+  - package.json
+asarUnpack:
+  - assets/**/*
+mac:
+  target:
+    - dmg
+  category: public.app-category.productivity
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
