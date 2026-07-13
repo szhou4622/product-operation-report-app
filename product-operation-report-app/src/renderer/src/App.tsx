@@ -5,6 +5,8 @@ import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
 
+const SOP_GUIDE_URL = 'https://my.feishu.cn/docx/FU5FdRkHFoNH7JxUp6wciLksnEe'
+
 export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
   const settings = useStore((s) => s.settings)
@@ -96,6 +98,9 @@ export default function App(): JSX.Element {
           <span className="brand-main">AI 经营研究室</span>
           <span className="sub">上传资料 → 经营分析 → 报告交付</span>
         </div>
+        <a className="tutorial-link" href={SOP_GUIDE_URL} target="_blank" rel="noreferrer">
+          使用教程 / SOP 文档
+        </a>
         <div className="right">
           <span className="model-pill">
             {active ? `模型：${active.name}（${active.model}）` : '未配置模型'}
