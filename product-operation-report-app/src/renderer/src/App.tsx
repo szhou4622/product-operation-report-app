@@ -126,8 +126,24 @@ export default function App(): JSX.Element {
             <span className="sub">专业的产品经营分析与报告系统</span>
           </span>
         </div>
-        <a className="tutorial-link" href={SOP_GUIDE_URL} target="_blank" rel="noreferrer">
-          使用教程 / SOP 文档
+        <a className="tutorial-link" href={SOP_GUIDE_URL} target="_blank" rel="noreferrer" aria-label="打开使用教程 SOP 文档">
+          <span className="tutorial-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" focusable="false">
+              <path d="M5.4 2.5h6.1l3.1 3.1v11.9H5.4V2.5Z" />
+              <path d="M11.5 2.8v3h3" />
+              <path d="M7.5 9h5M7.5 12h5M7.5 15h3" />
+            </svg>
+          </span>
+          <span className="tutorial-copy">
+            <span className="tutorial-title">使用教程</span>
+            <span className="tutorial-subtitle">SOP 文档</span>
+          </span>
+          <span className="tutorial-external" aria-hidden="true">
+            <svg viewBox="0 0 16 16" focusable="false">
+              <path d="M6 4h6v6" />
+              <path d="M12 4 5 11" />
+            </svg>
+          </span>
         </a>
         <div className="right">
           <span className="model-pill">
