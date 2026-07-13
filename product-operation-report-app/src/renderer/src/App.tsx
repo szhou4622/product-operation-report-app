@@ -7,6 +7,30 @@ import SettingsModal from './components/SettingsModal'
 
 const SOP_GUIDE_URL = 'https://my.feishu.cn/docx/FU5FdRkHFoNH7JxUp6wciLksnEe'
 
+function ProductLogo(): JSX.Element {
+  return (
+    <svg className="product-logo" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient id="logo-blue" x1="8" y1="6" x2="34" y2="42" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#38BDF8" />
+          <stop offset="1" stopColor="#2563EB" />
+        </linearGradient>
+        <linearGradient id="logo-green" x1="18" y1="12" x2="42" y2="38" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#22C55E" />
+          <stop offset="1" stopColor="#14B8A6" />
+        </linearGradient>
+      </defs>
+      <path
+        d="M24 4 7 13.5v21L17 40V19l7-4 7 4v6.5l-9 5.1V42l19-10.8V13.5L24 4Z"
+        fill="url(#logo-blue)"
+      />
+      <path d="M24 14.8 17 19v21l7 4V27.2l14-8-7-4.1-7 4.1v-4.4Z" fill="url(#logo-green)" />
+      <path d="M24 4 41 13.5l-10 5.7L24 15 17 19 7 13.5 24 4Z" fill="#7DD3FC" opacity="0.9" />
+      <path d="M24 27.2 41 36.8 31 42.5 24 38.5v-11.3Z" fill="#1D4ED8" opacity="0.92" />
+    </svg>
+  )
+}
+
 export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
   const settings = useStore((s) => s.settings)
@@ -94,9 +118,13 @@ export default function App(): JSX.Element {
     <div className="app app-workbench">
       <div className="topbar">
         <div className="brand">
-          <span className="brand-mark">经营报</span>
-          <span className="brand-main">AI 经营研究室</span>
-          <span className="sub">上传资料 → 经营分析 → 报告交付</span>
+          <span className="brand-mark" aria-label="产品经营报告 Logo">
+            <ProductLogo />
+          </span>
+          <span className="brand-copy">
+            <span className="brand-main">产品经营报告</span>
+            <span className="sub">专业的产品经营分析与报告系统</span>
+          </span>
         </div>
         <a className="tutorial-link" href={SOP_GUIDE_URL} target="_blank" rel="noreferrer">
           使用教程 / SOP 文档
