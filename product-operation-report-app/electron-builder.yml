@@ -14,6 +14,7 @@ mac:
     - dmg
   category: public.app-category.productivity
 win:
+  icon: build/icon.ico
   target:
     - nsis
 nsis:
