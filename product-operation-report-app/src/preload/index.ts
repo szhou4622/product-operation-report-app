@@ -44,6 +44,8 @@ const api = {
 
   getSopRules: (): Promise<string> => ipcRenderer.invoke('sop:rules'),
 
+  openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
+
   exportMarkdown: (content: string, name: string): Promise<ExportResult> =>
     ipcRenderer.invoke('export:markdown', { content, name }),
 

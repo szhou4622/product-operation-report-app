@@ -139,7 +139,17 @@ export default function App(): JSX.Element {
             <span className="sub">专业的产品经营分析与报告系统</span>
           </span>
         </div>
-        <a className="tutorial-link" href={SOP_GUIDE_URL} target="_blank" rel="noreferrer" aria-label="打开使用教程 SOP 文档">
+        <a
+          className="tutorial-link"
+          href={SOP_GUIDE_URL}
+          target="_blank"
+          rel="noreferrer"
+          aria-label="打开使用教程 SOP 文档"
+          onClick={(event) => {
+            event.preventDefault()
+            void window.api.openExternal(SOP_GUIDE_URL)
+          }}
+        >
           <span className="tutorial-icon" aria-hidden="true">
             <svg viewBox="0 0 20 20" focusable="false">
               <path d="M5.4 2.5h6.1l3.1 3.1v11.9H5.4V2.5Z" />

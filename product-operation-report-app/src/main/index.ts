@@ -17,6 +17,20 @@ function resolveWindowIcon(): string | undefined {
   return candidates.find((p) => existsSync(p))
 }
 
+function isSafeExternalUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
+async function openExternalUrl(url: string): Promise<void> {
+  if (!isSafeExternalUrl(url)) throw new Error('仅支持打开 http/https 链接')
+  await shell.openExternal(url)
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1280,
@@ -52,8 +66,15 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    void openExternalUrl(details.url)
     return { action: 'deny' }
+  })
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isSafeExternalUrl(url)) {
+      event.preventDefault()
+      void openExternalUrl(url)
+    }
   })
 
   if (process.env['ELECTRON_RENDERER_URL']) {
@@ -66,6 +87,7 @@ function createWindow(): void {
 // ---- IPC：设置 ----
 ipcMain.handle('settings:get', () => loadSettings())
 ipcMain.handle('settings:save', (_e, settings: AppSettings) => saveSettings(settings))
+ipcMain.handle('shell:openExternal', (_e, url: string) => openExternalUrl(url))
 
 // ---- IPC：项目快照（不包含模型配置 / API Key）----
 ipcMain.handle('project:loadLast', () => loadLastProject())

@@ -156,7 +156,15 @@ export default function SettingsModal(): JSX.Element | null {
               <b>ai英雄会</b>
               <span>填入 API Key 后即可开始分析；连通测试和读图测试只是可选排障步骤。</span>
             </div>
-            <a href={CONFIG_GUIDE_URL} target="_blank" rel="noreferrer">
+            <a
+              href={CONFIG_GUIDE_URL}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(event) => {
+                event.preventDefault()
+                void window.api.openExternal(CONFIG_GUIDE_URL)
+              }}
+            >
               打开配置教程
             </a>
           </div>
