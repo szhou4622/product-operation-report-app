@@ -8,6 +8,15 @@ import { parseArchive, parseFile } from './ingest'
 import { exportDocx, exportHtml, exportMarkdown } from './export'
 import { loadLastProject, saveLastProject } from './project'
 
+function resolveWindowIcon(): string | undefined {
+  const candidates = [
+    join(app.getAppPath(), 'assets', 'product-logo.png'),
+    join(__dirname, '../../assets/product-logo.png'),
+    join(process.resourcesPath || '', 'app.asar.unpacked', 'assets', 'product-logo.png')
+  ]
+  return candidates.find((p) => existsSync(p))
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1280,
@@ -16,6 +25,7 @@ function createWindow(): void {
     minHeight: 640,
     show: false,
     title: '产品经营报告',
+    icon: resolveWindowIcon(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
