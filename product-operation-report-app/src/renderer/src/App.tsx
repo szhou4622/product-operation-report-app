@@ -7,6 +7,17 @@ import SettingsModal from './components/SettingsModal'
 
 const SOP_GUIDE_URL = 'https://my.feishu.cn/docx/FU5FdRkHFoNH7JxUp6wciLksnEe'
 
+function openExternalLink(url: string): void {
+  const api = window.api as typeof window.api & { openExternal?: (targetUrl: string) => Promise<void> }
+  if (typeof api.openExternal === 'function') {
+    void api.openExternal(url).catch(() => {
+      window.open(url, '_blank', 'noopener,noreferrer')
+    })
+    return
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
 function ProductLogo(): JSX.Element {
   return (
     <svg className="product-logo" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
@@ -147,7 +158,7 @@ export default function App(): JSX.Element {
           aria-label="打开使用教程 SOP 文档"
           onClick={(event) => {
             event.preventDefault()
-            void window.api.openExternal(SOP_GUIDE_URL)
+            openExternalLink(SOP_GUIDE_URL)
           }}
         >
           <span className="tutorial-icon" aria-hidden="true">

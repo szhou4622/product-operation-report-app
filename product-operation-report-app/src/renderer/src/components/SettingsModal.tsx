@@ -6,6 +6,17 @@ const DEFAULT_PROFILE_NAME = 'ai英雄会'
 const LEGACY_DEFAULT_PROFILE_NAME = '中转API（ai英雄会）'
 const CONFIG_GUIDE_URL = 'https://my.feishu.cn/docx/DrvrdxXguorTW0xrEA8cMK93nCg?from=from_copylink'
 
+function openExternalLink(url: string): void {
+  const api = window.api as typeof window.api & { openExternal?: (targetUrl: string) => Promise<void> }
+  if (typeof api.openExternal === 'function') {
+    void api.openExternal(url).catch(() => {
+      window.open(url, '_blank', 'noopener,noreferrer')
+    })
+    return
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
 function normalizeSettings(settings: AppSettings): AppSettings {
   return {
     ...settings,
@@ -162,7 +173,7 @@ export default function SettingsModal(): JSX.Element | null {
               rel="noreferrer"
               onClick={(event) => {
                 event.preventDefault()
-                void window.api.openExternal(CONFIG_GUIDE_URL)
+                openExternalLink(CONFIG_GUIDE_URL)
               }}
             >
               打开配置教程
