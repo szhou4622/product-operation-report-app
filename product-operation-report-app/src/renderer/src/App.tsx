@@ -74,7 +74,14 @@ export default function App(): JSX.Element {
     settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
 
   const [columns, setColumns] = useState({ left: 240, right: 380 })
+  const [windowWidth, setWindowWidth] = useState(() => window.innerWidth || 1280)
   const needsPrivacyConsent = Boolean(settings && !settings.privacyAccepted)
+
+  useEffect(() => {
+    const onResize = (): void => setWindowWidth(window.innerWidth || 1280)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   const acceptPrivacy = async (): Promise<void> => {
     if (!settings || privacySaving) return
@@ -113,6 +120,12 @@ export default function App(): JSX.Element {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }
+
+  const compactLayout = windowWidth < 1240
+  const leftColumn = Math.max(180, Math.min(columns.left, compactLayout ? 220 : 420))
+  const rightColumn = Math.max(340, Math.min(columns.right, compactLayout ? 360 : 620))
+  const middleMin = compactLayout ? 340 : 520
+  const paneTemplate = `${leftColumn}px 6px minmax(${middleMin}px, 1fr) 6px minmax(340px, ${rightColumn}px)`
 
   return (
     <div className="app app-workbench">
@@ -157,7 +170,7 @@ export default function App(): JSX.Element {
 
       <div
         className="panes"
-        style={{ gridTemplateColumns: `${columns.left}px 6px minmax(520px, 1fr) 6px ${columns.right}px` }}
+        style={{ gridTemplateColumns: paneTemplate }}
       >
         <PhaseTracker />
         <div

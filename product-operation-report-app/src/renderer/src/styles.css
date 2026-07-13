@@ -2858,6 +2858,8 @@ body {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.96);
   box-shadow: var(--shadow);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .panes .pane {
@@ -2893,6 +2895,24 @@ body.resizing .pane-resizer {
   color: #0f172a;
   font-size: 14px;
   font-weight: 800;
+  min-width: 0;
+}
+
+.report-title-bar {
+  min-width: 0;
+}
+
+.report-title-bar > span:first-child {
+  flex: 0 0 auto;
+}
+
+.export-bar {
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+
+.export-bar .btn.xs {
+  white-space: nowrap;
 }
 
 .phase-pane {
