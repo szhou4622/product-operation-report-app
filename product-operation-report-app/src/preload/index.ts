@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSettings,
   ArchiveItem,
+  ActivationResult,
+  ActivationStatus,
   ChatMessage,
   ChatStreamEvent,
   ExportResult,
@@ -20,6 +22,11 @@ export interface ChatHandlers {
 }
 
 const api = {
+  getActivationStatus: (): Promise<ActivationStatus> => ipcRenderer.invoke('activation:status'),
+
+  activate: (code: string): Promise<ActivationResult> =>
+    ipcRenderer.invoke('activation:activate', code),
+
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
 
   saveSettings: (settings: AppSettings): Promise<AppSettings> =>

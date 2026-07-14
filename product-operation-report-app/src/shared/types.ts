@@ -20,6 +20,20 @@ export interface AppSettings {
 }
 
 /** 聊天消息内容块 */
+export interface ActivationStatus {
+  activated: boolean
+  deviceId: string
+  activatedAt?: string
+  licenseId?: string
+  codeCount: number
+}
+
+export interface ActivationResult {
+  ok: boolean
+  message: string
+  status: ActivationStatus
+}
+
 export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'image'; dataUrl: string } // data:image/png;base64,...

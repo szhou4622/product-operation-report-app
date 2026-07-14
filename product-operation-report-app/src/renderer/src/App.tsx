@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
+import type { ActivationStatus } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
 import ConversationPanel from './components/ConversationPanel'
@@ -55,12 +56,26 @@ export default function App(): JSX.Element {
   const steering = useStore((s) => s.steering)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const saveSettings = useStore((s) => s.saveSettings)
+  const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null)
+  const [activationCode, setActivationCode] = useState('')
+  const [activationError, setActivationError] = useState('')
+  const [activationBusy, setActivationBusy] = useState(false)
   const [privacySaving, setPrivacySaving] = useState(false)
   const [privacyError, setPrivacyError] = useState('')
 
   useEffect(() => {
-    void init()
-  }, [init])
+    let alive = true
+    void window.api.getActivationStatus().then((status) => {
+      if (alive) setActivationStatus(status)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (activationStatus?.activated) void init()
+  }, [activationStatus?.activated, init])
 
   useEffect(() => {
     if (!settings) return
@@ -107,6 +122,24 @@ export default function App(): JSX.Element {
     }
   }
 
+  const submitActivation = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    if (activationBusy) return
+    setActivationBusy(true)
+    setActivationError('')
+    try {
+      const result = await window.api.activate(activationCode)
+      if (!result.ok) {
+        setActivationError(result.message)
+      }
+      setActivationStatus(result.status)
+    } catch (error) {
+      setActivationError(error instanceof Error ? error.message : '激活失败，请重试。')
+    } finally {
+      setActivationBusy(false)
+    }
+  }
+
   const startResize = (side: 'left' | 'right', startX: number): void => {
     const start = { ...columns }
     const onMove = (event: MouseEvent): void => {
@@ -137,6 +170,56 @@ export default function App(): JSX.Element {
   const rightColumn = Math.max(340, Math.min(columns.right, compactLayout ? 360 : 620))
   const middleMin = compactLayout ? 340 : 520
   const paneTemplate = `${leftColumn}px 6px minmax(${middleMin}px, 1fr) 6px minmax(340px, ${rightColumn}px)`
+
+  if (!activationStatus) {
+    return (
+      <div className="activation-screen">
+        <div className="activation-card activation-loading">
+          <div className="activation-logo">
+            <ProductLogo />
+          </div>
+          <h1>正在检查激活状态</h1>
+          <p>请稍候，正在读取本机授权信息。</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!activationStatus.activated) {
+    return (
+      <div className="activation-screen">
+        <form className="activation-card" onSubmit={(event) => void submitActivation(event)}>
+          <div className="activation-logo">
+            <ProductLogo />
+          </div>
+          <div className="activation-kicker">产品经营报告</div>
+          <h1>首次使用需要激活</h1>
+          <p>请输入管理员发放的激活码。激活成功后，本设备可永久使用。</p>
+          <label className="activation-field">
+            <span>激活码</span>
+            <input
+              autoFocus
+              value={activationCode}
+              onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
+              placeholder="POR-XXXX-XXXX-XXXX-XXXX"
+              spellCheck={false}
+            />
+          </label>
+          <div className="activation-device">
+            <span>当前设备码</span>
+            <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+          </div>
+          {activationError && <div className="activation-error">{activationError}</div>}
+          <button className="btn primary activation-submit" disabled={activationBusy}>
+            {activationBusy ? '正在激活...' : '激活并进入软件'}
+          </button>
+          <div className="activation-note">
+            激活码不会明文保存在软件包中；本机会保存一份授权记录。
+          </div>
+        </form>
+      </div>
+    )
+  }
 
   return (
     <div className="app app-workbench">

@@ -7,6 +7,7 @@ import { chatStream, listModels, testModel } from './model'
 import { parseArchive, parseFile } from './ingest'
 import { exportDocx, exportHtml, exportMarkdown } from './export'
 import { loadLastProject, saveLastProject } from './project'
+import { activateWithCode, getActivationStatus } from './activation'
 
 function resolveWindowIcon(): string | undefined {
   const candidates = [
@@ -29,6 +30,10 @@ function isSafeExternalUrl(url: string): boolean {
 async function openExternalUrl(url: string): Promise<void> {
   if (!isSafeExternalUrl(url)) throw new Error('仅支持打开 http/https 链接')
   await shell.openExternal(url)
+}
+
+function ensureActivated(): void {
+  if (!getActivationStatus().activated) throw new Error('软件未激活，请先输入激活码。')
 }
 
 function createWindow(): void {
@@ -85,25 +90,47 @@ function createWindow(): void {
 }
 
 // ---- IPC：设置 ----
-ipcMain.handle('settings:get', () => loadSettings())
-ipcMain.handle('settings:save', (_e, settings: AppSettings) => saveSettings(settings))
+ipcMain.handle('settings:get', () => {
+  ensureActivated()
+  return loadSettings()
+})
+ipcMain.handle('settings:save', (_e, settings: AppSettings) => {
+  ensureActivated()
+  return saveSettings(settings)
+})
 ipcMain.handle('shell:openExternal', (_e, url: string) => openExternalUrl(url))
+ipcMain.handle('activation:status', () => getActivationStatus())
+ipcMain.handle('activation:activate', (_e, code: string) => activateWithCode(code))
 
 // ---- IPC：项目快照（不包含模型配置 / API Key）----
-ipcMain.handle('project:loadLast', () => loadLastProject())
-ipcMain.handle('project:saveLast', (_e, project: SavedProject) => saveLastProject(project))
+ipcMain.handle('project:loadLast', () => {
+  ensureActivated()
+  return loadLastProject()
+})
+ipcMain.handle('project:saveLast', (_e, project: SavedProject) => {
+  ensureActivated()
+  return saveLastProject(project)
+})
 
 // ---- IPC：测试模型 ----
-ipcMain.handle('model:test', (_e, opts: TestModelOptions) => testModel(opts))
-ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => listModels(profile))
+ipcMain.handle('model:test', (_e, opts: TestModelOptions) => {
+  ensureActivated()
+  return testModel(opts)
+})
+ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => {
+  ensureActivated()
+  return listModels(profile)
+})
 
 // ---- IPC：文件解析 ----
-ipcMain.handle('file:parse', (_e, payload: { name: string; data: ArrayBuffer }) =>
-  parseFile(payload.name, payload.data)
-)
-ipcMain.handle('archive:parse', (_e, payload: { name: string; data: ArrayBuffer }) =>
-  parseArchive(payload.name, payload.data)
-)
+ipcMain.handle('file:parse', (_e, payload: { name: string; data: ArrayBuffer }) => {
+  ensureActivated()
+  return parseFile(payload.name, payload.data)
+})
+ipcMain.handle('archive:parse', (_e, payload: { name: string; data: ArrayBuffer }) => {
+  ensureActivated()
+  return parseArchive(payload.name, payload.data)
+})
 
 // ---- IPC：读取 SOP 规则（SKILL.md）作为系统提示词 ----
 function readSopRules(): string {
@@ -121,18 +148,24 @@ function readSopRules(): string {
   }
   return ''
 }
-ipcMain.handle('sop:rules', () => readSopRules())
+ipcMain.handle('sop:rules', () => {
+  ensureActivated()
+  return readSopRules()
+})
 
 // ---- IPC：导出报告 ----
-ipcMain.handle('export:markdown', (_e, p: { content: string; name: string }) =>
-  exportMarkdown(p.content, p.name)
-)
-ipcMain.handle('export:docx', (_e, p: { content: string; name: string }) =>
-  exportDocx(p.content, p.name)
-)
-ipcMain.handle('export:html', (_e, p: { content: string; name: string }) =>
-  exportHtml(p.content, p.name)
-)
+ipcMain.handle('export:markdown', (_e, p: { content: string; name: string }) => {
+  ensureActivated()
+  return exportMarkdown(p.content, p.name)
+})
+ipcMain.handle('export:docx', (_e, p: { content: string; name: string }) => {
+  ensureActivated()
+  return exportDocx(p.content, p.name)
+})
+ipcMain.handle('export:html', (_e, p: { content: string; name: string }) => {
+  ensureActivated()
+  return exportHtml(p.content, p.name)
+})
 
 // ---- IPC：流式聊天 ----
 const inflight = new Map<string, AbortController>()
@@ -142,6 +175,10 @@ ipcMain.on(
   async (event, payload: { id: string; messages: ChatMessage[] }) => {
     const { id, messages } = payload
     const channel = `chat:event:${id}`
+    if (!getActivationStatus().activated) {
+      event.sender.send(channel, { type: 'error', message: '软件未激活，请先输入激活码。' })
+      return
+    }
     const profile = getActiveProfile()
     if (!profile) {
       event.sender.send(channel, { type: 'error', message: '未配置模型，请先在设置里添加模型配置。' })
