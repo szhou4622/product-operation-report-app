@@ -6,11 +6,22 @@ const path = require('node:path')
 const projectDir = path.resolve(__dirname, '..')
 const output = path.join(projectDir, '.tmp-packaged-utility-smoke.cjs')
 const asarPath = path.join(projectDir, 'dist', 'win-unpacked', 'resources', 'app.asar')
-const modulePath = path.join(
+const parseModulePath = path.join(
   asarPath,
   'out',
   'main',
   'parse-utility.js'
+)
+const htmlModulePath = path.join(asarPath, 'out', 'main', 'html-report-utility.js')
+const skillPath = path.join(
+  projectDir,
+  'dist',
+  'win-unpacked',
+  'resources',
+  'app.asar.unpacked',
+  'assets',
+  'skill',
+  'SKILL.md'
 )
 
 if (!existsSync(asarPath)) {
@@ -29,7 +40,7 @@ try {
   })
 
   const electron = require('electron')
-  const result = spawnSync(electron, [output, modulePath], {
+  const result = spawnSync(electron, [output, parseModulePath, htmlModulePath, skillPath], {
     cwd: projectDir,
     stdio: 'inherit',
     windowsHide: true

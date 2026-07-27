@@ -17,6 +17,7 @@ Create a source-bound product operation report that turns scattered product, pla
 4. audience x pain point x scene x selling point content matrix
 5. Video Account content mainlines
 6. executable topic/script table
+7. positioning-matched visual design when the deliverable is HTML
 
 If the user asks for a Feishu document, create or update the cloud doc after the report is generated.
 
@@ -187,6 +188,23 @@ Default report sections:
 12. 本次报告限制
 
 Keep the report readable for business users. Prefer tables for structured judgments and short paragraphs for conclusions.
+
+When the deliverable is HTML, or the user asks for design/visualization, first read [Positioning-Driven HTML Design](references/positioning-driven-html-design.md). Derive a source-backed product visual brief before selecting the theme, typography, density, macrostructure, or chart language. Do not reuse the previous product's visual system as the default.
+
+Then add a visual decision layer before the detailed evidence tables:
+
+- Lead with one source-backed business thesis and 2-4 real metrics that explain the decision; do not use a decorative cover as the main first screen.
+- Visualize relationships that materially improve first-glance understanding: shared-scale bars for comparable percentages, small multiples for platform-specific age structures, a 100% stacked bar for an explicit content mix, ordinal phases for ranked selling points, and count-based marks for a fixed script portfolio.
+- Keep different platform definitions and denominators separate. State the comparison scope beside each chart, and never average incompatible audience data into a single portrait.
+- Treat ranks as order, not magnitude. Do not use unequal bar lengths, pie slices, or percentages when the source only supports P1/P2/P3 or rank 1-8.
+- Label important values directly so the first view works without hover. Keep the original tables and source-bound prose as the evidence layer below the visuals.
+- Verify that every chart value matches the source, every original evidence table remains intact, SVGs/figures have accessible names, anchors are unique, and the layout reflows without horizontal scrolling on narrow screens.
+- Check wide-screen screenshots as well as mobile: 2-3 column evidence tables should fit their content instead of stretching into a large empty tail, and chapter headings should stay on one line whenever the available width can hold them.
+- When source IDs are non-consecutive, preserve the original IDs but display a separate continuous presentation order and explain the missing IDs beside the visual. Never silently renumber source records.
+- Scope visual-block list and grid styles to their component class. Do not let broad chapter selectors such as `.chapter ol` or `.chapter li::before` distort a custom roadmap or chart.
+- Make the HTML's visual character traceable to the analyzed product positioning, not merely its category name. Change at least three meaningful axes when the positioning changes: information density, typography, macrostructure, palette, shape language, visualization emphasis, or imagery treatment.
+- If official brand guidelines or supplied brand assets exist, use them before inferred positioning cues. If positioning evidence is weak, use a neutral evidence-first report style and mark the design assumptions instead of inventing luxury, medical, traditional, youthful, or gendered associations.
+- Treat the generator application's current UI only as workflow context unless the user explicitly asks to reuse it. Its navigation, blue/white admin styling, cards, controls, or preview chrome are not the analyzed product's brand system and must not become the default export style.
 
 ### 9. Feishu Output
 

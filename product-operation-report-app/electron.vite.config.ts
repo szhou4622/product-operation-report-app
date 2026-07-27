@@ -4,12 +4,13 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: ['marked'] })],
     build: {
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
-          'parse-utility': resolve(__dirname, 'src/main/parse-utility.ts')
+          'parse-utility': resolve(__dirname, 'src/main/parse-utility.ts'),
+          'html-report-utility': resolve(__dirname, 'src/main/html-report-utility.ts')
         },
         output: {
           entryFileNames: '[name].js',

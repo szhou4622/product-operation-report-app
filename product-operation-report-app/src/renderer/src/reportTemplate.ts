@@ -9,6 +9,27 @@ export interface ReportSection {
 export const FINAL_REPORT_TITLE = '# 产品名 产品经营报告'
 export const FINAL_REPORT_DATE_LINE = '生成日期：YYYY-MM-DD'
 export const FINAL_REPORT_REQUIRED_FOOTER = '> (注：内容由 AI 生成，请谨慎参考）'
+export const FINAL_REPORT_VISUAL_BRIEF_GUIDE = `在生成日期下一行插入下面这段不可见 HTML 注释，用本次资料和已完成分析填写；不要把它写成可见章节：
+<!-- Product visual brief
+role: 产品在用户生活或工作中承担的作用；无依据写需补充
+audience: 核心受众的阅读和决策特点；无依据写需补充
+scene: 主要购买或使用场景；无依据写需补充
+value-signal: practicality | price | premium | expertise | efficiency | identity | gifting | 需补充
+trust-model: visible-use | ingredients | tests | authority | reviews | craft | service | ROI | 需补充
+design-direction: household-field-guide | restrained-catalogue | technical-workbench | calm-evidence | energetic-social | utilitarian-decision-brief | material-editorial | neutral-evidence
+evidence-confidence: confirmed | partial | insufficient
+-->
+
+视觉方向只能根据有来源的产品定位选择：
+- 家庭日常/高频实用使用选 household-field-guide。
+- 高端、礼赠、体验或身份价值选 restrained-catalogue。
+- 专业参数、性能、机制或标准选 technical-workbench。
+- 成分、安全、检测或安心决策选 calm-evidence。
+- 年轻、社交、新奇和分享场景选 energetic-social。
+- 企业采购、工业、ROI、交付或供应链选 utilitarian-decision-brief。
+- 产地、手工、传统、文化或真实工艺选 material-editorial。
+- 证据不足、信号冲突或只有产品名时必须选 neutral-evidence，并写 evidence-confidence: insufficient。
+不得为了视觉效果编造品牌、受众、场景、功效、档次或信任背书。`
 
 export interface FinalReportPart {
   id: string

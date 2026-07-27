@@ -13,8 +13,16 @@ import { loadLastProject, saveLastProject } from '../src/main/project'
 import { getActivationStatus } from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import { loadSettings, saveSettings } from '../src/main/settings'
+import { readBundledSopRules } from '../src/main/sopRules'
+import {
+  markdownToHtmlDocument,
+  parseHtmlReportModel,
+  sanitizeHtmlFragment,
+  stripProductVisualBrief
+} from '../src/main/htmlReport'
 import {
   buildProjectSnapshot,
+  friendlyError,
   inspectImageHeader,
   MAX_CLEANING_CONCURRENCY,
   useStore
@@ -947,6 +955,306 @@ function testExportButtonContract(): void {
   assert.equal(component.includes('其他格式'), false)
 }
 
+const HTML_REPORT_FIXTURE = `# 盐中甜酸菜 产品经营报告
+生成日期：2026-07-27
+<!-- Product visual brief
+role: 家庭日常快速配餐
+audience: 需要直接、可信表达的家庭主理人
+scene: 工作日晚餐和早餐配餐
+value-signal: practicality
+trust-model: visible-use
+design-direction: household-field-guide
+evidence-confidence: confirmed
+-->
+
+## 0. 结论先行
+这是一个面向家庭日常快速配餐的产品，经营上应优先讲清方便、真实吃法和复购理由。
+
+| 优先级 | 核心人群 | 关键判断 |
+|---|---|---|
+| P0 | 31-45 岁家庭主理人 | 晚餐配菜和早餐配餐需求明确 |
+| P1 | 50 岁以上家庭用户 | 更重视口味熟悉和使用方便 |
+
+## 1. 数据来源与使用范围
+| 数据类型 | 来源 | 本次用途 |
+|---|---|---|
+| 成交人群 | 视频号截图 | 判断家庭人群 |
+| 购买画像 | 巨量云图 | 判断年龄结构 |
+
+## 2. 产品基础信息
+| 模块 | 当前判断 |
+|---|---|
+| 产品名称 / 类目 | 盐中甜酸菜 / 佐餐食品 |
+| 核心成交规模 | GMV 128.6万元 |
+| 当前客单 | 79元 |
+| 主要使用场景 | 早餐、晚餐、家庭囤货 |
+
+## 3. 一方数据核心判断
+### 3.1 视频号成交人群
+| 维度 | 关键数据 | 经营含义 |
+|---|---|---|
+| 女性 | 67.4% | 家庭主理人是重点 |
+| 31-45 岁 | 48.2% | 处于家庭餐食决策阶段 |
+
+### 3.2 云图购买画像
+| 维度 | 关键数据 | 经营含义 |
+|---|---|---|
+| 小镇中年 | 32.1% | 关注熟悉口味 |
+| 都市银发 | 21.6% | 关注方便与可信 |
+
+### 重复标题
+同名标题第一次。
+### 重复标题
+同名标题第二次。
+
+## 4. 竞品与素材打法判断
+### 4.1 自有爆款素材结构
+| 指标 | 结果 |
+|---|---|
+| 场景开头 | 45% |
+| 口味展示 | 35% |
+| 机制收口 | 20% |
+
+### 4.2 竞品素材结构
+| 竞品开头 | 打法本质 | 我方可迁移方向 |
+|---|---|---|
+| 今天晚饭不知道吃什么 | 场景切入 | 家庭快餐场景 |
+
+## 5. 产品全量卖点拆解
+| 卖点维度 | 我方产品卖点 | 用户能感知的好处 |
+|---|---|---|
+| 产品包装 | 小袋分装 | 开袋方便 |
+| 价格 | 需补充 | 需补充 |
+| 场景 | 家庭佐餐 | 不用临时准备复杂配菜 |
+
+## 6. 卖点用户视角排序
+| 排序 | 用户视角卖点 | 对应产品事实 | 打动的人群/场景 | 作用 |
+|---|---|---|---|---|
+| 1 | 开袋就能配饭 | 小袋分装 | 工作日晚餐 | 转化钩子 |
+| 2 | 熟悉口味更安心 | 原料和口味资料 | 家庭复购 | 信任支撑 |
+
+## 7. 核心成交人群画像与卖点场景匹配
+一句话总判断：家庭餐食决策者是当前主力。
+
+| 优先级 | 成交人群 | 数据依据/特征 | 核心卖点 | 核心场景 | 内容语言 |
+|---|---|---|---|---|---|
+| 第一主力 | 31-45 岁已育女性/家庭主理人 | 视频号女性 67.4% | 开袋方便 | 工作日晚餐 | 直接展示吃法 |
+| 第二承接 | 50+ 家庭用户 | 银发 21.6% | 熟悉口味 | 早餐佐餐 | 真实、易懂 |
+
+## 8. 视频号内容主线设计
+| 内容主线 | 数据/分析依据 | 对应人群 | 对应卖点 | 核心场景 | 内容表达 | 作用 |
+|---|---|---|---|---|---|---|
+| 家庭快餐 | 视频号画像 | 家庭主理人 | 方便 | 晚餐 | 实拍吃法 | 主转化 |
+| 熟悉口味 | 银发画像 | 50+ 家庭用户 | 口味 | 早餐 | 用户体验 | 信任 |
+| 囤货机制 | 复购场景 | 家庭用户 | 规格 | 囤货 | 机制解释 | 收口 |
+
+建议内容体量：
+
+| 内容主线 | 建议占比 | 原因 |
+|---|---|---|
+| 家庭快餐 | 50% | 主需求 |
+| 熟悉口味 | 30% | 信任 |
+| 囤货机制 | 20% | 转化 |
+
+## 9. 内容执行方向
+### 9.1 第一轮建议选题
+| 脚本编号 | 内容主线 | 选题 | 视频分类 | 视角 | 人群 | 场景 | 开头类型 | 3 秒开头来源 | 参考视频结构 | 优先级 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| S01 | 家庭快餐 | 下班十分钟开饭 | 3.1 | 用户 | 家庭主理人 | 晚餐 | 场景 | 自有素材A | 场景-吃法-产品 | P0 |
+| S02 | 熟悉口味 | 爸妈早餐怎么配 | 3.2 | 专业 | 50+ 家庭用户 | 早餐 | 痛点 | 自有素材B | 痛点-展示-证据 | P0 |
+| S03 | 囤货机制 | 家庭一周怎么备 | 3.99 | 商家 | 家庭用户 | 囤货 | 机制 | 自有素材C | 规格-场景-机制 | P1 |
+
+### 9.2 3 秒开头库
+| 开头类型 | 可直接复用的原始开头 |
+|---|---|
+| 场景 | 今天晚饭不知道吃什么 |
+
+## 10. 经营建议
+1. 优先制作家庭晚餐场景素材。
+2. 用真实吃法补足信任证据。
+3. 补齐价格与规格机制。
+
+## 11. 本次报告的限制
+- 价格机制仍需品牌确认。
+- 部分素材缺少完整成交字段。
+- 超长字段测试：这是一段用于验证小屏幕自动换行且不会把页面撑出横向滚动的中文长文本这是一段用于验证小屏幕自动换行且不会把页面撑出横向滚动的中文长文本。
+
+<script>alert("bad")</script>
+<img src="https://example.com/tracker.png" onerror="alert(1)">
+> (注：内容由 AI 生成，请谨慎参考）`
+
+async function testHtmlReportRenderer(): Promise<void> {
+  const model = parseHtmlReportModel(HTML_REPORT_FIXTURE)
+  assert.equal(model.sections.length, 12)
+  assert.deepEqual(model.sections.map((section) => section.number), [
+    '0',
+    '1',
+    '2',
+    '3',
+    '4',
+    '5',
+    '6',
+    '7',
+    '8',
+    '9',
+    '10',
+    '11'
+  ])
+  assert.equal(model.brief.designDirection, 'household-field-guide')
+  assert.equal(model.brief.evidenceConfidence, 'confirmed')
+
+  const html = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
+  const repeated = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
+  assert.equal(html, repeated)
+  assert.match(html, /data-report-direction="household-field-guide"/)
+  assert.match(html, /经营优先级/)
+  assert.match(html, /一方数据分口径对比/)
+  assert.match(html, /用户决策顺序/)
+  assert.match(html, /人群、场景与卖点匹配/)
+  assert.match(html, /建议内容结构/)
+  assert.match(html, /第一轮脚本组合/)
+  assert.match(html, /data-label="脚本编号"/)
+  assert.match(html, /scope="col"/)
+  assert.match(html, /@media \(max-width: 414px\)/)
+  assert.match(html, /@media \(min-width: 769px\) and \(max-width: 1080px\)/)
+  assert.match(html, /@media print/)
+  assert.match(html, /@page wide/)
+  assert.match(html, /class="skip-link"/)
+  assert.match(html, /class="mobile-toc"/)
+  assert.match(html, /overflow-wrap: anywhere/)
+  assert.match(html, /重复标题-2/)
+  assert.equal((html.match(/class="report-section"/g) || []).length, 12)
+  assert.ok(html.indexOf('0. 结论先行') < html.indexOf('11. 本次报告的限制'))
+  assert.ok(html.includes('GMV 128.6万元'))
+  assert.ok(html.includes('价格机制仍需品牌确认'))
+  assert.equal(html.includes('<script>alert("bad")</script>'), false)
+  assert.equal(html.includes('tracker.png'), false)
+  assert.equal(html.includes('onerror='), false)
+  assert.equal(html.includes('Product visual brief'), false)
+  assert.equal(html.includes('@import'), false)
+  assert.equal(html.includes('<link'), false)
+
+  const stripped = stripProductVisualBrief(HTML_REPORT_FIXTURE)
+  assert.equal(stripped.includes('Product visual brief'), false)
+  assert.ok(stripped.startsWith('# 盐中甜酸菜 产品经营报告'))
+
+  const legacy = HTML_REPORT_FIXTURE.replace(/<!-- Product visual brief[\s\S]*?-->\n?/, '')
+  const legacyModel = parseHtmlReportModel(legacy)
+  assert.equal(legacyModel.brief.evidenceConfidence, 'insufficient')
+  assert.equal(legacyModel.brief.designDirection, 'neutral-evidence')
+  const legacyHtml = await markdownToHtmlDocument(legacy)
+  assert.match(legacyHtml, /data-report-direction="neutral-evidence"/)
+
+  const invalidMix = HTML_REPORT_FIXTURE.replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 10% | 转化 |')
+  const invalidMixHtml = await markdownToHtmlDocument(invalidMix)
+  assert.equal(invalidMixHtml.includes('建议内容结构'), false)
+  assert.ok(invalidMixHtml.includes('内容主线'))
+
+  const missingMix = HTML_REPORT_FIXTURE.replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 需补充 | 转化 |')
+  const missingMixHtml = await markdownToHtmlDocument(missingMix)
+  assert.equal(missingMixHtml.includes('建议内容结构'), false)
+
+  const rangedMix = HTML_REPORT_FIXTURE
+    .replace('| 家庭快餐 | 50% | 主需求 |', '| 家庭快餐 | 50%-60% | 主需求 |')
+    .replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 20% | 转化 |')
+  const rangedMixHtml = await markdownToHtmlDocument(rangedMix)
+  assert.equal(rangedMixHtml.includes('建议内容结构'), false)
+
+  const misleadingClass = HTML_REPORT_FIXTURE.replace(
+    '| S01 | 家庭快餐 | 下班十分钟开饭 | 3.1 | 用户 |',
+    '| S01 | 家庭快餐 | 下班十分钟开饭 | 3.10 | 用户 |'
+  )
+  const misleadingClassHtml = await markdownToHtmlDocument(misleadingClass)
+  const classCounts = misleadingClassHtml.match(
+    /<section class="count-group"><h3>视频分类<\/h3>([\s\S]*?)<\/section>/
+  )?.[1]
+  assert.ok(classCounts)
+  assert.match(classCounts || '', /3\.1[\s\S]*?<strong>0 条<\/strong>/)
+
+  const incompleteBrief = HTML_REPORT_FIXTURE.replace(
+    /role: 家庭日常快速配餐/,
+    'role: 需补充'
+  )
+  const incompleteBriefModel = parseHtmlReportModel(incompleteBrief)
+  assert.equal(incompleteBriefModel.brief.evidenceConfidence, 'insufficient')
+  assert.equal(incompleteBriefModel.brief.designDirection, 'neutral-evidence')
+
+  const invalidControlledBrief = HTML_REPORT_FIXTURE
+    .replace('value-signal: practicality', 'value-signal: invented')
+    .replace('trust-model: visible-use', 'trust-model: invented')
+  const invalidControlledBriefModel = parseHtmlReportModel(invalidControlledBrief)
+  assert.equal(invalidControlledBriefModel.brief.evidenceConfidence, 'insufficient')
+  assert.equal(invalidControlledBriefModel.brief.designDirection, 'neutral-evidence')
+
+  const malformedAudience = HTML_REPORT_FIXTURE.replace(
+    '| 优先级 | 成交人群 | 数据依据/特征 | 核心卖点 | 核心场景 | 内容语言 |',
+    '| 优先级 | 人群备注 | 数据依据/特征 | 卖点备注 | 场景备注 | 内容语言 |'
+  )
+  const malformedAudienceHtml = await markdownToHtmlDocument(malformedAudience)
+  assert.equal(malformedAudienceHtml.includes('人群、场景与卖点匹配'), false)
+
+  for (const range of ['31-45 岁', '31 - 45 岁', '31—45 岁', '31~45 岁', '31～45 岁', '31至45 岁']) {
+    const ageRange = await markdownToHtmlDocument(
+      `# 年龄测试\n\n## 2. 产品基础信息\n| 模块 | 当前判断 |\n|---|---|\n| 核心年龄 | ${range} |`
+    )
+    assert.doesNotMatch(ageRange, /<strong>-?45岁<\/strong>/)
+    assert.doesNotMatch(ageRange, /<strong>3145岁<\/strong>/)
+  }
+
+  const genericMaterialList = await markdownToHtmlDocument(
+    '# 素材清单测试\n\n## 4. 竞品与素材打法判断\n| 素材链接 | 备注 |\n|---|---|\n| A | 示例一 |\n| B | 示例二 |'
+  )
+  assert.equal(genericMaterialList.includes('素材打法提炼'), false)
+
+  const invalidEntity = await markdownToHtmlDocument(
+    '# 极端实体 &#9999999999;\n\n## 0. 结论先行\n仍可正常导出。'
+  )
+  assert.ok(invalidEntity.includes('极端实体'))
+  assert.ok(invalidEntity.includes('�'))
+
+  const longUrl = `https://example.com/${'very-long-path-'.repeat(30)}`
+  const longUrlHtml = await markdownToHtmlDocument(
+    `# 长链接测试\n\n## 0. 结论先行\n[完整长链接](${longUrl})`
+  )
+  assert.ok(longUrlHtml.includes(longUrl))
+  assert.match(longUrlHtml, /word-break: break-word/)
+
+  const platformFacets = await markdownToHtmlDocument(
+    '# 分平台测试\n\n## 3. 一方数据核心判断\n### 同口径人群占比\n| 平台 | 维度 | 关键数据 |\n|---|---|---|\n| 视频号 | 女性 | 60% |\n| 视频号 | 男性 | 40% |\n| 云图 | 女性 | 55% |\n| 云图 | 男性 | 45% |'
+  )
+  assert.match(platformFacets, /同口径人群占比 · 视频号 · 关键数据/)
+  assert.match(platformFacets, /同口径人群占比 · 云图 · 关键数据/)
+
+  const incomplete = await markdownToHtmlDocument('# 空报告\n生成日期：2026-07-27\n\n## 0. 结论先行\n需补充')
+  assert.match(incomplete, /data-report-direction="neutral-evidence"/)
+  assert.ok(incomplete.includes('需补充'))
+
+  const sanitized = sanitizeHtmlFragment(
+    '<p class="ok" onclick="bad()">安全</p><iframe src="x">坏</iframe><a href="javascript:bad()">链接</a>'
+  )
+  assert.equal(sanitized.includes('onclick'), false)
+  assert.equal(sanitized.includes('iframe'), false)
+  assert.equal(sanitized.includes('javascript:'), false)
+  assert.ok(sanitized.includes('安全'))
+
+  assert.equal(
+    friendlyError(new Error('EPERM: operation not permitted, rename report.html')),
+    '文件可能正在被占用，或保存位置没有权限。请关闭同名文件，或改存到桌面后重试。'
+  )
+  assert.equal(
+    friendlyError(new Error('ENOSPC: no space left on device')),
+    '磁盘空间不足，无法保存文件。请清理空间或改存到其他磁盘后重试。'
+  )
+  assert.equal(
+    friendlyError(new Error('EBUSY: resource busy or locked')),
+    '文件正在被其他程序占用。请关闭同名的 Word 或浏览器文件后重试。'
+  )
+
+  const bundledRules = readBundledSopRules([join(process.cwd(), 'assets', 'skill', 'SKILL.md')])
+  assert.match(bundledRules, /内置 HTML 视觉规范/)
+  assert.match(bundledRules, /Product visual brief/)
+}
+
 async function run(): Promise<void> {
   console.log('Regression: project persistence')
   await testProjectRevisionAndBackup()
@@ -984,7 +1292,9 @@ async function run(): Promise<void> {
   await testBulkAttributionAndExportOpen()
   console.log('Regression: original export button contract')
   testExportButtonContract()
-  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, CSV/TXT encoding, ZIP, image and file limits.')
+  console.log('Regression: adaptive HTML report renderer')
+  await testHtmlReportRenderer()
+  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
 }
 
 void app.whenReady().then(async () => {

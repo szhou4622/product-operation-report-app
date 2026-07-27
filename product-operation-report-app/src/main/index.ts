@@ -1,7 +1,7 @@
 import { app, shell, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
 import { randomUUID } from 'crypto'
 import { isAbsolute, join } from 'path'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
 import type { AppSettings, ChatMessage, SavedProject, TestModelOptions } from '../shared/types'
 import { getActiveProfile, loadSettings, saveSettings } from './settings'
 import { chatStream, listModels, testModel } from './model'
@@ -20,6 +20,7 @@ import {
   saveLastProjectSync
 } from './project'
 import { activateWithCode, getActivationStatus } from './activation'
+import { readBundledSopRules } from './sopRules'
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
@@ -285,14 +286,7 @@ function readSopRules(): string {
     join(process.resourcesPath || '', 'app.asar.unpacked', 'assets', 'skill', 'SKILL.md'),
     join(__dirname, '../../assets/skill/SKILL.md')
   ]
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return readFileSync(p, 'utf8')
-    } catch {
-      // try next
-    }
-  }
-  return ''
+  return readBundledSopRules(candidates)
 }
 ipcMain.handle('sop:rules', () => {
   ensureActivated()

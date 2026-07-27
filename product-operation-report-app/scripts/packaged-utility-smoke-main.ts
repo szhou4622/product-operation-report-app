@@ -1,4 +1,6 @@
 import { strict as assert } from 'node:assert'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { app, utilityProcess, type UtilityProcess } from 'electron'
 import JSZip from 'jszip'
 import * as XLSX from 'xlsx'
@@ -67,12 +69,17 @@ async function request(
 }
 
 async function run(): Promise<void> {
-  const modulePath = process.argv[2]
-  assert.ok(modulePath, 'Missing packaged utility module path')
-  const child = utilityProcess.fork(modulePath, [], {
+  const parseModulePath = process.argv[2]
+  const htmlModulePath = process.argv[3]
+  const skillPath = process.argv[4]
+  assert.ok(parseModulePath, 'Missing packaged parse utility module path')
+  assert.ok(htmlModulePath, 'Missing packaged HTML utility module path')
+  assert.ok(skillPath, 'Missing packaged Skill path')
+  const child = utilityProcess.fork(parseModulePath, [], {
     serviceName: '产品经营报告-安装包解析测试',
-    stdio: 'ignore'
+    stdio: 'pipe'
   })
+  child.stderr?.on('data', (chunk) => console.error(`[packaged-parse] ${String(chunk).trim()}`))
   await waitForReady(child)
 
   const csv = new TextEncoder().encode('name,value\nalpha,1')
@@ -114,12 +121,72 @@ async function run(): Promise<void> {
   assert.match(zipResult.result[0]?.text || '', /gamma/)
 
   child.kill()
+
+  const htmlChild = utilityProcess.fork(htmlModulePath, [], {
+    serviceName: '产品经营报告-安装包HTML测试',
+    stdio: 'pipe'
+  })
+  htmlChild.stderr?.on('data', (chunk) => console.error(`[packaged-html] ${String(chunk).trim()}`))
+  await waitForReady(htmlChild)
+  const htmlResult = await new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Packaged HTML render timeout')), 30_000)
+    const onMessage = (message: any): void => {
+      if (message?.id !== 'html') return
+      clearTimeout(timer)
+      htmlChild.off('message', onMessage)
+      resolve(message)
+    }
+    htmlChild.on('message', onMessage)
+    htmlChild.postMessage({
+      id: 'html',
+      markdown: `# 安装版 HTML 测试
+<!-- Product visual brief
+role: 家庭日常快速配餐
+audience: 家庭主理人
+scene: 工作日晚餐
+value-signal: practicality
+trust-model: visible-use
+design-direction: household-field-guide
+evidence-confidence: confirmed
+-->
+
+## 0. 结论先行
+优先展示真实使用场景。
+
+| 优先级 | 核心人群 | 关键判断 |
+|---|---|---|
+| P0 | 家庭主理人 | 晚餐配餐需求明确 |`
+    })
+  })
+  assert.equal(htmlResult.ok, true, JSON.stringify(htmlResult))
+  assert.match(htmlResult.html || '', /data-report-direction="household-field-guide"/)
+  assert.match(htmlResult.html || '', /Content-Security-Policy/)
+  assert.equal(/<script|@import|https?:\/\/[^"]+\.(?:js|css|woff)/i.test(htmlResult.html || ''), false)
+
+  const outputPath = join(app.getPath('temp'), 'product-report-packaged-html-smoke.html')
+  try {
+    writeFileSync(outputPath, htmlResult.html, 'utf8')
+    const saved = readFileSync(outputPath, 'utf8')
+    assert.match(saved, /优先展示真实使用场景/)
+    assert.match(saved, /@media print/)
+  } finally {
+    rmSync(outputPath, { force: true })
+  }
+  htmlChild.kill()
+
+  assert.equal(existsSync(skillPath), true)
+  const skill = readFileSync(skillPath, 'utf8')
+  const referencePath = join(dirname(skillPath), 'references', 'positioning-driven-html-design.md')
+  assert.equal(existsSync(referencePath), true)
+  const reference = readFileSync(referencePath, 'utf8')
+  assert.match(skill, /positioning-driven-html-design\.md/)
+  assert.match(reference, /Product visual brief/)
 }
 
 void app.whenReady().then(async () => {
   try {
     await run()
-    console.log('Packaged ASAR utility checks passed: CSV, XLSX, PDF and ZIP.')
+    console.log('Packaged ASAR checks passed: CSV, XLSX, PDF, ZIP, offline HTML renderer and bundled Skill.')
     app.exit(0)
   } catch (error) {
     console.error(error)

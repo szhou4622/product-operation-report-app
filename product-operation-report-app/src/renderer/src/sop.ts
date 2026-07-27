@@ -5,6 +5,7 @@ import {
   finalReportOutlineForPrompt,
   finalReportOutlineForSections,
   FINAL_REPORT_REQUIRED_FOOTER,
+  FINAL_REPORT_VISUAL_BRIEF_GUIDE,
   PROCESS_TERMS,
   type FinalReportPart
 } from './reportTemplate'
@@ -24,6 +25,9 @@ export const STEP_INSTRUCTIONS: Record<number, string> = {
 【硬性结构】
 必须严格按下面目录输出干净 Markdown，标题文字和顺序都不要改：
 ${finalReportOutlineForPrompt()}
+
+【HTML 可视化简报】
+${FINAL_REPORT_VISUAL_BRIEF_GUIDE}
 
 【每章固定写法】
 ${finalReportFormatGuide()}
@@ -318,6 +322,7 @@ export function buildFinalReportPartMessages(params: {
     `## 本次只生成：${part.label}`,
     '必须严格输出以下标题，标题文字和顺序不要改：',
     finalReportOutlineForSections(part).replace('生成日期：YYYY-MM-DD', `生成日期：${todayDateString()}`),
+    part.includeTitle ? `## HTML 可视化简报（不可见，不是新章节）\n${FINAL_REPORT_VISUAL_BRIEF_GUIDE}` : '',
     '## 本片段每章固定写法',
     finalReportFormatGuideForSections(part.sections),
     '## 已确认的资料汇总',
@@ -328,7 +333,7 @@ export function buildFinalReportPartMessages(params: {
     [
       '1. 这是最终报告片段，不要写「第几步」「上游产出」「本步任务」等过程词。',
       '2. 不要新增本片段之外的二级章节。',
-      part.includeTitle ? `3. 第一行必须直接是报告标题，不要输出确认日期、命令、解释、寒暄或任何标题前废话。生成日期必须写：生成日期：${todayDateString()}` : '',
+      part.includeTitle ? `3. 第一行必须直接是报告标题，不要输出确认日期、命令、解释、寒暄或任何标题前废话。生成日期必须写：生成日期：${todayDateString()}。视觉简报注释必须紧跟生成日期。` : '',
       '4. 内容要贴近用户目标报告：结论短、表格清楚、只保留经营和内容决策有用的信息。',
       '5. 价格、规格、销量、背书、活动机制、3 秒开头必须有来源；没有来源就写「需补充/待补证」。',
       part.includeFooter ? `6. 最后一行必须是：${FINAL_REPORT_REQUIRED_FOOTER}` : ''
