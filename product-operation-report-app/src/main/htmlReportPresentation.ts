@@ -74,6 +74,34 @@ export interface HtmlReportContentMixPresentation {
   }>
 }
 
+export interface HtmlReportKeywordCloudItemPresentation {
+  label: string
+  count: number
+  weight: 1 | 2 | 3 | 4 | 5
+  sources: HtmlReportSourceRef[]
+}
+
+export interface HtmlReportKeywordCloudPresentation {
+  title: string
+  tableIndex: number
+  totalOccurrences: number
+  items: HtmlReportKeywordCloudItemPresentation[]
+}
+
+export interface HtmlReportDistributionItemPresentation {
+  label: string
+  value: number
+  sources: HtmlReportSourceRef[]
+}
+
+export interface HtmlReportDistributionPresentation {
+  title: string
+  total: number
+  unit: string
+  totalSources: HtmlReportSourceRef[]
+  items: HtmlReportDistributionItemPresentation[]
+}
+
 export interface HtmlReportSectionPresentation {
   sectionNumber: string
   visualKind: HtmlReportVisualKind
@@ -81,6 +109,8 @@ export interface HtmlReportSectionPresentation {
   visualSources: HtmlReportSourceRef[]
   percentFacets: HtmlReportPercentFacetPresentation[]
   contentMix: HtmlReportContentMixPresentation | null
+  keywordCloud: HtmlReportKeywordCloudPresentation | null
+  executionDistributions: HtmlReportDistributionPresentation[]
   tables: HtmlReportTablePresentation[]
 }
 
@@ -107,6 +137,64 @@ const PLATFORM_TERM_PATTERN =
   /巨量云图|微信小店|示例平台|视频号|抖音|快手|小红书|淘宝|天猫|京东|拼多多|抖店|千川|云图/g
 const DISTRIBUTION_CONTEXT_PATTERN =
   /成交人群|购买画像|人群|性别|年龄|地域|地区|城市线级|用户构成|内容构成|素材结构|来源构成|类目构成|占比分布|分布/
+const KEYWORD_STOP_WORDS = new Set(
+  [
+    '产品',
+    '用户',
+    '卖点',
+    '场景',
+    '我方',
+    '已见',
+    '包括',
+    '表达',
+    '可以',
+    '适合',
+    '使用',
+    '以及',
+    '对应',
+    '主要',
+    '当前',
+    '信息',
+    '更有',
+    '感知',
+    '进行',
+    '好处',
+    '人群',
+    '素材',
+    '补充',
+    '具体',
+    '机制',
+    '品牌',
+    '需要',
+    '已经',
+    '目前',
+    '这个',
+    '这种',
+    '一个',
+    '通过',
+    '相关',
+    '作为',
+    '用于',
+    '建议',
+    '说明',
+    '内容',
+    '方向',
+    '核心',
+    '重点',
+    '表现',
+    '比较',
+    '更加',
+    '维度',
+    '资料',
+    '数据',
+    '分析',
+    '判断',
+    '中有',
+    '即可',
+    '一次',
+    '一袋'
+  ].map((item) => item.toLocaleLowerCase('zh-CN'))
+)
 
 function text(value: string): string {
   return value
@@ -453,6 +541,163 @@ function buildContentMix(section: HtmlReportSection): HtmlReportContentMixPresen
   }
 }
 
+function keywordTokens(value: string): string[] {
+  const normalized = text(value)
+  if (!normalized || PLACEHOLDER_PATTERN.test(normalized)) return []
+  const segmenter = new Intl.Segmenter('zh-CN', { granularity: 'word' })
+  return Array.from(segmenter.segment(normalized))
+    .filter((segment) => segment.isWordLike)
+    .map((segment) => segment.segment.trim())
+    .filter((token) => {
+      if (!/^(?:[\p{Script=Han}]{2,8}|[A-Za-z][A-Za-z0-9.+-]{1,15})$/u.test(token)) return false
+      const normalizedToken = token.toLocaleLowerCase('zh-CN')
+      return !KEYWORD_STOP_WORDS.has(normalizedToken) && !/^\d/.test(normalizedToken)
+    })
+}
+
+function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPresentation | null {
+  const tableIndex = section.tables.findIndex((table) =>
+    tableMatches(table, [/卖点维度/, /我方产品卖点/])
+  )
+  if (tableIndex < 0) return null
+  const table = section.tables[tableIndex]
+  const entries = new Map<
+    string,
+    { label: string; count: number; sources: Map<string, HtmlReportSourceRef> }
+  >()
+  table.rows.forEach((row, rowIndex) => {
+    row.slice(1).forEach((rawValue, offset) => {
+      const columnIndex = offset + 1
+      const source = sourceRef(section, tableIndex, rowIndex, columnIndex)
+      keywordTokens(rawValue).forEach((label) => {
+        const key = label.toLocaleLowerCase('zh-CN')
+        const entry = entries.get(key) || { label, count: 0, sources: new Map() }
+        entry.count += 1
+        entry.sources.set(`${rowIndex}:${columnIndex}`, source)
+        entries.set(key, entry)
+      })
+    })
+  })
+  const candidates = Array.from(entries.values())
+    .filter((entry) => entry.count >= 2)
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label, 'zh-CN'))
+    .slice(0, 24)
+  if (candidates.length < 6) return null
+  const min = Math.min(...candidates.map((entry) => entry.count))
+  const max = Math.max(...candidates.map((entry) => entry.count))
+  const weightFor = (count: number): 1 | 2 | 3 | 4 | 5 => {
+    if (max === min) return 3
+    return Math.max(1, Math.min(5, Math.round(1 + ((count - min) / (max - min)) * 4))) as
+      | 1
+      | 2
+      | 3
+      | 4
+      | 5
+  }
+  return {
+    title: '卖点原文高频词',
+    tableIndex,
+    totalOccurrences: candidates.reduce((sum, entry) => sum + entry.count, 0),
+    items: candidates.map((entry) => ({
+      label: entry.label,
+      count: entry.count,
+      weight: weightFor(entry.count),
+      sources: Array.from(entry.sources.values())
+    }))
+  }
+}
+
+function buildExecutionDistributions(
+  section: HtmlReportSection
+): HtmlReportDistributionPresentation[] {
+  const tableIndex = section.tables.findIndex((table) =>
+    tableMatches(table, [/脚本编号/, /视频分类/, /视角/])
+  )
+  if (tableIndex < 0) return []
+  const table = section.tables[tableIndex]
+  const idIndex = findHeaderIndex(table, /脚本编号/)
+  const classIndex = findHeaderIndex(table, /视频分类/)
+  const perspectiveIndex = findHeaderIndex(table, /视角/)
+  if (idIndex < 0 || classIndex < 0 || perspectiveIndex < 0) return []
+  const uniqueRows = Array.from(
+    new Map(
+      table.rows
+        .map((row, rowIndex) => ({ row, rowIndex }))
+        .filter(({ row }) => Boolean(text(row[idIndex] || '')))
+        .map(({ row, rowIndex }) => [text(row[idIndex]), { row, rowIndex }] as const)
+    ).values()
+  )
+  if (uniqueRows.length === 0) return []
+  const readClass = (value: string): string =>
+    text(value).match(/^(3\.(?:1|2|99))(?:\s|$)/)?.[1] || ''
+  const classLabels = ['3.1', '3.2', '3.99']
+  const classItems = classLabels.map((label) => {
+    const matches = uniqueRows.filter(({ row }) => readClass(row[classIndex] || '') === label)
+    return {
+      label,
+      value: matches.length,
+      sources: matches.map(({ rowIndex }) => sourceRef(section, tableIndex, rowIndex, classIndex))
+    }
+  })
+  const otherClasses = uniqueRows.filter(({ row }) => !readClass(row[classIndex] || ''))
+  if (otherClasses.length > 0) {
+    classItems.push({
+      label: '其他分类',
+      value: otherClasses.length,
+      sources: otherClasses.map(({ rowIndex }) =>
+        sourceRef(section, tableIndex, rowIndex, classIndex)
+      )
+    })
+  }
+
+  const perspectiveLabels = ['商家', '用户', '专业']
+  const readPerspective = (value: string): string =>
+    text(value).replace(/\s+/g, '').replace(/视角$/, '')
+  const perspectiveItems = perspectiveLabels.map((label) => {
+    const matches = uniqueRows.filter(
+      ({ row }) => readPerspective(row[perspectiveIndex] || '') === label
+    )
+    return {
+      label: `${label}视角`,
+      value: matches.length,
+      sources: matches.map(({ rowIndex }) =>
+        sourceRef(section, tableIndex, rowIndex, perspectiveIndex)
+      )
+    }
+  })
+  const otherPerspectives = uniqueRows.filter(
+    ({ row }) => !perspectiveLabels.includes(readPerspective(row[perspectiveIndex] || ''))
+  )
+  if (otherPerspectives.length > 0) {
+    perspectiveItems.push({
+      label: '其他视角',
+      value: otherPerspectives.length,
+      sources: otherPerspectives.map(({ rowIndex }) =>
+        sourceRef(section, tableIndex, rowIndex, perspectiveIndex)
+      )
+    })
+  }
+  const totalSources = uniqueRows.map(({ rowIndex }) =>
+    sourceRef(section, tableIndex, rowIndex, idIndex)
+  )
+  return [
+    {
+      title: '视频分类',
+      total: uniqueRows.length,
+      unit: '条',
+      totalSources,
+      items: classItems
+    },
+    {
+      title: '内容视角',
+      total: uniqueRows.length,
+      unit: '条',
+      totalSources,
+      items: perspectiveItems
+    }
+  ]
+}
+
 function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVisualKind): number[] {
   const matches = (predicate: (table: HtmlReportTable) => boolean): number[] =>
     section.tables
@@ -530,6 +775,10 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
       ? buildPercentFacets(section)
       : []
   const contentMix = visualKind === 'content-mix' ? buildContentMix(section) : null
+  const keywordCloud =
+    visualKind === 'selling-point-matrix' ? buildKeywordCloud(section) : null
+  const executionDistributions =
+    visualKind === 'execution-matrix' ? buildExecutionDistributions(section) : []
   const plannedIndexes =
     visualKind === 'summary-only' ? [] : findVisualSourceIndexes(section, visualKind)
   const visualSourceTableIndexes =
@@ -598,6 +847,8 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
     visualSources,
     percentFacets,
     contentMix,
+    keywordCloud,
+    executionDistributions,
     tables
   }
 }

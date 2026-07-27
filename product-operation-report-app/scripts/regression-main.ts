@@ -1132,6 +1132,24 @@ async function testHtmlReportRenderer(): Promise<void> {
   }
   assert.equal(presentation.sections.find((section) => section.sectionNumber === '0')?.tables[0]?.mode, 'visible')
   assert.equal(presentation.sections.find((section) => section.sectionNumber === '9')?.tables[0]?.mode, 'collapsed')
+  const executionPlan = presentation.sections.find((section) => section.sectionNumber === '9')
+  assert.equal(executionPlan?.executionDistributions.length, 2)
+  for (const distribution of executionPlan?.executionDistributions || []) {
+    assert.equal(
+      distribution.items.reduce((sum, item) => sum + item.value, 0),
+      distribution.total
+    )
+    for (const item of distribution.items) {
+      for (const source of item.sources) {
+        assert.equal(
+          model.sections
+            .find((section) => section.number === source.sectionNumber)
+            ?.tables[source.tableIndex!]?.rows[source.rowIndex!]?.[source.columnIndex!],
+          source.rawValue
+        )
+      }
+    }
+  }
 
   const html = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
   const repeated = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
@@ -1149,7 +1167,10 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(html, /用户决策顺序/)
   assert.match(html, /人群、场景与卖点匹配/)
   assert.match(html, /建议内容结构/)
+  assert.match(html, /class="content-mix-dashboard"/)
+  assert.match(html, /class="donut-chart"/)
   assert.match(html, /第一轮脚本组合/)
+  assert.match(html, /class="donut-pair"/)
   assert.match(html, /class="execution-matrix"/)
   assert.match(html, /发布前风险护栏/)
   assert.match(html, /data-label="脚本编号"/)
@@ -1192,17 +1213,20 @@ async function testHtmlReportRenderer(): Promise<void> {
   const invalidMix = HTML_REPORT_FIXTURE.replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 10% | 转化 |')
   const invalidMixHtml = await markdownToHtmlDocument(invalidMix)
   assert.equal(invalidMixHtml.includes('建议内容结构'), false)
+  assert.equal(invalidMixHtml.includes('class="content-mix-dashboard"'), false)
   assert.ok(invalidMixHtml.includes('内容主线'))
 
   const missingMix = HTML_REPORT_FIXTURE.replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 需补充 | 转化 |')
   const missingMixHtml = await markdownToHtmlDocument(missingMix)
   assert.equal(missingMixHtml.includes('建议内容结构'), false)
+  assert.equal(missingMixHtml.includes('class="content-mix-dashboard"'), false)
 
   const rangedMix = HTML_REPORT_FIXTURE
     .replace('| 家庭快餐 | 50% | 主需求 |', '| 家庭快餐 | 50%-60% | 主需求 |')
     .replace('| 囤货机制 | 20% | 转化 |', '| 囤货机制 | 20% | 转化 |')
   const rangedMixHtml = await markdownToHtmlDocument(rangedMix)
   assert.equal(rangedMixHtml.includes('建议内容结构'), false)
+  assert.equal(rangedMixHtml.includes('class="content-mix-dashboard"'), false)
 
   const misleadingClass = HTML_REPORT_FIXTURE.replace(
     '| S01 | 家庭快餐 | 下班十分钟开饭 | 3.1 | 用户 |',
@@ -1210,10 +1234,50 @@ async function testHtmlReportRenderer(): Promise<void> {
   )
   const misleadingClassHtml = await markdownToHtmlDocument(misleadingClass)
   const classCounts = misleadingClassHtml.match(
-    /<section class="count-group"><h3>视频分类<\/h3>([\s\S]*?)<\/section>/
+    /<section class="donut-card">\s*<h3>视频分类<\/h3>([\s\S]*?)<\/section>/
   )?.[1]
   assert.ok(classCounts)
-  assert.match(classCounts || '', /3\.1[\s\S]*?<strong>0 条<\/strong>/)
+  assert.match(classCounts || '', /<span>3\.1<\/span>[\s\S]*?<strong>0条<\/strong>/)
+  assert.match(classCounts || '', /<span>其他分类<\/span>[\s\S]*?<strong>1条<\/strong>/)
+
+  const keywordMarkdown = `# 卖点词频测试
+
+## 5. 产品全量卖点拆解
+| 卖点维度 | 我方产品卖点 | 用户能感知的好处 |
+|---|---|---|
+| 原料 | 自然发酵酸菜，配料简单 | 家庭做菜能直接感知酸菜发酵风味 |
+| 使用 | 酸菜分袋，快速做菜 | 家庭晚餐做菜更快速 |
+| 信任 | 配料清晰，发酵过程可见 | 家庭选择酸菜时更容易核对配料 |
+| 场景 | 家庭日常酸菜做法 | 快速完成一顿家庭饭菜 |`
+  const keywordModel = parseHtmlReportModel(keywordMarkdown)
+  const keywordPlan = buildHtmlReportPresentation(keywordModel).sections.find(
+    (section) => section.sectionNumber === '5'
+  )
+  assert.ok(keywordPlan?.keywordCloud)
+  assert.ok((keywordPlan?.keywordCloud?.items.length || 0) >= 6)
+  assert.ok(keywordPlan?.keywordCloud?.items.some((item) => item.label === '家庭'))
+  assert.ok(keywordPlan?.keywordCloud?.items.some((item) => item.label === '酸菜'))
+  const keywordSection = keywordModel.sections.find((section) => section.number === '5')
+  for (const item of keywordPlan?.keywordCloud?.items || []) {
+    assert.ok(item.count >= 2)
+    for (const source of item.sources) {
+      assert.equal(
+        keywordSection?.tables[source.tableIndex!]?.rows[source.rowIndex!]?.[source.columnIndex!],
+        source.rawValue
+      )
+    }
+  }
+  const keywordHtml = await markdownToHtmlDocument(keywordMarkdown)
+  assert.match(keywordHtml, /class="word-cloud"/)
+  assert.match(keywordHtml, /卖点原文高频词/)
+  assert.match(keywordHtml, /data-count="\d+"/)
+
+  const sparseKeywordPlan = buildHtmlReportPresentation(
+    parseHtmlReportModel(
+      '# 稀疏词测试\n\n## 5. 产品全量卖点拆解\n| 卖点维度 | 我方产品卖点 |\n|---|---|\n| A | 清爽脆嫩 |\n| B | 独立小袋 |'
+    )
+  ).sections.find((section) => section.sectionNumber === '5')
+  assert.equal(sparseKeywordPlan?.keywordCloud, null)
 
   const incompleteBrief = HTML_REPORT_FIXTURE.replace(
     /role: 家庭日常快速配餐/,

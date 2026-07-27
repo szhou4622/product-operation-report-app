@@ -1,6 +1,8 @@
 import { marked } from 'marked'
 import {
   buildHtmlReportPresentation,
+  type HtmlReportDistributionPresentation,
+  type HtmlReportKeywordCloudPresentation,
   type HtmlReportPresentation,
   type HtmlReportSectionPresentation
 } from './htmlReportPresentation'
@@ -19,6 +21,10 @@ import {
 
 export type {
   HtmlReportContentMixPresentation,
+  HtmlReportDistributionItemPresentation,
+  HtmlReportDistributionPresentation,
+  HtmlReportKeywordCloudItemPresentation,
+  HtmlReportKeywordCloudPresentation,
   HtmlReportMetricPresentation,
   HtmlReportPercentFacetPresentation,
   HtmlReportPercentItemPresentation,
@@ -591,9 +597,10 @@ function renderSellingPointMatrix(
 ): string {
   const table = plannedTable(section, plan)
   if (!table || table.rows.length === 0) return ''
+  const keywordCloud = renderKeywordCloud(plan.keywordCloud)
   return renderFigure(
     '卖点证据覆盖',
-    `<div class="selling-grid">${table.rows
+    `${keywordCloud}<div class="selling-grid">${table.rows
       .slice(0, 12)
       .map((row) => {
         const missing = row.some((cell) => /需补充|待补证|未知/.test(cell))
@@ -606,6 +613,35 @@ function renderSellingPointMatrix(
       .join('')}</div>`,
     'selling-visual'
   )
+}
+
+function renderKeywordCloud(cloud: HtmlReportKeywordCloudPresentation | null): string {
+  if (!cloud || cloud.items.length === 0) return ''
+  return `<section class="keyword-panel" aria-labelledby="keyword-cloud-title">
+    <header>
+      <div>
+        <small>从原始卖点表统计</small>
+        <h3 id="keyword-cloud-title">${escapeHtml(cloud.title)}</h3>
+      </div>
+      <span>${cloud.items.length} 个高频词 · ${cloud.totalOccurrences} 次出现</span>
+    </header>
+    <div class="word-cloud" role="list" aria-label="${escapeHtml(
+      cloud.items.map((item) => `${item.label} ${item.count} 次`).join('，')
+    )}">
+      ${cloud.items
+        .map(
+          (item) => `<span class="word-cloud__item weight-${item.weight}" role="listitem" data-count="${
+            item.count
+          }" data-source-count="${item.sources.length}" title="${escapeHtml(
+            `${item.label}：原表出现 ${item.count} 次`
+          )}">
+            <b>${escapeHtml(item.label)}</b><small>×${item.count}</small>
+          </span>`
+        )
+        .join('')}
+    </div>
+    <p class="visual-note">字号只表示词语在原始卖点表中的出现频次；已过滤“产品、用户、卖点”等通用词，点击导出的原表可核对原文。</p>
+  </section>`
 }
 
 function renderOrdinalVisual(
@@ -677,28 +713,45 @@ function renderContentMixVisual(plan: HtmlReportSectionPresentation): string {
     const items = contentMix.items.filter(
       (item): item is typeof item & { value: number } => item.value !== null
     )
+    const distribution: HtmlReportDistributionPresentation = {
+      title: '内容占比',
+      total: 100,
+      unit: '%',
+      totalSources: items.map((item) => item.source),
+      items: items.map((item) => ({
+        label: item.label,
+        value: item.value,
+        sources: [item.source]
+      }))
+    }
     return renderFigure(
       '建议内容结构',
-      `<div class="stacked-bar" role="img" aria-label="${escapeHtml(
-        items.map((item) => `${item.label} ${item.value}%`).join('，')
-      )}">
-        ${items
-          .map(
-            (item, index) =>
-              `<span class="series-${(index % 4) + 1}" style="--share:${item.value}%"><b>${escapeHtml(
-                `${item.value}%`
-              )}</b></span>`
-          )
-          .join('')}
-      </div>
-      <div class="stacked-legend">${items
-        .map(
-          (item, index) =>
-            `<div><i class="series-${(index % 4) + 1}" aria-hidden="true"></i><span>${escapeHtml(
-              item.label
-            )}</span><strong>${item.value}%</strong></div>`
-        )
-        .join('')}</div>`,
+      `<div class="content-mix-dashboard">
+        ${renderDonutChart(distribution, false)}
+        <section class="mix-breakdown" aria-label="内容占比横向对照">
+          <h3>横向占比对照</h3>
+          <div class="stacked-bar" role="img" aria-label="${escapeHtml(
+            items.map((item) => `${item.label} ${item.value}%`).join('，')
+          )}">
+            ${items
+              .map(
+                (item, index) =>
+                  `<span class="series-${(index % 6) + 1}" style="--share:${item.value}%"><b>${escapeHtml(
+                    `${item.value}%`
+                  )}</b></span>`
+              )
+              .join('')}
+          </div>
+          <div class="stacked-legend">${items
+            .map(
+              (item, index) =>
+                `<div><i class="series-${(index % 6) + 1}" aria-hidden="true"></i><span>${escapeHtml(
+                  item.label
+                )}</span><strong>${item.value}%</strong></div>`
+            )
+            .join('')}</div>
+        </section>
+      </div>`,
       'mix-visual'
     )
   }
@@ -717,17 +770,59 @@ function renderContentMixVisual(plan: HtmlReportSectionPresentation): string {
   )
 }
 
-function renderCountBars(items: Array<{ label: string; value: number }>, title: string): string {
-  if (items.length === 0) return ''
-  const max = Math.max(...items.map((item) => item.value), 1)
-  return `<section class="count-group"><h3>${escapeHtml(title)}</h3>${items
-    .map(
-      (item) => `<div class="bar-row" role="img" aria-label="${escapeHtml(`${item.label} ${item.value} 条`)}">
-        <div class="bar-label"><span>${escapeHtml(item.label)}</span><strong>${item.value} 条</strong></div>
-        <div class="bar-track" aria-hidden="true"><span style="--bar-size:${(item.value / max) * 100}%"></span></div>
-      </div>`
-    )
-    .join('')}</section>`
+function renderDonutChart(
+  distribution: HtmlReportDistributionPresentation,
+  showLegend = true
+): string {
+  if (distribution.total <= 0 || distribution.items.length === 0) return ''
+  const activeItems = distribution.items.filter((item) => item.value > 0)
+  let offset = 0
+  const stops = activeItems.map((item, index) => {
+    const start = offset
+    offset += (item.value / distribution.total) * 100
+    const end = index === activeItems.length - 1 ? 100 : offset
+    return `var(--series-${(index % 6) + 1}) ${start.toFixed(3)}% ${end.toFixed(3)}%`
+  })
+  const fill =
+    stops.length > 0 ? `conic-gradient(${stops.join(',')})` : 'conic-gradient(var(--line) 0 100%)'
+  return `<section class="donut-card">
+    <h3>${escapeHtml(distribution.title)}</h3>
+    <div class="donut-card__body${showLegend ? '' : ' has-no-legend'}">
+      <div class="donut-chart" role="img" aria-label="${escapeHtml(
+        distribution.items
+          .map((item) => `${item.label} ${item.value}${distribution.unit}`)
+          .join('，')
+      )}" style="--donut-fill:${fill}">
+        <div class="donut-chart__center">
+          <strong>${distribution.total}${escapeHtml(distribution.unit)}</strong>
+          <span>${escapeHtml(distribution.title)}</span>
+        </div>
+      </div>
+      ${
+        showLegend
+          ? `<div class="donut-legend">
+              ${distribution.items
+                .map((item, index) => {
+                  const percent = (item.value / distribution.total) * 100
+                  return `<div data-count="${item.value}" data-source-count="${item.sources.length}">
+                    <i class="series-${(index % 6) + 1}" aria-hidden="true"></i>
+                    <span>${escapeHtml(item.label)}</span>
+                    <strong>${item.value}${escapeHtml(distribution.unit)}</strong>
+                    ${
+                      distribution.unit === '%'
+                        ? ''
+                        : `<small>${percent.toLocaleString('zh-CN', {
+                            maximumFractionDigits: 1
+                          })}%</small>`
+                    }
+                  </div>`
+                })
+                .join('')}
+            </div>`
+          : ''
+      }
+    </div>
+  </section>`
 }
 
 function renderExecutionVisual(
@@ -773,10 +868,9 @@ function renderExecutionVisual(
   const matrixMax = Math.max(...matrix.flatMap((row) => row.cells), 1)
   return renderFigure(
     '第一轮脚本组合',
-    `<div class="count-grid">${renderCountBars(classes, '视频分类')}${renderCountBars(
-      perspectives,
-      '内容视角'
-    )}</div>
+    `<div class="donut-pair">${plan.executionDistributions
+      .map((distribution) => renderDonutChart(distribution))
+      .join('')}</div>
     <div class="execution-matrix" role="img" aria-label="视频分类与内容视角交叉分布">
       <div class="execution-matrix__corner">分类 × 视角</div>
       ${perspectives.map((item) => `<div class="execution-matrix__head">${escapeHtml(item.label)}</div>`).join('')}

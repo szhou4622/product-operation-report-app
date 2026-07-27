@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "产品经营报告 桌面 App — 按 SOP 把一方/竞品/素材数据生成产品经营报告",
   "main": "./out/main/index.js",
   "author": "",

@@ -80,8 +80,10 @@ evidence-confidence: confirmed
 ## 5. 产品全量卖点拆解
 | 卖点维度 | 我方产品卖点 | 用户能感知的好处 |
 |---|---|---|
-| 使用方法 | 打开即可使用 | 少一步准备 |
-| 场景 | 多种家常菜 | 不容易吃腻 |
+| 原料 | 自然发酵酸菜，配料简单 | 家庭做菜能直接感知酸菜发酵风味 |
+| 使用 | 酸菜分袋，快速做菜 | 家庭晚餐做菜更快速 |
+| 信任 | 配料清晰，发酵过程可见 | 家庭选择酸菜时更容易核对配料 |
+| 场景 | 家庭日常酸菜做法 | 快速完成一顿家庭饭菜 |
 
 ## 6. 卖点用户视角排序
 | 排序 | 用户视角卖点 | 对应产品事实 | 打动的人群/场景 | 作用 |
@@ -240,6 +242,36 @@ async function runAudit(): Promise<void> {
   })
   await window.loadFile(htmlPath)
 
+  const expectedDonuts = presentation.sections.reduce(
+    (sum, sectionPlan) =>
+      sum +
+      sectionPlan.executionDistributions.length +
+      (sectionPlan.contentMix?.mode === 'stacked' ? 1 : 0),
+    0
+  )
+  const expectedWordClouds = presentation.sections.filter(
+    (sectionPlan) => sectionPlan.keywordCloud
+  ).length
+  const visualAudit = (await window.webContents.executeJavaScript(
+    `(() => ({
+      donuts: document.querySelectorAll('.donut-chart').length,
+      visibleDonuts: Array.from(document.querySelectorAll('.donut-chart')).filter((element) => {
+        const rect = element.getBoundingClientRect()
+        return rect.width >= 120 && rect.height >= 120 && getComputedStyle(element).backgroundImage !== 'none'
+      }).length,
+      wordClouds: document.querySelectorAll('.word-cloud').length,
+      wordItems: Array.from(document.querySelectorAll('.word-cloud__item')).filter((element) =>
+        Number(element.getAttribute('data-count')) >= 2
+      ).length
+    }))()`
+  )) as { donuts: number; visibleDonuts: number; wordClouds: number; wordItems: number }
+  assert.equal(visualAudit.donuts, expectedDonuts, '环图数量与展示模型不一致。')
+  assert.equal(visualAudit.visibleDonuts, expectedDonuts, '环图未正确显示或尺寸过小。')
+  assert.equal(visualAudit.wordClouds, expectedWordClouds, '词云数量与展示模型不一致。')
+  if (expectedWordClouds > 0) {
+    assert.ok(visualAudit.wordItems >= 6, '词云未显示足够的可核对高频词。')
+  }
+
   const keyboardAudit = (await window.webContents.executeJavaScript(
     `(() => {
       const focusable = Array.from(document.querySelectorAll('a[href], summary, [tabindex]'))
@@ -358,7 +390,7 @@ async function runAudit(): Promise<void> {
     }))`
   )) as Array<{ section: string; top: number; height: number }>
   const sectionPositions: Record<string, number> = {}
-  for (const sectionNumber of ['1', '3', '4', '7', '9', '10', '11']) {
+  for (const sectionNumber of ['1', '3', '4', '5', '7', '8', '9', '10', '11']) {
     sectionPositions[sectionNumber] = await window.webContents.executeJavaScript(
       `(() => {
         const target = document.querySelector('[data-section="${sectionNumber}"]')
@@ -380,7 +412,7 @@ async function runAudit(): Promise<void> {
   window.setContentSize(320, 760)
   await new Promise((resolveWait) => setTimeout(resolveWait, 120))
   const mobileSectionPositions: Record<string, number> = {}
-  for (const sectionNumber of ['3', '7', '9', '10']) {
+  for (const sectionNumber of ['3', '5', '7', '8', '9', '10']) {
     mobileSectionPositions[sectionNumber] = await window.webContents.executeJavaScript(
       `(() => {
         const target = document.querySelector('[data-section="${sectionNumber}"]')
