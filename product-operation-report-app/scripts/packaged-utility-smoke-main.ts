@@ -72,9 +72,21 @@ async function run(): Promise<void> {
   const parseModulePath = process.argv[2]
   const htmlModulePath = process.argv[3]
   const skillPath = process.argv[4]
+  const packagedPackagePath = process.argv[5]
+  const expectedVersion = process.argv[6]
   assert.ok(parseModulePath, 'Missing packaged parse utility module path')
   assert.ok(htmlModulePath, 'Missing packaged HTML utility module path')
   assert.ok(skillPath, 'Missing packaged Skill path')
+  assert.ok(packagedPackagePath, 'Missing packaged package.json path')
+  assert.ok(expectedVersion, 'Missing expected package version')
+  const packagedPackage = JSON.parse(readFileSync(packagedPackagePath, 'utf8')) as {
+    version?: unknown
+  }
+  assert.equal(
+    packagedPackage.version,
+    expectedVersion,
+    `安装版版本不匹配：当前源码是 ${expectedVersion}，dist 中是 ${String(packagedPackage.version)}。请先重新生成安装版。`
+  )
   const child = utilityProcess.fork(parseModulePath, [], {
     serviceName: '产品经营报告-安装包解析测试',
     stdio: 'pipe'

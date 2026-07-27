@@ -15,6 +15,7 @@ import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import { loadSettings, saveSettings } from '../src/main/settings'
 import { readBundledSopRules } from '../src/main/sopRules'
 import {
+  buildHtmlReportPresentation,
   markdownToHtmlDocument,
   parseHtmlReportModel,
   sanitizeHtmlFragment,
@@ -1102,12 +1103,47 @@ async function testHtmlReportRenderer(): Promise<void> {
   ])
   assert.equal(model.brief.designDirection, 'household-field-guide')
   assert.equal(model.brief.evidenceConfidence, 'confirmed')
+  const presentation = buildHtmlReportPresentation(model)
+  assert.ok(presentation.mainMetric)
+  assert.match(presentation.mainMetric?.label || '', /女性占比/)
+  for (const metric of [presentation.mainMetric, ...presentation.supportingSignals]) {
+    if (!metric) continue
+    const source = metric.source
+    assert.notEqual(source.tableIndex, null)
+    assert.notEqual(source.rowIndex, null)
+    assert.notEqual(source.columnIndex, null)
+    assert.equal(
+      model.sections
+        .find((section) => section.number === source.sectionNumber)
+        ?.tables[source.tableIndex!]?.rows[source.rowIndex!]?.[source.columnIndex!],
+      source.rawValue
+    )
+  }
+  for (const sectionPlan of presentation.sections) {
+    const section = model.sections.find((candidate) => candidate.number === sectionPlan.sectionNumber)
+    assert.ok(section)
+    for (const source of sectionPlan.visualSources) {
+      const expected =
+        source.tableIndex === null
+          ? section?.listItems[source.rowIndex!]
+          : section?.tables[source.tableIndex]?.rows[source.rowIndex!]?.[source.columnIndex!]
+      assert.equal(expected, source.rawValue)
+    }
+  }
+  assert.equal(presentation.sections.find((section) => section.sectionNumber === '0')?.tables[0]?.mode, 'visible')
+  assert.equal(presentation.sections.find((section) => section.sectionNumber === '9')?.tables[0]?.mode, 'collapsed')
 
   const html = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
   const repeated = await markdownToHtmlDocument(HTML_REPORT_FIXTURE)
   assert.equal(html, repeated)
   assert.match(html, /data-report-direction="household-field-guide"/)
-  assert.match(html, /经营优先级/)
+  assert.match(html, /先做什么，再验证什么/)
+  assert.match(html, /class="story-stat-hero"/)
+  assert.match(html, /class="signal-strip"/)
+  assert.match(html, /class="decision-dashboard"/)
+  assert.match(html, /class="chapter-index"/)
+  assert.match(html, /data-source-value=/)
+  assert.match(html, /data-source-cell-count=/)
   assert.match(html, /一方数据分口径对比/)
   assert.match(html, /用户决策顺序/)
   assert.match(html, /人群、场景与卖点匹配/)
@@ -1120,7 +1156,12 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(html, /@media print/)
   assert.match(html, /@page wide/)
   assert.match(html, /class="skip-link"/)
-  assert.match(html, /class="mobile-toc"/)
+  assert.equal(html.includes('class="mobile-toc"'), false)
+  assert.match(html, /@media \(min-width: 769px\)[\s\S]*?\.chapter-index \{ display: none; \}/)
+  assert.match(html, /class="evidence-disclosure"/)
+  assert.match(html, /查看完整数据/)
+  assert.match(html, /class="print-table-copy"/)
+  assert.match(html, /\.print-table-copy \{ display: block !important; \}/)
   assert.match(html, /overflow-wrap: anywhere/)
   assert.match(html, /重复标题-2/)
   assert.equal((html.match(/class="report-section"/g) || []).length, 12)
@@ -1225,9 +1266,114 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(platformFacets, /同口径人群占比 · 视频号 · 关键数据/)
   assert.match(platformFacets, /同口径人群占比 · 云图 · 关键数据/)
 
+  const sourceFacets = await markdownToHtmlDocument(
+    '# 分来源测试\n\n## 3. 一方数据核心判断\n### 同口径人群占比\n| 来源 | 维度 | 关键数据 |\n|---|---|---|\n| 视频号 | 女性 | 60% |\n| 视频号 | 男性 | 40% |\n| 云图 | 女性 | 55% |\n| 云图 | 男性 | 45% |'
+  )
+  assert.match(sourceFacets, /同口径人群占比 · 视频号 · 关键数据/)
+  assert.match(sourceFacets, /同口径人群占比 · 云图 · 关键数据/)
+
+  const groupedDimensions = await markdownToHtmlDocument(
+    '# 分维度测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 维度 | 类别 | 关键数据 |\n|---|---|---|---|\n| 视频号 | 性别 | 女性 | 60% |\n| 视频号 | 性别 | 男性 | 40% |\n| 视频号 | 年龄 | 31-40岁 | 45% |\n| 视频号 | 年龄 | 41-50岁 | 30% |'
+  )
+  assert.match(groupedDimensions, /视频号成交人群 · 视频号 · 性别 · 关键数据/)
+  assert.match(groupedDimensions, /视频号成交人群 · 视频号 · 年龄 · 关键数据/)
+  assert.match(groupedDimensions, />女性<\/span><strong>60%<\/strong>/)
+  assert.match(groupedDimensions, />31-40岁<\/span><strong>45%<\/strong>/)
+
+  const emptyCategories = await markdownToHtmlDocument(
+    '# 空类别测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 维度 | 类别 | 关键数据 |\n|---|---|---|---|\n| 视频号 | 性别 |  | 60% |\n| 视频号 | 性别 |  | 40% |'
+  )
+  assert.equal(emptyCategories.includes('一方数据分口径对比'), false)
+
+  const aliasedDimensions = await markdownToHtmlDocument(
+    '# 维度别名测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 属性 | 选项 | 关键数据 |\n|---|---|---|---|\n| 视频号 | 性别 | 女性 | 60% |\n| 视频号 | 性别 | 男性 | 40% |\n| 视频号 | 年龄 | 31-40岁 | 45% |\n| 视频号 | 年龄 | 41-50岁 | 30% |'
+  )
+  assert.match(aliasedDimensions, /视频号成交人群 · 视频号 · 性别 · 关键数据/)
+  assert.match(aliasedDimensions, /视频号成交人群 · 视频号 · 年龄 · 关键数据/)
+
+  const compactMixedDimensions = await markdownToHtmlDocument(
+    '# 紧凑混合维度测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 类别 | 关键数据 |\n|---|---|---|\n| 视频号 | 女性 | 60% |\n| 视频号 | 男性 | 40% |\n| 视频号 | 31-40岁 | 45% |\n| 视频号 | 41-50岁 | 30% |'
+  )
+  assert.equal(compactMixedDimensions.includes('一方数据分口径对比'), false)
+
+  const compactSingleDimension = await markdownToHtmlDocument(
+    '# 紧凑单维度测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 类别 | 关键数据 |\n|---|---|---|\n| 视频号 | 女性 | 60% |\n| 视频号 | 男性 | 40% |'
+  )
+  assert.match(compactSingleDimension, /视频号成交人群 · 视频号 · 关键数据/)
+
+  const implicitMixedPlatform = await markdownToHtmlDocument(
+    '# 隐式跨平台测试\n\n## 3. 一方数据核心判断\n### 综合数据\n| 维度 | 关键数据 |\n|---|---|\n| 视频号女性 | 60% |\n| 视频号男性 | 40% |\n| 云图女性 | 55% |\n| 云图男性 | 45% |'
+  )
+  assert.equal(implicitMixedPlatform.includes('一方数据分口径对比'), false)
+
+  const mixedDenominator = await markdownToHtmlDocument(
+    '# 混合分母测试\n\n## 3. 一方数据核心判断\n### 视频号综合指标\n| 维度 | 关键数据 |\n|---|---|\n| 女性占全部用户 | 60% |\n| 复购用户占已购用户 | 20% |'
+  )
+  assert.equal(mixedDenominator.includes('一方数据分口径对比'), false)
+
+  const mixedMetricRates = await markdownToHtmlDocument(
+    '# 混合指标测试\n\n## 3. 一方数据核心判断\n### 视频号综合指标\n| 维度 | 数据 |\n|---|---|\n| 女性比例 | 60% |\n| 复购率 | 20% |'
+  )
+  assert.equal(mixedMetricRates.includes('一方数据分口径对比'), false)
+
+  const implicitSinglePlatform = await markdownToHtmlDocument(
+    '# 单平台测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 维度 | 关键数据 |\n|---|---|\n| 女性 | 60% |\n| 男性 | 40% |'
+  )
+  assert.match(implicitSinglePlatform, /视频号成交人群 · 关键数据/)
+
+  const sourceDriftModel = parseHtmlReportModel(
+    '# 来源绑定测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群已确认\n| 维度 | 关键数据 |\n|---|---|\n| 女性 | 60% |\n| 男性 | 40% |\n\n### 视频号成交人群约数\n| 维度 | 关键数据 |\n|---|---|\n| 女性 | 约55% |\n| 男性 | 约45% |'
+  )
+  const sourceDriftPlan = buildHtmlReportPresentation(sourceDriftModel).sections.find(
+    (section) => section.sectionNumber === '3'
+  )
+  assert.deepEqual(sourceDriftPlan?.visualSourceTableIndexes, [0])
+  assert.equal(sourceDriftPlan?.percentFacets.length, 1)
+  const sourceDriftHtml = await markdownToHtmlDocument(
+    '# 来源绑定测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群已确认\n| 维度 | 关键数据 |\n|---|---|\n| 女性 | 60% |\n| 男性 | 40% |\n\n### 视频号成交人群约数\n| 维度 | 关键数据 |\n|---|---|\n| 女性 | 约55% |\n| 男性 | 约45% |'
+  )
+  assert.match(sourceDriftHtml, /data-source-tables="0"/)
+  assert.equal(sourceDriftHtml.includes('约55%</strong>'), false)
+
+  const fallbackMixModel = parseHtmlReportModel(
+    '# 内容回退测试\n\n## 8. 视频号内容主线设计\n| 方向 | 建议占比 |\n|---|---|\n| A | 60% |\n| B | 30% |\n\n| 内容主线 | 对应人群 | 选题方向 |\n|---|---|---|\n| 家庭快餐 | 家庭用户 | 十分钟开饭 |'
+  )
+  const fallbackMixPlan = buildHtmlReportPresentation(fallbackMixModel).sections.find(
+    (section) => section.sectionNumber === '8'
+  )
+  assert.equal(fallbackMixPlan?.contentMix?.mode, 'mainline')
+  assert.deepEqual(fallbackMixPlan?.visualSourceTableIndexes, [1])
+  const fallbackMixHtml = await markdownToHtmlDocument(
+    '# 内容回退测试\n\n## 8. 视频号内容主线设计\n| 方向 | 建议占比 |\n|---|---|\n| A | 60% |\n| B | 30% |\n\n| 内容主线 | 对应人群 | 选题方向 |\n|---|---|---|\n| 家庭快餐 | 家庭用户 | 十分钟开饭 |'
+  )
+  assert.match(fallbackMixHtml, /data-source-tables="1"/)
+
   const incomplete = await markdownToHtmlDocument('# 空报告\n生成日期：2026-07-27\n\n## 0. 结论先行\n需补充')
   assert.match(incomplete, /data-report-direction="neutral-evidence"/)
   assert.ok(incomplete.includes('需补充'))
+  assert.equal(
+    buildHtmlReportPresentation(
+      parseHtmlReportModel('# 低信号报告\n\n## 2. 产品基础信息\n| 模块 | 当前判断 |\n|---|---|\n| 规格 | 3袋 |')
+    ).mainMetric,
+    null
+  )
+  assert.equal(
+    buildHtmlReportPresentation(
+      parseHtmlReportModel(
+        '# 规格与价格测试\n\n## 2. 产品基础信息\n| 模块 | 关键数据 |\n|---|---|\n| 规格 | 10个 |\n| 价格 | 79元 |'
+      )
+    ).mainMetric,
+    null
+  )
+  for (const range of ['19.9~25.9元', '19.9～25.9元', '10~20个']) {
+    const rangePresentation = buildHtmlReportPresentation(
+      parseHtmlReportModel(
+        `# 区间测试\n\n## 3. 一方数据核心判断\n| 指标 | 关键数据 |\n|---|---|\n| 价格区间 | ${range} |`
+      )
+    )
+    assert.equal(rangePresentation.mainMetric, null)
+    assert.equal(rangePresentation.supportingSignals.length, 0)
+  }
 
   const sanitized = sanitizeHtmlFragment(
     '<p class="ok" onclick="bad()">安全</p><iframe src="x">坏</iframe><a href="javascript:bad()">链接</a>'

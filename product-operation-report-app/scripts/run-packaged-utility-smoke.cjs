@@ -1,11 +1,15 @@
 const { buildSync } = require('esbuild')
 const { spawnSync } = require('node:child_process')
-const { existsSync, rmSync } = require('node:fs')
+const { existsSync, readFileSync, rmSync } = require('node:fs')
 const path = require('node:path')
 
 const projectDir = path.resolve(__dirname, '..')
 const output = path.join(projectDir, '.tmp-packaged-utility-smoke.cjs')
 const asarPath = path.join(projectDir, 'dist', 'win-unpacked', 'resources', 'app.asar')
+const packagedPackagePath = path.join(asarPath, 'package.json')
+const expectedVersion = JSON.parse(
+  readFileSync(path.join(projectDir, 'package.json'), 'utf8')
+).version
 const parseModulePath = path.join(
   asarPath,
   'out',
@@ -40,11 +44,22 @@ try {
   })
 
   const electron = require('electron')
-  const result = spawnSync(electron, [output, parseModulePath, htmlModulePath, skillPath], {
-    cwd: projectDir,
-    stdio: 'inherit',
-    windowsHide: true
-  })
+  const result = spawnSync(
+    electron,
+    [
+      output,
+      parseModulePath,
+      htmlModulePath,
+      skillPath,
+      packagedPackagePath,
+      expectedVersion
+    ],
+    {
+      cwd: projectDir,
+      stdio: 'inherit',
+      windowsHide: true
+    }
+  )
   if (result.error) throw result.error
   process.exitCode = result.status ?? 1
 } finally {

@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "产品经营报告 桌面 App — 按 SOP 把一方/竞品/素材数据生成产品经营报告",
   "main": "./out/main/index.js",
   "author": "",
@@ -9,6 +9,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "test:regression": "node scripts/run-regression.cjs",
+    "test:html-visual": "node scripts/run-html-visual-smoke.cjs",
     "test:utility": "npm run build && node scripts/run-utility-smoke.cjs",
     "test:packaged-utility": "node scripts/run-packaged-utility-smoke.cjs",
     "preview": "electron-vite preview",
