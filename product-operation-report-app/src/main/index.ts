@@ -1,13 +1,31 @@
-import { app, shell, BrowserWindow, ipcMain, Menu } from 'electron'
-import { join } from 'path'
+import { app, shell, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
+import { randomUUID } from 'crypto'
+import { isAbsolute, join } from 'path'
 import { existsSync, readFileSync } from 'fs'
 import type { AppSettings, ChatMessage, SavedProject, TestModelOptions } from '../shared/types'
 import { getActiveProfile, loadSettings, saveSettings } from './settings'
 import { chatStream, listModels, testModel } from './model'
-import { parseArchive, parseFile } from './ingest'
+import {
+  cancelParsingForOwner,
+  disposeParseService,
+  parseArchiveInUtility,
+  parseFileInUtility
+} from './parseService'
 import { exportDocx, exportHtml, exportMarkdown } from './export'
-import { loadLastProject, saveLastProject } from './project'
+import {
+  archiveProject,
+  loadLastProject,
+  loadPreviousProject,
+  saveLastProject,
+  saveLastProjectSync
+} from './project'
 import { activateWithCode, getActivationStatus } from './activation'
+
+let mainWindow: BrowserWindow | null = null
+let latestProjectSnapshot: SavedProject | null = null
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) app.quit()
 
 function resolveWindowIcon(): string | undefined {
   const candidates = [
@@ -32,15 +50,23 @@ async function openExternalUrl(url: string): Promise<void> {
   await shell.openExternal(url)
 }
 
+function validateLocalPath(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 4096 || !isAbsolute(value)) {
+    throw new Error('文件路径无效，请重新导出。')
+  }
+  if (!existsSync(value)) throw new Error('文件已被移动或删除，请重新导出。')
+  return value
+}
+
 function ensureActivated(): void {
   if (!getActivationStatus().activated) throw new Error('软件未激活，请先输入激活码。')
 }
 
 function createWindow(): void {
-  const mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1280,
     height: 820,
-    minWidth: 960,
+    minWidth: 880,
     minHeight: 640,
     show: false,
     title: '产品经营报告',
@@ -52,11 +78,104 @@ function createWindow(): void {
       contextIsolation: true
     }
   })
+  mainWindow = window
+  const ownerId = window.webContents.id
 
-  mainWindow.on('ready-to-show', () => mainWindow.show())
+  let forceClose = false
+  let closeRequestId = ''
+  let closeTimer: ReturnType<typeof setTimeout> | null = null
+  let closeGuardReady = false
+  const finishClose = (): void => {
+    forceClose = true
+    if (closeTimer) clearTimeout(closeTimer)
+    closeTimer = null
+    window.close()
+  }
+  const scheduleCloseTimeout = (delay = 5000): void => {
+    if (closeTimer) clearTimeout(closeTimer)
+    closeTimer = setTimeout(() => {
+      closeTimer = null
+      if (!closeRequestId || window.isDestroyed()) return
+      void dialog
+        .showMessageBox(window, {
+          type: 'warning',
+          title: '保存时间较长',
+          message: '软件正在保存当前分析，暂时还不能安全关闭。',
+          detail: '建议继续等待，避免丢失刚才的操作。',
+          buttons: ['继续等待', '仍然退出'],
+          defaultId: 0,
+          cancelId: 0
+        })
+        .then((result) => {
+          if (window.isDestroyed() || !closeRequestId) return
+          if (result.response === 1) finishClose()
+          else scheduleCloseTimeout(10000)
+        })
+    }, delay)
+  }
+  const onCloseReady = (
+    event: Electron.IpcMainEvent,
+    payload: { id?: string; ok?: boolean; error?: string }
+  ): void => {
+    if (event.sender !== window.webContents || !closeRequestId || payload?.id !== closeRequestId) return
+    if (closeTimer) clearTimeout(closeTimer)
+    closeTimer = null
+    closeRequestId = ''
+    if (payload.ok) {
+      finishClose()
+      return
+    }
+    void dialog.showMessageBox(window, {
+      type: 'error',
+      title: '暂时无法关闭',
+      message: '当前分析还没有保存成功。',
+      detail: payload.error || '请检查磁盘空间或文件权限，然后再关闭软件。',
+      buttons: ['我知道了']
+    })
+  }
+  ipcMain.on('app:close-ready', onCloseReady)
+  const onCloseGuardState = (event: Electron.IpcMainEvent, ready: boolean): void => {
+    if (event.sender === window.webContents) closeGuardReady = Boolean(ready)
+  }
+  ipcMain.on('app:close-guard-state', onCloseGuardState)
+
+  window.on('close', (event) => {
+    if (forceClose || !closeGuardReady || window.webContents.isDestroyed()) return
+    event.preventDefault()
+    if (closeRequestId) return
+    closeRequestId = randomUUID()
+    window.webContents.send('app:before-close', { id: closeRequestId })
+    scheduleCloseTimeout()
+  })
+  window.on('session-end', () => {
+    if (latestProjectSnapshot) {
+      try {
+        saveLastProjectSync(latestProjectSnapshot)
+      } catch {
+        // Windows 正在强制结束会话，无法阻止；尽最大努力保留最近一次主进程快照
+      }
+    }
+    forceClose = true
+  })
+
+  window.webContents.on('render-process-gone', () => {
+    closeGuardReady = false
+    cancelParsingForOwner(ownerId, '界面已重新加载，旧文件解析已停止。')
+    for (const controller of inflight.values()) controller.abort()
+    inflight.clear()
+  })
+
+  window.on('ready-to-show', () => window.show())
+  window.on('closed', () => {
+    if (closeTimer) clearTimeout(closeTimer)
+    cancelParsingForOwner(ownerId, '窗口已关闭，旧文件解析已停止。')
+    ipcMain.removeListener('app:close-ready', onCloseReady)
+    ipcMain.removeListener('app:close-guard-state', onCloseGuardState)
+    if (mainWindow === window) mainWindow = null
+  })
 
   // 输入框右键菜单：剪切 / 复制 / 粘贴 / 全选
-  mainWindow.webContents.on('context-menu', (_e, params) => {
+  window.webContents.on('context-menu', (_e, params) => {
     if (params.isEditable) {
       Menu.buildFromTemplate([
         { role: 'cut' },
@@ -64,28 +183,30 @@ function createWindow(): void {
         { role: 'paste' },
         { type: 'separator' },
         { role: 'selectAll' }
-      ]).popup({ window: mainWindow })
+      ]).popup({ window })
     } else if (params.selectionText) {
-      Menu.buildFromTemplate([{ role: 'copy' }]).popup({ window: mainWindow })
+      Menu.buildFromTemplate([{ role: 'copy' }]).popup({ window })
     }
   })
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    void openExternalUrl(details.url)
+  window.webContents.setWindowOpenHandler((details) => {
+    void openExternalUrl(details.url).catch(() => undefined)
     return { action: 'deny' }
   })
 
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isSafeExternalUrl(url)) {
-      event.preventDefault()
-      void openExternalUrl(url)
-    }
+  window.webContents.on('will-navigate', (event, url) => {
+    const currentUrl = window.webContents.getURL()
+    const withoutHash = (value: string): string => value.split('#', 1)[0]
+    if (url === currentUrl || (withoutHash(url) === withoutHash(currentUrl) && url.includes('#'))) return
+
+    event.preventDefault()
+    if (isSafeExternalUrl(url)) void openExternalUrl(url).catch(() => undefined)
   })
 
   if (process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    window.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    window.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -99,6 +220,16 @@ ipcMain.handle('settings:save', (_e, settings: AppSettings) => {
   return saveSettings(settings)
 })
 ipcMain.handle('shell:openExternal', (_e, url: string) => openExternalUrl(url))
+ipcMain.handle('shell:openPath', async (_e, path: string) => {
+  ensureActivated()
+  const error = await shell.openPath(validateLocalPath(path))
+  if (error) throw new Error('系统没有找到可打开此文件的程序，请点击“打开所在文件夹”。')
+})
+ipcMain.handle('shell:showItemInFolder', (_e, path: string) => {
+  ensureActivated()
+  shell.showItemInFolder(validateLocalPath(path))
+})
+ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:activate', (_e, code: string) => activateWithCode(code))
 
@@ -109,7 +240,19 @@ ipcMain.handle('project:loadLast', () => {
 })
 ipcMain.handle('project:saveLast', (_e, project: SavedProject) => {
   ensureActivated()
+  latestProjectSnapshot = project
   return saveLastProject(project)
+})
+ipcMain.on('project:cacheSnapshot', (_e, project: SavedProject) => {
+  if (getActivationStatus().activated) latestProjectSnapshot = project
+})
+ipcMain.handle('project:archive', (_e, project: SavedProject) => {
+  ensureActivated()
+  return archiveProject(project)
+})
+ipcMain.handle('project:loadPrevious', () => {
+  ensureActivated()
+  return loadPreviousProject()
 })
 
 // ---- IPC：测试模型 ----
@@ -123,13 +266,16 @@ ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => 
 })
 
 // ---- IPC：文件解析 ----
-ipcMain.handle('file:parse', (_e, payload: { name: string; data: ArrayBuffer }) => {
+ipcMain.handle('file:parse', (event, payload: { name: string; data: ArrayBuffer }) => {
   ensureActivated()
-  return parseFile(payload.name, payload.data)
+  return parseFileInUtility(event.sender.id, payload.name, payload.data)
 })
-ipcMain.handle('archive:parse', (_e, payload: { name: string; data: ArrayBuffer }) => {
+ipcMain.handle('archive:parse', (event, payload: { name: string; data: ArrayBuffer }) => {
   ensureActivated()
-  return parseArchive(payload.name, payload.data)
+  return parseArchiveInUtility(event.sender.id, payload.name, payload.data)
+})
+ipcMain.handle('file:cancelAll', (event) => {
+  cancelParsingForOwner(event.sender.id)
 })
 
 // ---- IPC：读取 SOP 规则（SKILL.md）作为系统提示词 ----
@@ -215,14 +361,27 @@ function setupMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-app.whenReady().then(() => {
-  setupMenu()
-  createWindow()
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+if (hasSingleInstanceLock) {
+  app.on('second-instance', () => {
+    if (!mainWindow) return
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
   })
-})
+
+  app.whenReady().then(() => {
+    setupMenu()
+    createWindow()
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
+  })
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('will-quit', () => {
+  disposeParseService()
 })

@@ -6,11 +6,28 @@ import { validateReport } from '../validate'
 
 export default function ReportPreview(): JSX.Element {
   const reportMarkdown = useStore((s) => s.reportMarkdown)
+  const reportStale = useStore((s) => s.reportStale)
+  const artifacts = useStore((s) => s.artifacts)
   const phase = useStore((s) => s.phase)
   const exportStatus = useStore((s) => s.exportStatus)
+  const lastExportPath = useStore((s) => s.lastExportPath)
+  const openingExport = useStore((s) => s.openingExport)
   const exportReport = useStore((s) => s.exportReport)
+  const openLastExport = useStore((s) => s.openLastExport)
+  const showLastExportInFolder = useStore((s) => s.showLastExportInFolder)
 
-  const warnings = useMemo(() => validateReport(reportMarkdown), [reportMarkdown])
+  const reportGenerating = phase === 'cleaning' || phase === 'analyzing'
+  const exporting = exportStatus === '导出中…'
+  const canExport =
+    Boolean(reportMarkdown) &&
+    !reportGenerating &&
+    !exporting &&
+    artifacts[9] === reportMarkdown &&
+    (phase === 'done' || reportStale)
+  const warnings = useMemo(
+    () => (reportGenerating ? [] : validateReport(reportMarkdown)),
+    [reportGenerating, reportMarkdown]
+  )
   const headings = useMemo(
     () =>
       reportMarkdown
@@ -25,16 +42,16 @@ export default function ReportPreview(): JSX.Element {
   return (
     <div className={`pane report-pane ${phase === 'checkpoint2' || phase === 'done' ? 'report-ready' : ''}`} style={{ borderRight: 'none' }}>
       <div className="pane-title report-title-bar">
-        <span>{reportMarkdown ? '报告预览' : '报告大纲'}</span>
+        <span>{reportGenerating && reportMarkdown ? '报告生成中…' : reportMarkdown ? '报告预览' : '报告大纲'}</span>
         {reportMarkdown && (
           <span className="export-bar">
-            <button className="btn xs primary" onClick={() => void exportReport('html')}>
+            <button className="btn xs primary" disabled={!canExport} onClick={() => void exportReport('html')}>
               导出 HTML
             </button>
-            <button className="btn xs" onClick={() => void exportReport('md')}>
+            <button className="btn xs" disabled={!canExport} onClick={() => void exportReport('md')}>
               导出 MD
             </button>
-            <button className="btn xs" onClick={() => void exportReport('docx')}>
+            <button className="btn xs" disabled={!canExport} onClick={() => void exportReport('docx')}>
               导出 Word
             </button>
           </span>
@@ -52,7 +69,20 @@ export default function ReportPreview(): JSX.Element {
               ))}
             </aside>
             <main className="report-canvas">
-              {warnings.length > 0 ? (
+              {reportStale && (
+                <div className="warnings">
+                  <div className="warnings-title">资料已变化</div>
+                  <div>当前保留的是上一份完整报告，可先导出备份；重新生成成功后会自动替换。</div>
+                </div>
+              )}
+              {phase === 'checkpoint2' ? (
+                <div className="warnings">
+                  <div className="warnings-title">这是待确认的初稿</div>
+                  <div>请先检查内容，再点击左侧“确认定稿”；定稿后才能导出最终报告。</div>
+                </div>
+              ) : reportGenerating ? (
+                <div className="structure-ok">报告正在生成，完成后才能导出。</div>
+              ) : warnings.length > 0 ? (
                 <div className="warnings">
                   <div className="warnings-title">成稿检查（{warnings.length}）</div>
                   <ul>
@@ -64,7 +94,29 @@ export default function ReportPreview(): JSX.Element {
               ) : (
                 <div className="structure-ok">成稿结构符合目标报告模板</div>
               )}
-              {exportStatus && <div className="export-status">{exportStatus}</div>}
+              {exportStatus && (
+                <div className="export-status">
+                  <span>{exportStatus}</span>
+                  {lastExportPath && (
+                    <div className="export-result-actions">
+                      <button
+                        className="btn xs primary"
+                        disabled={openingExport}
+                        onClick={() => void openLastExport()}
+                      >
+                        {openingExport ? '正在打开…' : '打开刚导出的文件'}
+                      </button>
+                      <button
+                        className="btn xs"
+                        disabled={openingExport}
+                        onClick={() => void showLastExportInFolder()}
+                      >
+                        打开所在文件夹
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="markdown-body">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportMarkdown}</ReactMarkdown>
               </div>

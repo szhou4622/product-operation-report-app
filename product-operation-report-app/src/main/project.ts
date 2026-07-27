@@ -1,5 +1,15 @@
 import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from 'fs'
+import { copyFile, rename, rm, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import type {
   ProjectCleanDetailSnapshot,
@@ -28,9 +38,18 @@ const MESSAGE_KINDS = new Set<NonNullable<ProjectMessageSnapshot['kind']>>([
   'report-block',
   'error'
 ])
+const MAX_PROJECT_FILE_BYTES = 200 * 1024 * 1024
 
 function projectPath(): string {
   return join(app.getPath('userData'), PROJECT_FILE_NAME)
+}
+
+function backupPath(): string {
+  return `${projectPath()}.bak`
+}
+
+function previousProjectPath(): string {
+  return join(app.getPath('userData'), 'previous-project.json')
 }
 
 function isPlainObject(value: unknown): value is PlainRecord {
@@ -47,6 +66,10 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function sanitizeRevision(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
 }
 
 function sanitizePhase(value: unknown): ProjectPhase {
@@ -115,6 +138,7 @@ function sanitizeArtifactRecord(value: unknown): Record<number, string> {
 function sanitizeProject(value: unknown): SavedProject {
   const input = isPlainObject(value) ? value : {}
   return {
+    revision: sanitizeRevision(input.revision),
     sources: Array.isArray(input.sources)
       ? input.sources
           .map((source) => sanitizeSource(source))
@@ -133,27 +157,161 @@ function sanitizeProject(value: unknown): SavedProject {
       : [],
     artifacts: sanitizeArtifactRecord(input.artifacts),
     reportMarkdown: asString(input.reportMarkdown),
+    reportStale: Boolean(input.reportStale),
     phase: sanitizePhase(input.phase),
     steering: asString(input.steering),
     updatedAt: optionalString(input.updatedAt) || new Date().toISOString()
   }
 }
 
-export function loadLastProject(): SavedProject | null {
-  const file = projectPath()
+function hasProjectShape(value: unknown): value is PlainRecord {
+  if (!isPlainObject(value)) return false
+  return (
+    Array.isArray(value.sources) &&
+    Array.isArray(value.messages) &&
+    isPlainObject(value.artifacts) &&
+    typeof value.cleanedData === 'string' &&
+    typeof value.reportMarkdown === 'string' &&
+    typeof value.steering === 'string' &&
+    typeof value.phase === 'string' &&
+    PROJECT_PHASES.has(value.phase as ProjectPhase)
+  )
+}
+
+function loadProjectFile(file: string): SavedProject | null {
   if (!existsSync(file)) return null
 
   try {
-    return sanitizeProject(JSON.parse(readFileSync(file, 'utf8')))
+    if (statSync(file).size > MAX_PROJECT_FILE_BYTES) return null
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
+    return hasProjectShape(parsed) ? sanitizeProject(parsed) : null
   } catch {
     return null
   }
 }
 
-export function saveLastProject(project: SavedProject): SavedProject {
-  const snapshot = sanitizeProject(project)
+export function loadLastProject(): SavedProject | null {
+  const candidates = [loadProjectFile(projectPath()), loadProjectFile(backupPath())].filter(
+    (project): project is SavedProject => Boolean(project)
+  )
+  candidates.sort((a, b) => {
+    if (a.revision !== b.revision) return b.revision - a.revision
+    return Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
+  })
+  return candidates[0] ?? null
+}
+
+export function loadPreviousProject(): SavedProject | null {
+  return loadProjectFile(previousProjectPath())
+}
+
+let saveQueue: Promise<void> = Promise.resolve()
+
+function serializedProject(snapshot: SavedProject): string {
+  const serialized = JSON.stringify(snapshot, null, 2)
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_PROJECT_FILE_BYTES) {
+    throw new Error('当前资料过多，项目无法安全保存。请删除部分大图片或拆成两份分析后重试。')
+  }
+  return serialized
+}
+
+function currentIsNewer(current: SavedProject | null, snapshot: SavedProject): current is SavedProject {
+  if (!current) return false
+  if (current.revision !== snapshot.revision) return current.revision > snapshot.revision
+  return Date.parse(current.updatedAt) > Date.parse(snapshot.updatedAt)
+}
+
+async function refreshBackupAtomically(file: string, backup: string): Promise<void> {
+  const backupTemp = `${backup}.tmp-${process.pid}-${Date.now()}`
+  try {
+    await copyFile(file, backupTemp)
+    await rename(backupTemp, backup)
+  } finally {
+    if (existsSync(backupTemp)) await rm(backupTemp, { force: true })
+  }
+}
+
+async function writeProjectSnapshot(snapshot: SavedProject): Promise<SavedProject> {
   const file = projectPath()
+  const backup = backupPath()
+  const temp = `${file}.tmp-${process.pid}-${Date.now()}`
   mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, JSON.stringify(snapshot, null, 2), 'utf8')
+  const serialized = serializedProject(snapshot)
+
+  const current = loadProjectFile(file) ?? loadProjectFile(backup)
+  if (currentIsNewer(current, snapshot)) return current
+
+  try {
+    await writeFile(temp, serialized, 'utf8')
+    const latest = loadProjectFile(file) ?? loadProjectFile(backup)
+    if (currentIsNewer(latest, snapshot)) return latest
+    await rename(temp, file)
+    try {
+      await refreshBackupAtomically(file, backup)
+    } catch {
+      // 保留旧备份；主文件已经原子写入成功
+    }
+  } finally {
+    if (existsSync(temp)) await rm(temp, { force: true })
+  }
   return snapshot
+}
+
+export function saveLastProject(project: SavedProject): Promise<SavedProject> {
+  const snapshot = sanitizeProject(project)
+  const task = saveQueue.then(() => writeProjectSnapshot(snapshot))
+  saveQueue = task.then(
+    () => undefined,
+    () => undefined
+  )
+  return task
+}
+
+export function saveLastProjectSync(project: SavedProject): SavedProject {
+  const snapshot = sanitizeProject(project)
+  const serialized = serializedProject(snapshot)
+  const file = projectPath()
+  const backup = backupPath()
+  const temp = `${file}.sync-${process.pid}-${Date.now()}`
+  const backupTemp = `${backup}.sync-${process.pid}-${Date.now()}`
+  mkdirSync(dirname(file), { recursive: true })
+  const current = loadProjectFile(file) ?? loadProjectFile(backup)
+  if (currentIsNewer(current, snapshot)) return current
+
+  try {
+    writeFileSync(temp, serialized, 'utf8')
+    renameSync(temp, file)
+    try {
+      copyFileSync(file, backupTemp)
+      renameSync(backupTemp, backup)
+    } catch {
+      if (existsSync(backupTemp)) rmSync(backupTemp, { force: true })
+    }
+    return snapshot
+  } finally {
+    if (existsSync(temp)) rmSync(temp, { force: true })
+    if (existsSync(backupTemp)) rmSync(backupTemp, { force: true })
+  }
+}
+
+export function archiveProject(project: SavedProject): Promise<SavedProject> {
+  const snapshot = sanitizeProject(project)
+  serializedProject(snapshot)
+  const task = saveQueue.then(async () => {
+    const file = previousProjectPath()
+    const temp = `${file}.tmp`
+    mkdirSync(dirname(file), { recursive: true })
+    try {
+      await writeFile(temp, JSON.stringify(snapshot, null, 2), 'utf8')
+      await rename(temp, file)
+    } finally {
+      if (existsSync(temp)) await rm(temp, { force: true })
+    }
+    return snapshot
+  })
+  saveQueue = task.then(
+    () => undefined,
+    () => undefined
+  )
+  return task
 }

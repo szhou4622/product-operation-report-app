@@ -17,6 +17,7 @@ export interface AppSettings {
   activeProfileId: string | null
   projectsDir: string // 报告工程默认保存目录
   privacyAccepted: boolean // 是否已确认“资料会发送到当前模型服务商”
+  privacyEndpoint?: string // 上次确认隐私说明时使用的模型服务地址
 }
 
 /** 聊天消息内容块 */
@@ -52,6 +53,7 @@ export interface ProjectSourceSnapshot {
   text?: string
   dataUrl?: string
   error?: string
+  warning?: string
   attribution?: string
   platform?: string
   purpose?: string
@@ -73,12 +75,14 @@ export interface ProjectCleanDetailSnapshot {
 }
 
 export interface SavedProject {
+  revision: number
   sources: ProjectSourceSnapshot[]
   messages: ProjectMessageSnapshot[]
   cleanedData: string
   cleanDetails: ProjectCleanDetailSnapshot[]
   artifacts: Record<number, string>
   reportMarkdown: string
+  reportStale: boolean
   phase: ProjectPhase
   steering: string
   updatedAt: string
@@ -107,10 +111,12 @@ export interface ModelListResult {
 export interface ArchiveItem {
   name: string
   kind: 'image' | 'doc' | 'table' | 'other'
+  size?: number
   text?: string
   dataUrl?: string // 图片
   ok: boolean
   error?: string
+  warning?: string
 }
 
 /** 报告导出结果 */
@@ -128,6 +134,7 @@ export interface ParsedFile {
   text: string // 抽取出的文本（表格转 CSV）
   ok: boolean
   error?: string
+  warning?: string
 }
 
 /** 流式聊天事件（通过 IPC 推送到渲染层） */

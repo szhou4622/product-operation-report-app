@@ -9,12 +9,14 @@ files:
   - package.json
 asarUnpack:
   - assets/**/*
+afterPack: build/afterPack.cjs
 mac:
   target:
     - dmg
   category: public.app-category.productivity
 win:
   icon: build/icon.ico
+  signAndEditExecutable: false
   target:
     - nsis
 nsis:

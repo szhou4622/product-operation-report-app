@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import type { ActivationStatus } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
@@ -7,6 +7,17 @@ import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
 
 const SOP_GUIDE_URL = 'https://my.feishu.cn/docx/FU5FdRkHFoNH7JxUp6wciLksnEe'
+
+function friendlyUiError(value: unknown, fallback: string): string {
+  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
+  if (!raw) return fallback
+  if (/ENOSPC|no space|磁盘.*满/i.test(raw)) return '磁盘空间不足，请清理空间后重试。'
+  if (/EACCES|EPERM|permission|access denied|权限/i.test(raw)) {
+    return '没有写入权限，请关闭占用文件的软件，或换一个可保存的位置后重试。'
+  }
+  if (/fetch failed|ECONN|ENOTFOUND|network|网络/i.test(raw)) return '网络连接失败，请检查网络后重试。'
+  return raw.length <= 160 && !/[{}<>]/.test(raw) ? raw : fallback
+}
 
 function openExternalLink(url: string): void {
   const api = window.api as typeof window.api & { openExternal?: (targetUrl: string) => Promise<void> }
@@ -45,6 +56,9 @@ function ProductLogo(): JSX.Element {
 
 export default function App(): JSX.Element {
   const init = useStore((s) => s.init)
+  const initialized = useStore((s) => s.initialized)
+  const persistencePaused = useStore((s) => s.persistencePaused)
+  const projectRevision = useStore((s) => s.projectRevision)
   const settings = useStore((s) => s.settings)
   const phase = useStore((s) => s.phase)
   const sources = useStore((s) => s.sources)
@@ -53,55 +67,212 @@ export default function App(): JSX.Element {
   const cleanDetails = useStore((s) => s.cleanDetails)
   const artifacts = useStore((s) => s.artifacts)
   const reportMarkdown = useStore((s) => s.reportMarkdown)
+  const reportStale = useStore((s) => s.reportStale)
   const steering = useStore((s) => s.steering)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const saveSettings = useStore((s) => s.saveSettings)
+  const resetAnalysis = useStore((s) => s.resetAnalysis)
+  const restorePreviousAnalysis = useStore((s) => s.restorePreviousAnalysis)
+  const previousProjectAvailable = useStore((s) => s.previousProjectAvailable)
   const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null)
   const [activationCode, setActivationCode] = useState('')
   const [activationError, setActivationError] = useState('')
   const [activationBusy, setActivationBusy] = useState(false)
   const [privacySaving, setPrivacySaving] = useState(false)
   const [privacyError, setPrivacyError] = useState('')
+  const [newAnalysisState, setNewAnalysisState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const [newAnalysisError, setNewAnalysisError] = useState('')
+  const [restoreBusy, setRestoreBusy] = useState(false)
+  const [activationLoadError, setActivationLoadError] = useState('')
+  const [initError, setInitError] = useState('')
+  const [autosaveError, setAutosaveError] = useState('')
+  const [appVersion, setAppVersion] = useState('')
+  const autosaveAttempt = useRef(0)
+  const reportForEmergencyCache =
+    phase === 'cleaning' || phase === 'analyzing' ? artifacts[9] || '' : reportMarkdown
+
+  const checkActivation = async (): Promise<void> => {
+    setActivationLoadError('')
+    try {
+      setActivationStatus(await window.api.getActivationStatus())
+    } catch (error) {
+      setActivationLoadError(friendlyUiError(error, '读取激活状态失败，请重试。'))
+    }
+  }
+
+  useEffect(() => {
+    void window.api.getAppVersion().then(setAppVersion).catch(() => undefined)
+  }, [])
 
   useEffect(() => {
     let alive = true
-    void window.api.getActivationStatus().then((status) => {
-      if (alive) setActivationStatus(status)
-    })
+    void window.api
+      .getActivationStatus()
+      .then((status) => {
+        if (alive) setActivationStatus(status)
+      })
+      .catch((error: unknown) => {
+        if (alive) setActivationLoadError(friendlyUiError(error, '读取激活状态失败，请重试。'))
+      })
     return () => {
       alive = false
     }
   }, [])
 
   useEffect(() => {
-    if (activationStatus?.activated) void init()
-  }, [activationStatus?.activated, init])
+    if (!activationStatus?.activated || initialized) return
+    setInitError('')
+    void init().catch((error: unknown) => {
+      setInitError(friendlyUiError(error, '初始化软件失败，请重试。'))
+    })
+  }, [activationStatus?.activated, init, initialized])
 
   useEffect(() => {
-    if (!settings) return
+    if (!initialized || !settings || persistencePaused) return
     const handle = window.setTimeout(() => {
-      void window.api.saveLastProject(
-        buildProjectSnapshot({
-          sources,
-          messages,
-          cleanedData,
-          cleanDetails,
-          artifacts,
-          reportMarkdown,
-          phase,
-          steering
+      const attempt = ++autosaveAttempt.current
+      void window.api
+        .saveLastProject(
+          buildProjectSnapshot({
+            projectRevision,
+            sources,
+            messages,
+            cleanedData,
+            cleanDetails,
+            artifacts,
+            reportMarkdown,
+            reportStale,
+            phase,
+            steering
+          })
+        )
+        .then(() => {
+          if (autosaveAttempt.current === attempt) setAutosaveError('')
         })
-      )
-    }, 800)
+        .catch((error: unknown) => {
+          if (autosaveAttempt.current === attempt) {
+            setAutosaveError(friendlyUiError(error, '自动保存失败，请检查磁盘空间后重试。'))
+          }
+        })
+    }, 100)
     return () => window.clearTimeout(handle)
-  }, [settings, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, phase, steering])
+  }, [initialized, persistencePaused, settings, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
+
+  useLayoutEffect(() => {
+    if (!initialized || persistencePaused) return
+    window.api.cacheProjectSnapshot(
+      buildProjectSnapshot({
+        projectRevision,
+        sources,
+        messages,
+        cleanedData,
+        cleanDetails,
+        artifacts,
+        reportMarkdown: reportForEmergencyCache,
+        reportStale,
+        phase,
+        steering
+      })
+    )
+  }, [initialized, persistencePaused, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportForEmergencyCache, reportStale, phase, steering])
+
+  useEffect(() => {
+    if (!initialized) return
+    return window.api.onBeforeClose(async () => {
+      const state = useStore.getState()
+      await window.api.saveLastProject(buildProjectSnapshot(state))
+    })
+  }, [initialized])
+
+  useEffect(() => {
+    if (newAnalysisState !== 'success' && newAnalysisState !== 'error') return
+    const handle = window.setTimeout(() => {
+      setNewAnalysisState('idle')
+      setNewAnalysisError('')
+    }, 2600)
+    return () => window.clearTimeout(handle)
+  }, [newAnalysisState])
 
   const active =
     settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
 
   const [columns, setColumns] = useState({ left: 240, right: 380 })
   const [windowWidth, setWindowWidth] = useState(() => window.innerWidth || 1280)
-  const needsPrivacyConsent = Boolean(settings && !settings.privacyAccepted)
+  const activeEndpoint = active?.baseURL.trim().replace(/\/+$/, '') || ''
+  const needsPrivacyConsent = Boolean(
+    settings && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
+  )
+
+  useEffect(() => {
+    const elements = Array.from(document.querySelectorAll<HTMLElement>('.topbar, .panes'))
+    for (const element of elements) {
+      if (needsPrivacyConsent) element.setAttribute('inert', '')
+      else element.removeAttribute('inert')
+    }
+    return () => elements.forEach((element) => element.removeAttribute('inert'))
+  }, [needsPrivacyConsent])
+
+  const analysisBusy = phase === 'cleaning' || phase === 'analyzing'
+  const hasAnalysis = Boolean(
+    sources.length ||
+      messages.length ||
+      cleanedData ||
+      cleanDetails.length ||
+      Object.keys(artifacts).length ||
+      reportMarkdown ||
+      steering
+  )
+
+  const newAnalysisButtonLabel =
+    newAnalysisState === 'loading'
+      ? '正在新建…'
+      : newAnalysisState === 'success'
+        ? '已新建'
+        : newAnalysisState === 'error'
+          ? '新建失败'
+          : '新建分析'
+
+  const newAnalysisButtonTitle = analysisBusy
+    ? '当前分析正在进行，请先等待完成或停止任务'
+    : !hasAnalysis
+      ? '当前已经是一份空白分析'
+      : '清空当前资料、对话和报告，开始一份新的分析'
+
+  const handleNewAnalysis = async (): Promise<void> => {
+    if (!hasAnalysis || analysisBusy || newAnalysisState === 'loading') return
+    const confirmed = window.confirm(
+      '新建分析会清空当前资料、对话和报告。软件会保留上一份，您可以随时点“恢复上一份”。\n\n模型设置和激活状态不会改变。确定新建吗？'
+    )
+    if (!confirmed) return
+
+    setNewAnalysisState('loading')
+    setNewAnalysisError('')
+    try {
+      await resetAnalysis()
+      setNewAnalysisState('success')
+    } catch (error) {
+      setNewAnalysisState('error')
+      setNewAnalysisError(
+        `新建分析失败，当前内容已保留：${friendlyUiError(error, '请检查磁盘空间后重试。')}`
+      )
+    }
+  }
+
+  const handleRestorePrevious = async (): Promise<void> => {
+    if (hasAnalysis || analysisBusy || restoreBusy) return
+    setRestoreBusy(true)
+    setNewAnalysisError('')
+    try {
+      await restorePreviousAnalysis()
+    } catch (error) {
+      setNewAnalysisState('error')
+      setNewAnalysisError(
+        `恢复上一份分析失败：${friendlyUiError(error, '请重试。')}`
+      )
+    } finally {
+      setRestoreBusy(false)
+    }
+  }
 
   useEffect(() => {
     const onResize = (): void => setWindowWidth(window.innerWidth || 1280)
@@ -114,9 +285,9 @@ export default function App(): JSX.Element {
     setPrivacySaving(true)
     setPrivacyError('')
     try {
-      await saveSettings({ ...settings, privacyAccepted: true })
+      await saveSettings({ ...settings, privacyAccepted: true, privacyEndpoint: activeEndpoint })
     } catch (error) {
-      setPrivacyError(error instanceof Error ? error.message : '保存确认状态失败，请重试')
+      setPrivacyError(friendlyUiError(error, '保存确认状态失败，请重试。'))
     } finally {
       setPrivacySaving(false)
     }
@@ -134,7 +305,7 @@ export default function App(): JSX.Element {
       }
       setActivationStatus(result.status)
     } catch (error) {
-      setActivationError(error instanceof Error ? error.message : '激活失败，请重试。')
+      setActivationError(friendlyUiError(error, '激活失败，请重试。'))
     } finally {
       setActivationBusy(false)
     }
@@ -179,7 +350,12 @@ export default function App(): JSX.Element {
             <ProductLogo />
           </div>
           <h1>正在检查激活状态</h1>
-          <p>请稍候，正在读取本机授权信息。</p>
+          <p>{activationLoadError || '请稍候，正在读取本机授权信息。'}</p>
+          {activationLoadError && (
+            <button className="btn primary" onClick={() => void checkActivation()}>
+              重新检查
+            </button>
+          )}
         </div>
       </div>
     )
@@ -209,6 +385,7 @@ export default function App(): JSX.Element {
             <span>当前设备码</span>
             <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
           </div>
+          <div className="activation-note">如果激活遇到问题，把设备码发给管理员即可。</div>
           {activationError && <div className="activation-error">{activationError}</div>}
           <button className="btn primary activation-submit" disabled={activationBusy}>
             {activationBusy ? '正在激活...' : '激活并进入软件'}
@@ -217,6 +394,33 @@ export default function App(): JSX.Element {
             激活码不会明文保存在软件包中；本机会保存一份授权记录。
           </div>
         </form>
+      </div>
+    )
+  }
+
+  if (!initialized) {
+    return (
+      <div className="activation-screen">
+        <div className="activation-card activation-loading">
+          <div className="activation-logo">
+            <ProductLogo />
+          </div>
+          <h1>{initError ? '软件初始化失败' : '正在恢复上次分析'}</h1>
+          <p>{initError || '请稍候，正在安全恢复资料、设置和报告。'}</p>
+          {initError && (
+            <button
+              className="btn primary"
+              onClick={() => {
+                setInitError('')
+                void init().catch((error: unknown) => {
+                  setInitError(friendlyUiError(error, '初始化软件失败，请重试。'))
+                })
+              }}
+            >
+              重新加载
+            </button>
+          )}
+        </div>
       </div>
     )
   }
@@ -266,11 +470,63 @@ export default function App(): JSX.Element {
           <span className="model-pill">
             {active ? `模型：${active.name}（${active.model}）` : '未配置模型'}
           </span>
-          <button className="btn" onClick={() => setSettingsOpen(true)}>
+          <button
+            className="btn new-analysis-button"
+            type="button"
+            data-state={newAnalysisState}
+            disabled={!hasAnalysis || analysisBusy || newAnalysisState === 'loading'}
+            aria-label={newAnalysisButtonLabel}
+            title={newAnalysisButtonTitle}
+            onClick={() => void handleNewAnalysis()}
+          >
+            <span className="new-analysis-icon" aria-hidden="true">
+              {newAnalysisState === 'loading'
+                ? '·'
+                : newAnalysisState === 'success'
+                  ? '✓'
+                  : newAnalysisState === 'error'
+                    ? '!'
+                    : '＋'}
+            </span>
+            <span>{newAnalysisButtonLabel}</span>
+          </button>
+          {previousProjectAvailable && !hasAnalysis && (
+            <button
+              className="btn restore-analysis-button"
+              type="button"
+              disabled={analysisBusy || restoreBusy}
+              title="把刚才清空的上一份分析恢复回来"
+              onClick={() => void handleRestorePrevious()}
+            >
+              {restoreBusy ? '正在恢复…' : '恢复上一份'}
+            </button>
+          )}
+          {appVersion && <span className="app-version">v{appVersion}</span>}
+          <button
+            className="btn"
+            disabled={analysisBusy}
+            title={analysisBusy ? '当前分析完成或停止后才能修改模型设置' : '打开模型设置'}
+            onClick={() => setSettingsOpen(true)}
+          >
             ⚙ 设置
           </button>
         </div>
       </div>
+
+      {(newAnalysisError || autosaveError) && (
+        <div className="app-alert-stack">
+          {newAnalysisError && (
+            <div className="new-analysis-error" role="alert">
+              {newAnalysisError}
+            </div>
+          )}
+          {autosaveError && (
+            <div className="new-analysis-error" role="alert">
+              自动保存失败，当前内容可能尚未写入磁盘：{autosaveError}
+            </div>
+          )}
+        </div>
+      )}
 
       <div
         className="panes"
@@ -318,8 +574,13 @@ export default function App(): JSX.Element {
               <button className="btn" onClick={() => setSettingsOpen(true)}>
                 先去设置模型
               </button>
-              <button className="btn primary" disabled={privacySaving} onClick={() => void acceptPrivacy()}>
-                {privacySaving ? '保存中…' : '我已知晓，继续使用'}
+              <button
+                className="btn primary"
+                disabled={privacySaving || !active}
+                title={active ? '' : '请先完成模型设置'}
+                onClick={() => void acceptPrivacy()}
+              >
+                {privacySaving ? '保存中…' : active ? '我已知晓，继续使用' : '请先设置模型'}
               </button>
             </div>
           </div>

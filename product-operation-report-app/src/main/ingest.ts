@@ -6,11 +6,18 @@ import type { ArchiveItem, ParsedFile } from '../shared/types'
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif']
 const DOC_TABLE_EXTS = ['xlsx', 'xls', 'csv', 'pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt']
-const MAX_PARSE_BYTES = 80 * 1024 * 1024
+const MAX_PARSE_BYTES = 40 * 1024 * 1024
 const MAX_ARCHIVE_BYTES = 120 * 1024 * 1024
 const MAX_ARCHIVE_ENTRIES = 120
-const MAX_ARCHIVE_ITEM_BYTES = 80 * 1024 * 1024
-const MAX_ARCHIVE_IMAGE_BYTES = 25 * 1024 * 1024
+const MAX_ARCHIVE_ITEM_BYTES = 40 * 1024 * 1024
+const MAX_ARCHIVE_IMAGE_BYTES = 10 * 1024 * 1024
+const MAX_ARCHIVE_TOTAL_BYTES = 120 * 1024 * 1024
+const MAX_ARCHIVE_COMPRESSION_RATIO = 300
+const MAX_OFFICE_ARCHIVE_ENTRIES = 1000
+const MAX_EXTRACTED_TEXT_CHARS = 1_000_000
+const MAX_PDF_PAGES = 500
+const MAX_OFFICE_PAGES = 500
+const MAX_XLSX_CELLS = 2_000_000
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)}MB`
@@ -50,43 +57,200 @@ function ext(name: string): string {
   return name.toLowerCase().split('.').pop() || ''
 }
 
+function textResult(
+  name: string,
+  kind: ParsedFile['kind'],
+  text: string,
+  emptyError: string
+): ParsedFile {
+  const normalized = text.trim()
+  const bounded =
+    normalized.length > MAX_EXTRACTED_TEXT_CHARS
+      ? `${normalized.slice(0, MAX_EXTRACTED_TEXT_CHARS)}\n\n[内容过长，已保留前 ${MAX_EXTRACTED_TEXT_CHARS.toLocaleString()} 个字符。建议拆分文件后分批分析。]`
+      : normalized
+  return bounded
+    ? { name, kind, text: bounded, ok: true }
+    : { name, kind, text: '', ok: false, error: emptyError }
+}
+
 function parseXlsx(buf: Buffer): string {
   const wb = XLSX.read(buf, { type: 'buffer' })
+  if (wb.SheetNames.length > 100) throw new Error('表格工作表超过 100 个，请只保留本次分析需要的工作表。')
   const parts: string[] = []
   for (const sheetName of wb.SheetNames) {
     const ws = wb.Sheets[sheetName]
+    if (ws['!ref']) {
+      const range = XLSX.utils.decode_range(ws['!ref'])
+      const cells = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1)
+      if (cells > MAX_XLSX_CELLS) {
+        throw new Error(`工作表“${sheetName}”范围过大，请删除空白行列或拆分后重试。`)
+      }
+    }
     const csv = XLSX.utils.sheet_to_csv(ws, { blankrows: false })
     if (csv.trim()) parts.push(`### 工作表：${sheetName}\n${csv.trim()}`)
   }
   return parts.join('\n\n')
 }
 
-function parseCsv(buf: Buffer): string {
-  const text = buf.toString('utf8')
-  // 用 papaparse 规范化一遍，去除空行
+function decodeTextBuffer(buf: Buffer): string {
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(buf.subarray(2))
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(buf.subarray(2))
+  }
+  const sampleLength = Math.min(buf.length - (buf.length % 2), 8192)
+  let evenZeros = 0
+  let oddZeros = 0
+  for (let index = 0; index < sampleLength; index += 2) {
+    if (buf[index] === 0) evenZeros++
+    if (buf[index + 1] === 0) oddZeros++
+  }
+  if (oddZeros >= 4 && oddZeros > evenZeros * 3) {
+    return new TextDecoder('utf-16le').decode(buf)
+  }
+  if (evenZeros >= 4 && evenZeros > oddZeros * 3) {
+    return new TextDecoder('utf-16be').decode(buf)
+  }
+  let utf8: string
+  try {
+    utf8 = new TextDecoder('utf-8', { fatal: true }).decode(buf)
+  } catch {
+    utf8 = ''
+  }
+  const gb18030 = new TextDecoder('gb18030').decode(buf)
+  const hasUtf8Bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf
+  const cjkCount = (value: string): number => (value.match(/[\u3400-\u9fff]/g) || []).length
+  const suspiciousCount = (value: string): number => (value.match(/[\u0370-\u052f]/g) || []).length
+  const text =
+    !utf8 || (!hasUtf8Bom && cjkCount(gb18030) > cjkCount(utf8) && suspiciousCount(utf8) > 0)
+      ? gb18030
+      : utf8
+  return text.replace(/^\uFEFF/, '')
+}
+
+interface CsvParseResult {
+  text: string
+  warning?: string
+}
+
+function parseCsv(buf: Buffer): CsvParseResult {
+  const text = decodeTextBuffer(buf)
+  // 用 papaparse 规范化一遍，去除空行；再由 unparse 恢复必要引号，避免含逗号/换行的单元格错列
   const res = Papa.parse<string[]>(text, { skipEmptyLines: true })
-  return (res.data as string[][]).map((row) => row.join(',')).join('\n')
+  const seriousErrors = res.errors.filter((error) => error.code !== 'UndetectableDelimiter')
+  if (seriousErrors.length) {
+    const first = seriousErrors[0]
+    throw new Error(`CSV 格式不完整（第 ${(first.row ?? 0) + 1} 行附近），请用 Excel 重新另存为 CSV 后再上传。`)
+  }
+  const rows = res.data as string[][]
+  if (!rows.length) return { text: '' }
+
+  // 经营平台导出的 CSV 经常只有少数行缺列、多一个尾逗号或备注中带未转义逗号。
+  // 这些情况不应让整份资料失败：以最常见列数为基准，安全补齐尾部空值、删除多余尾空列；
+  // 对无法判断位置的额外非空字段则完整保留，不擅自合并或丢数据。
+  const widthCounts = new Map<number, number>()
+  for (const row of rows) widthCounts.set(row.length, (widthCounts.get(row.length) || 0) + 1)
+  let expectedColumns = rows[0]?.length ?? 0
+  let expectedCount = widthCounts.get(expectedColumns) || 0
+  for (const [width, count] of widthCounts) {
+    if (count > expectedCount) {
+      expectedColumns = width
+      expectedCount = count
+    }
+  }
+
+  const mismatchedRows: number[] = []
+  let preservedExtraRows = 0
+  const normalizedRows = rows.map((row, index) => {
+    if (row.length === expectedColumns) return row
+    mismatchedRows.push(index + 1)
+    if (row.length < expectedColumns) {
+      return [...row, ...Array.from({ length: expectedColumns - row.length }, () => '')]
+    }
+    const extra = row.slice(expectedColumns)
+    if (extra.every((cell) => !String(cell ?? '').trim())) return row.slice(0, expectedColumns)
+    preservedExtraRows++
+    return row
+  })
+
+  const warning = mismatchedRows.length
+    ? `检测到 ${mismatchedRows.length} 行的列数不一致（最早在第 ${mismatchedRows[0]} 行），软件已自动兼容并继续分析。${preservedExtraRows ? `其中 ${preservedExtraRows} 行含额外内容，已完整保留，未删除数据。` : '缺少的尾部空值已自动补齐。'}`
+    : undefined
+  return { text: Papa.unparse(normalizedRows, { newline: '\n' }), warning }
+}
+
+async function validateOfficeArchive(name: string, buf: Buffer): Promise<string | undefined> {
+  let zip: JSZip
+  try {
+    zip = await JSZip.loadAsync(buf)
+  } catch {
+    return `${name} 文件结构损坏或不是有效的 Office 文件。`
+  }
+  const entries = Object.values(zip.files).filter((entry) => !entry.dir)
+  if (entries.length > MAX_OFFICE_ARCHIVE_ENTRIES) {
+    return `${name} 内部文件数量异常，已停止解析以保护软件稳定性。`
+  }
+  let total = 0
+  for (const entry of entries) {
+    const meta = (entry as unknown as {
+      _data?: { uncompressedSize?: number; compressedSize?: number }
+    })._data
+    const uncompressedSize = meta?.uncompressedSize ?? 0
+    const compressedSize = meta?.compressedSize ?? 0
+    total += uncompressedSize
+    if (uncompressedSize > MAX_ARCHIVE_ITEM_BYTES) {
+      return `${name} 内部单个文件解压后超过 ${formatBytes(MAX_ARCHIVE_ITEM_BYTES)}，请精简后重试。`
+    }
+    if (
+      compressedSize > 0 &&
+      uncompressedSize > 1024 * 1024 &&
+      uncompressedSize / compressedSize > MAX_ARCHIVE_COMPRESSION_RATIO
+    ) {
+      return `${name} 的内部压缩比例异常，已停止解析以保护软件稳定性。`
+    }
+  }
+  if (total > MAX_ARCHIVE_TOTAL_BYTES) {
+    return `${name} 解压后的预计体积超过 ${formatBytes(MAX_ARCHIVE_TOTAL_BYTES)}，请精简后重试。`
+  }
+  return undefined
 }
 
 async function parsePdf(buf: Buffer): Promise<string> {
   ensureWithResolvers()
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const [pdfjs, pdfWorker] = await Promise.all([
+    import('pdfjs-dist/legacy/build/pdf.mjs'),
+    import('pdfjs-dist/legacy/build/pdf.worker.mjs')
+  ])
+  ;(
+    globalThis as typeof globalThis & {
+      pdfjsWorker?: typeof pdfWorker
+    }
+  ).pdfjsWorker ??= pdfWorker
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buf),
     useSystemFonts: true,
     isEvalSupported: false
   })
   const pdf = await loadingTask.promise
-  const pages: string[] = []
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i)
-    const content = await page.getTextContent()
-    const strings = content.items
-      .map((it) => ('str' in it ? (it as { str: string }).str : ''))
-      .join(' ')
-    pages.push(`--- 第 ${i} 页 ---\n${strings.trim()}`)
+  if (pdf.numPages > MAX_PDF_PAGES) {
+    await pdf.destroy()
+    throw new Error(`PDF 共 ${pdf.numPages} 页，超过 ${MAX_PDF_PAGES} 页上限。请只保留关键页面后重试。`)
   }
-  await pdf.cleanup()
+  const pages: string[] = []
+  try {
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const content = await page.getTextContent()
+      const strings = content.items
+        .map((it) => ('str' in it ? (it as { str: string }).str : ''))
+        .join(' ')
+      pages.push(`--- 第 ${i} 页 ---\n${strings.trim()}`)
+    }
+  } finally {
+    await pdf.cleanup()
+    await pdf.destroy()
+  }
   return pages.join('\n\n')
 }
 
@@ -116,6 +280,9 @@ async function parsePptx(buf: Buffer): Promise<string> {
   const slideNames = names
     .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
     .sort((a, b) => slideNum(a) - slideNum(b))
+  if (slideNames.length > MAX_OFFICE_PAGES) {
+    throw new Error(`PPTX 共 ${slideNames.length} 页，超过 ${MAX_OFFICE_PAGES} 页上限。请只保留关键页面后重试。`)
+  }
 
   const parts: string[] = []
   for (const name of slideNames) {
@@ -150,6 +317,7 @@ export async function parseArchive(name: string, data: ArrayBuffer): Promise<Arc
     return [{
       name,
       kind: 'other',
+      size: buf.length,
       ok: false,
       error: `压缩包 ${formatBytes(buf.length)} 超过上限 ${formatBytes(MAX_ARCHIVE_BYTES)}，请拆分后上传。`
     }]
@@ -177,16 +345,49 @@ export async function parseArchive(name: string, data: ArrayBuffer): Promise<Arc
     }]
   }
 
+  let declaredTotal = 0
+  for (const entry of entries) {
+    const meta = (entry as unknown as {
+      _data?: { uncompressedSize?: number; compressedSize?: number }
+    })._data
+    const uncompressedSize = meta?.uncompressedSize ?? 0
+    const compressedSize = meta?.compressedSize ?? 0
+    declaredTotal += uncompressedSize
+    if (
+      compressedSize > 0 &&
+      uncompressedSize > 1024 * 1024 &&
+      uncompressedSize / compressedSize > MAX_ARCHIVE_COMPRESSION_RATIO
+    ) {
+      return [{
+        name,
+        kind: 'other',
+        ok: false,
+        error: `压缩包内文件「${entry.name}」压缩比异常，已停止解压以保护软件稳定性。`
+      }]
+    }
+  }
+  if (declaredTotal > MAX_ARCHIVE_TOTAL_BYTES) {
+    return [{
+      name,
+      kind: 'other',
+      ok: false,
+      error: `压缩包解压后预计 ${formatBytes(declaredTotal)}，超过总上限 ${formatBytes(MAX_ARCHIVE_TOTAL_BYTES)}，请拆分后上传。`
+    }]
+  }
+
   const items: ArchiveItem[] = []
+  let actualTotal = 0
   for (const f of entries) {
     const base = f.name.split('/').pop() || f.name
+    const entryName = f.name.replace(/^\/+/, '')
     const fe = ext(base)
     const size = (f as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0
     try {
       if (size > MAX_ARCHIVE_ITEM_BYTES) {
         items.push({
-          name: base,
+          name: entryName,
           kind: 'other',
+          size,
           ok: false,
           error: `已忽略：压缩包内文件 ${formatBytes(size)} 超过上限 ${formatBytes(MAX_ARCHIVE_ITEM_BYTES)}。`
         })
@@ -195,29 +396,54 @@ export async function parseArchive(name: string, data: ArrayBuffer): Promise<Arc
       if (IMAGE_EXTS.includes(fe)) {
         if (size > MAX_ARCHIVE_IMAGE_BYTES) {
           items.push({
-            name: base,
+            name: entryName,
             kind: 'other',
+            size,
             ok: false,
             error: `已忽略：图片 ${formatBytes(size)} 过大，请压缩到 ${formatBytes(MAX_ARCHIVE_IMAGE_BYTES)} 以内。`
           })
           continue
         }
-        const b64 = await f.async('base64')
-        items.push({ name: base, kind: 'image', dataUrl: `data:${imageMime(fe)};base64,${b64}`, ok: true })
+        const bytes = await f.async('uint8array')
+        actualTotal += bytes.byteLength
+        if (actualTotal > MAX_ARCHIVE_TOTAL_BYTES) {
+          return [{ name, kind: 'other', ok: false, error: `压缩包实际解压量超过 ${formatBytes(MAX_ARCHIVE_TOTAL_BYTES)}，已停止处理。` }]
+        }
+        const b64 = Buffer.from(bytes).toString('base64')
+        items.push({ name: entryName, kind: 'image', size: bytes.byteLength, dataUrl: `data:${imageMime(fe)};base64,${b64}`, ok: true })
       } else if (DOC_TABLE_EXTS.includes(fe)) {
         const content = await f.async('arraybuffer')
+        actualTotal += content.byteLength
+        if (actualTotal > MAX_ARCHIVE_TOTAL_BYTES) {
+          return [{ name, kind: 'other', ok: false, error: `压缩包实际解压量超过 ${formatBytes(MAX_ARCHIVE_TOTAL_BYTES)}，已停止处理。` }]
+        }
         const parsed = await parseFile(base, content)
-        items.push({ name: base, kind: parsed.kind, text: parsed.text, ok: parsed.ok, error: parsed.error })
+        items.push({
+          name: entryName,
+          kind: parsed.kind,
+          size: content.byteLength,
+          text: parsed.text,
+          ok: parsed.ok,
+          error: parsed.error,
+          warning: parsed.warning
+        })
       } else {
         items.push({
-          name: base,
+          name: entryName,
           kind: 'other',
+          size,
           ok: false,
           error: `已忽略：暂不支持 .${fe || '未知'} 文件。`
         })
       }
     } catch (err) {
-      items.push({ name: base, kind: 'other', ok: false, error: err instanceof Error ? err.message : String(err) })
+      items.push({
+        name: entryName,
+        kind: 'other',
+        size,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err)
+      })
     }
   }
 
@@ -248,10 +474,16 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
   }
   try {
     if (e === 'xlsx' || e === 'xls') {
-      return { name, kind: 'table', text: parseXlsx(buf), ok: true }
+      if (e === 'xlsx') {
+        const archiveError = await validateOfficeArchive(name, buf)
+        if (archiveError) return { name, kind: 'table', text: '', ok: false, error: archiveError }
+      }
+      return textResult(name, 'table', parseXlsx(buf), '表格中没有可读取的数据。')
     }
     if (e === 'csv') {
-      return { name, kind: 'table', text: parseCsv(buf), ok: true }
+      const csv = parseCsv(buf)
+      const result = textResult(name, 'table', csv.text, 'CSV 中没有可读取的数据。')
+      return result.ok && csv.warning ? { ...result, warning: csv.warning } : result
     }
     if (e === 'pdf') {
       const text = await parsePdf(buf)
@@ -267,7 +499,9 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
       return { name, kind: 'doc', text, ok: true }
     }
     if (e === 'docx') {
-      return { name, kind: 'doc', text: await parseDocx(buf), ok: true }
+      const archiveError = await validateOfficeArchive(name, buf)
+      if (archiveError) return { name, kind: 'doc', text: '', ok: false, error: archiveError }
+      return textResult(name, 'doc', await parseDocx(buf), 'Word 文档中没有可提取的文字。')
     }
     if (e === 'doc') {
       return {
@@ -279,6 +513,8 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
       }
     }
     if (e === 'pptx') {
+      const archiveError = await validateOfficeArchive(name, buf)
+      if (archiveError) return { name, kind: 'doc', text: '', ok: false, error: archiveError }
       const text = await parsePptx(buf)
       if (!text.replace(/--- 第 \d+ 页 ---/g, '').trim()) {
         return {
@@ -301,7 +537,7 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
       }
     }
     if (e === 'md' || e === 'markdown' || e === 'txt') {
-      return { name, kind: 'doc', text: buf.toString('utf8').trim(), ok: true }
+      return textResult(name, 'doc', decodeTextBuffer(buf), '文本文件为空。')
     }
     return { name, kind: 'other', text: '', ok: false, error: `暂不支持的文件类型：.${e}` }
   } catch (err) {

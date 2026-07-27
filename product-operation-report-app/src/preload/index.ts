@@ -22,6 +22,8 @@ export interface ChatHandlers {
 }
 
 const api = {
+  getAppVersion: (): Promise<string> => ipcRenderer.invoke('app:version'),
+
   getActivationStatus: (): Promise<ActivationStatus> => ipcRenderer.invoke('activation:status'),
 
   activate: (code: string): Promise<ActivationResult> =>
@@ -37,6 +39,35 @@ const api = {
   saveLastProject: (project: SavedProject): Promise<SavedProject> =>
     ipcRenderer.invoke('project:saveLast', project),
 
+  cacheProjectSnapshot: (project: SavedProject): void =>
+    ipcRenderer.send('project:cacheSnapshot', project),
+
+  archiveProject: (project: SavedProject): Promise<SavedProject> =>
+    ipcRenderer.invoke('project:archive', project),
+
+  loadPreviousProject: (): Promise<SavedProject | null> => ipcRenderer.invoke('project:loadPrevious'),
+
+  onBeforeClose: (handler: () => void | Promise<void>): (() => void) => {
+    const listener = async (_event: unknown, payload: { id: string }): Promise<void> => {
+      try {
+        await handler()
+        ipcRenderer.send('app:close-ready', { id: payload.id, ok: true })
+      } catch (error) {
+        ipcRenderer.send('app:close-ready', {
+          id: payload.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+    ipcRenderer.on('app:before-close', listener)
+    ipcRenderer.send('app:close-guard-state', true)
+    return () => {
+      ipcRenderer.removeListener('app:before-close', listener)
+      ipcRenderer.send('app:close-guard-state', false)
+    }
+  },
+
   testModel: (opts: TestModelOptions): Promise<TestModelResult> =>
     ipcRenderer.invoke('model:test', opts),
 
@@ -49,9 +80,16 @@ const api = {
   parseArchive: (name: string, data: ArrayBuffer): Promise<ArchiveItem[]> =>
     ipcRenderer.invoke('archive:parse', { name, data }),
 
+  cancelFileParsing: (): Promise<void> => ipcRenderer.invoke('file:cancelAll'),
+
   getSopRules: (): Promise<string> => ipcRenderer.invoke('sop:rules'),
 
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
+
+  openPath: (path: string): Promise<void> => ipcRenderer.invoke('shell:openPath', path),
+
+  showItemInFolder: (path: string): Promise<void> =>
+    ipcRenderer.invoke('shell:showItemInFolder', path),
 
   exportMarkdown: (content: string, name: string): Promise<ExportResult> =>
     ipcRenderer.invoke('export:markdown', { content, name }),

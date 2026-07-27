@@ -13,19 +13,22 @@ export interface Source {
   size?: number
   parsing?: boolean
   error?: string
+  warning?: string
   attribution?: string // 用户指定归属：自有数据 / 竞品数据 / ''(未定)
   platform?: string // 用户指定平台/来源：巨量云图 / 抖店罗盘 / 视频号 / 抖音 / 有米云...
   purpose?: string // 用户指定信息类型：人群画像数据 / 内容素材数据 / 交易数据 / 产品手卡...
   note?: string // 用户对这份文件的补充信息（平台/时间/内容/文件外说明）
 }
 
-const PARSE_CONCURRENCY = 4
+const PARSE_CONCURRENCY = 1
+export const MAX_CLEANING_CONCURRENCY = 4
 const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 const CLEAN_DETAIL_MARKER = '\n\n---\n## 各来源清洗明细'
 const FINAL_PRIOR_OUTPUT_LIMIT = 7000
-const MAX_SINGLE_FILE_BYTES = 80 * 1024 * 1024
+const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
+const MAX_SOURCE_FILES = 200
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)}MB`
@@ -49,23 +52,50 @@ export interface CleaningProgress {
   failed: number
 }
 
+const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0 })
+const isRunningPhase = (phase: Phase): boolean => phase === 'cleaning' || phase === 'analyzing'
+
+function friendlyError(value: unknown): string {
+  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
+  if (!raw) return '操作没有完成，请重试。'
+  if (/已停止|aborted|aborterror/i.test(raw)) return '已停止。'
+  if (/timeout|timed out|超时/i.test(raw)) return '请求超时，请检查网络后重试。'
+  if (/401|unauthorized|invalid api key|authentication/i.test(raw)) return '模型授权失败，请检查 API Key。'
+  if (/404|model.*not found|not found.*model/i.test(raw)) return '模型地址或模型名称不正确，请到设置中检查。'
+  if (/429|rate limit|quota|insufficient_quota/i.test(raw)) {
+    const wait = raw.match(/等待\s*(\d+)\s*秒/)
+    return wait
+      ? `模型服务繁忙或额度受限，建议等待 ${wait[1]} 秒后重试。`
+      : '模型服务繁忙或额度受限，请稍后重试。'
+  }
+  if (/fetch failed|econnreset|enotfound|terminated|network/i.test(raw)) {
+    return '网络连接失败，请检查网络和模型地址后重试。'
+  }
+  return raw.slice(0, 280)
+}
+
+const isUserStop = (value: unknown): boolean => /已停止|aborted/i.test(String(value || ''))
+
 function restorePhase(project: SavedProject): Phase {
-  if (project.phase === 'cleaning') return project.cleanedData ? 'checkpoint1' : 'idle'
+  if (project.phase === 'cleaning') return 'idle'
   if (project.phase === 'analyzing') return project.cleanedData ? 'checkpoint1' : 'idle'
   return project.phase as Phase
 }
 
 export function buildProjectSnapshot(state: {
+  projectRevision: number
   sources: Source[]
   messages: ChatMsg[]
   cleanedData: string
   cleanDetails: { id: string; name: string; text: string }[]
   artifacts: Record<number, string>
   reportMarkdown: string
+  reportStale: boolean
   phase: Phase
   steering: string
 }): SavedProject {
   return {
+    revision: state.projectRevision,
     sources: state.sources.map((s) => ({
       id: s.id,
       name: s.name,
@@ -73,6 +103,7 @@ export function buildProjectSnapshot(state: {
       text: s.text,
       dataUrl: s.dataUrl,
       error: s.error,
+      warning: s.warning,
       attribution: s.attribution,
       platform: s.platform,
       purpose: s.purpose,
@@ -88,7 +119,10 @@ export function buildProjectSnapshot(state: {
     cleanedData: state.cleanedData,
     cleanDetails: state.cleanDetails,
     artifacts: state.artifacts,
-    reportMarkdown: state.reportMarkdown,
+    reportMarkdown: isRunningPhase(state.phase)
+      ? state.artifacts[REPORT_STEP_ID] || ''
+      : state.reportMarkdown,
+    reportStale: state.reportStale,
     phase: state.phase as ProjectPhase,
     steering: state.steering,
     updatedAt: new Date().toISOString()
@@ -124,7 +158,10 @@ const inferAttribution = (name: string): string => {
   if (n.includes('竞品') || n.includes('竞对') || n.includes('对标') || n.includes('competitor')) {
     return '竞品数据'
   }
-  return '自有数据'
+  if (n.includes('自有') || n.includes('本品') || n.includes('本店') || n.includes('我方')) {
+    return '自有数据'
+  }
+  return ''
 }
 
 const inferPlatform = (name: string): string => {
@@ -157,38 +194,302 @@ const inferPurpose = (name: string): string => {
   return ''
 }
 
+export interface ImageHeaderInfo {
+  format: 'png' | 'jpeg' | 'gif' | 'webp'
+  width: number
+  height: number
+  frames: number
+}
+
+const MAX_IMAGE_SIDE = 10_000
+const MAX_IMAGE_PIXELS = 20_000_000
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  return String.fromCharCode(...bytes.subarray(offset, offset + length))
+}
+
+function u24le(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)
+}
+
+function validateImageDimensions(info: ImageHeaderInfo): ImageHeaderInfo {
+  if (
+    !info.width ||
+    !info.height ||
+    info.width > MAX_IMAGE_SIDE ||
+    info.height > MAX_IMAGE_SIDE ||
+    info.width * info.height > MAX_IMAGE_PIXELS
+  ) {
+    throw new Error('图片像素尺寸过大，请压缩或截图后重新上传。')
+  }
+  return info
+}
+
+function skipGifSubBlocks(bytes: Uint8Array, start: number): number {
+  let offset = start
+  while (offset < bytes.length) {
+    const size = bytes[offset++]
+    if (size === 0) return offset
+    if (offset + size > bytes.length) throw new Error('GIF 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+    offset += size
+  }
+  throw new Error('GIF 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+}
+
+export function inspectImageHeader(bytes: Uint8Array): ImageHeaderInfo {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  if (
+    bytes.length >= 33 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    if (view.getUint32(8) !== 13 || ascii(bytes, 12, 4) !== 'IHDR') {
+      throw new Error('PNG 文件结构损坏，请重新保存后上传。')
+    }
+    const info: ImageHeaderInfo = {
+      format: 'png',
+      width: view.getUint32(16),
+      height: view.getUint32(20),
+      frames: 1
+    }
+    let offset = 8
+    while (offset + 12 <= bytes.length) {
+      const size = view.getUint32(offset)
+      const type = ascii(bytes, offset + 4, 4)
+      const payload = offset + 8
+      const end = payload + size + 4
+      if (end > bytes.length) throw new Error('PNG 文件结构不完整，请重新保存后上传。')
+      if (type === 'acTL') {
+        if (size < 8) throw new Error('PNG 动图信息损坏，请转换为普通 PNG 后重试。')
+        info.frames = view.getUint32(payload)
+        throw new Error('暂不支持动态 PNG，请截取关键画面并保存为普通 PNG。')
+      }
+      offset = end
+      if (type === 'IEND') break
+    }
+    return validateImageDimensions(info)
+  }
+
+  if (bytes.length >= 13 && (ascii(bytes, 0, 6) === 'GIF87a' || ascii(bytes, 0, 6) === 'GIF89a')) {
+    const info: ImageHeaderInfo = {
+      format: 'gif',
+      width: view.getUint16(6, true),
+      height: view.getUint16(8, true),
+      frames: 0
+    }
+    const packed = bytes[10]
+    let offset = 13 + (packed & 0x80 ? 3 * (1 << ((packed & 0x07) + 1)) : 0)
+    let trailerFound = false
+    while (offset < bytes.length) {
+      const marker = bytes[offset]
+      if (marker === 0x3b) {
+        trailerFound = true
+        break
+      }
+      if (marker === 0x2c) {
+        if (offset + 10 > bytes.length) throw new Error('GIF 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+        const left = view.getUint16(offset + 1, true)
+        const top = view.getUint16(offset + 3, true)
+        const frameWidth = view.getUint16(offset + 5, true)
+        const frameHeight = view.getUint16(offset + 7, true)
+        validateImageDimensions({
+          format: 'gif',
+          width: frameWidth,
+          height: frameHeight,
+          frames: 1
+        })
+        if (left + frameWidth > info.width || top + frameHeight > info.height) {
+          throw new Error('GIF 画面尺寸与画布不一致，请转换为 PNG 或 JPG 后重试。')
+        }
+        info.frames++
+        if (info.frames > 1) throw new Error('暂不支持动态 GIF，请截取关键画面并保存为 PNG 或 JPG。')
+        const localPacked = bytes[offset + 9]
+        offset += 10
+        if (localPacked & 0x80) offset += 3 * (1 << ((localPacked & 0x07) + 1))
+        if (offset >= bytes.length) throw new Error('GIF 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+        offset++ // LZW 最小码长
+        offset = skipGifSubBlocks(bytes, offset)
+        continue
+      }
+      if (marker === 0x21) {
+        if (offset + 2 > bytes.length) throw new Error('GIF 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+        offset = skipGifSubBlocks(bytes, offset + 2)
+        continue
+      }
+      throw new Error('GIF 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+    }
+    if (!trailerFound || info.frames !== 1) {
+      throw new Error('GIF 中没有完整的静态画面，请转换为 PNG 或 JPG 后重试。')
+    }
+    return validateImageDimensions(info)
+  }
+
+  if (bytes.length >= 20 && ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WEBP') {
+    const declaredEnd = view.getUint32(4, true) + 8
+    if (declaredEnd < 20 || declaredEnd > bytes.length) {
+      throw new Error('WebP 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+    }
+    let offset = 12
+    let canvasInfo: ImageHeaderInfo | null = null
+    let bitstreamInfo: ImageHeaderInfo | null = null
+    while (offset + 8 <= declaredEnd) {
+      const type = ascii(bytes, offset, 4)
+      const size = view.getUint32(offset + 4, true)
+      const payload = offset + 8
+      if (payload + size > declaredEnd) throw new Error('WebP 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+      if (type === 'VP8X') {
+        if (size < 10 || canvasInfo || bitstreamInfo) {
+          throw new Error('WebP 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+        }
+        if (bytes[payload] & 0x02) throw new Error('暂不支持动态 WebP，请截取关键画面并保存为 PNG 或 JPG。')
+        canvasInfo = validateImageDimensions({
+          format: 'webp',
+          width: 1 + u24le(bytes, payload + 4),
+          height: 1 + u24le(bytes, payload + 7),
+          frames: 1
+        })
+      } else if (type === 'VP8 ') {
+        if (
+          size < 10 ||
+          bytes[payload + 3] !== 0x9d ||
+          bytes[payload + 4] !== 0x01 ||
+          bytes[payload + 5] !== 0x2a
+        ) {
+          throw new Error('WebP 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+        }
+        if (bitstreamInfo) throw new Error('WebP 包含重复画面数据，请转换为 PNG 或 JPG 后重试。')
+        bitstreamInfo = validateImageDimensions({
+          format: 'webp',
+          width: view.getUint16(payload + 6, true) & 0x3fff,
+          height: view.getUint16(payload + 8, true) & 0x3fff,
+          frames: 1
+        })
+      } else if (type === 'VP8L') {
+        if (size < 5 || bytes[payload] !== 0x2f) {
+          throw new Error('WebP 文件结构损坏，请转换为 PNG 或 JPG 后重试。')
+        }
+        const bits =
+          (bytes[payload + 1] |
+            (bytes[payload + 2] << 8) |
+            (bytes[payload + 3] << 16) |
+            (bytes[payload + 4] << 24)) >>>
+          0
+        if (bitstreamInfo) throw new Error('WebP 包含重复画面数据，请转换为 PNG 或 JPG 后重试。')
+        bitstreamInfo = validateImageDimensions({
+          format: 'webp',
+          width: (bits & 0x3fff) + 1,
+          height: ((bits >>> 14) & 0x3fff) + 1,
+          frames: 1
+        })
+      } else if (type === 'ANIM' || type === 'ANMF') {
+        throw new Error('暂不支持动态 WebP，请截取关键画面并保存为 PNG 或 JPG。')
+      }
+      const nextOffset = payload + size + (size & 1)
+      if (nextOffset > declaredEnd) {
+        throw new Error('WebP 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+      }
+      offset = nextOffset
+    }
+    if (offset !== declaredEnd) throw new Error('WebP 文件结构不完整，请转换为 PNG 或 JPG 后重试。')
+    if (!bitstreamInfo) {
+      throw new Error('WebP 中没有可读取的静态画面，请转换为 PNG 或 JPG 后重试。')
+    }
+    if (
+      canvasInfo &&
+      (canvasInfo.width !== bitstreamInfo.width || canvasInfo.height !== bitstreamInfo.height)
+    ) {
+      throw new Error('WebP 画布尺寸与实际画面不一致，请转换为 PNG 或 JPG 后重试。')
+    }
+    return bitstreamInfo
+  }
+
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2
+    while (offset < bytes.length) {
+      if (bytes[offset] !== 0xff) throw new Error('JPEG 文件结构损坏，请重新保存后上传。')
+      while (offset < bytes.length && bytes[offset] === 0xff) offset++
+      if (offset >= bytes.length) break
+      const marker = bytes[offset++]
+      if (marker === 0xd9 || marker === 0xda) break
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue
+      if (offset + 2 > bytes.length) throw new Error('JPEG 文件结构不完整，请重新保存后上传。')
+      const length = view.getUint16(offset)
+      if (length < 2 || offset + length > bytes.length) {
+        throw new Error('JPEG 文件结构损坏，请重新保存后上传。')
+      }
+      if (
+        (marker >= 0xc0 && marker <= 0xc3) ||
+        (marker >= 0xc5 && marker <= 0xc7) ||
+        (marker >= 0xc9 && marker <= 0xcb) ||
+        (marker >= 0xcd && marker <= 0xcf)
+      ) {
+        if (length < 7) throw new Error('JPEG 尺寸信息损坏，请重新保存后上传。')
+        return validateImageDimensions({
+          format: 'jpeg',
+          height: view.getUint16(offset + 3),
+          width: view.getUint16(offset + 5),
+          frames: 1
+        })
+      }
+      offset += length
+    }
+    throw new Error('JPEG 中没有可读取的尺寸信息，请重新保存后上传。')
+  }
+
+  throw new Error('图片格式无法识别，请转换为 PNG 或 JPG 后重试。')
+}
+
 // 截图压缩：缩放到最大边 maxDim、转 JPEG，避免多张全尺寸图拼成超大请求体导致 fetch failed
-const downscaleImage = (file: File, maxDim = 1600, quality = 0.9): Promise<string> =>
-  new Promise((resolve) => {
+const downscaleImage = async (file: File, maxDim = 1600, quality = 0.9): Promise<string> => {
+  const headerBytes = new Uint8Array(await file.arrayBuffer())
+  inspectImageHeader(headerBytes)
+  return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => {
       const dataUrl = reader.result as string
       const img = new Image()
       img.onload = () => {
-        const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
-        if (scale === 1 && file.size < 600_000) {
-          resolve(dataUrl) // 已经够小，原样用
-          return
+        try {
+          if (
+            !img.width ||
+            !img.height ||
+            img.width > MAX_IMAGE_SIDE ||
+            img.height > MAX_IMAGE_SIDE ||
+            img.width * img.height > MAX_IMAGE_PIXELS
+          ) {
+            throw new Error('图片像素尺寸过大，请压缩或截图后重新上传。')
+          }
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+          if (scale === 1 && file.size < 600_000) {
+            resolve(dataUrl) // 已经够小，原样用
+            return
+          }
+          const w = Math.round(img.width * scale)
+          const h = Math.round(img.height * scale)
+          const canvas = document.createElement('canvas')
+          canvas.width = w
+          canvas.height = h
+          const ctx = canvas.getContext('2d')
+          if (!ctx) throw new Error('无法创建图片处理画布')
+          ctx.drawImage(img, 0, 0, w, h)
+          resolve(canvas.toDataURL('image/jpeg', quality))
+        } catch (error) {
+          reject(error)
         }
-        const w = Math.round(img.width * scale)
-        const h = Math.round(img.height * scale)
-        const canvas = document.createElement('canvas')
-        canvas.width = w
-        canvas.height = h
-        const ctx = canvas.getContext('2d')
-        if (!ctx) {
-          resolve(dataUrl)
-          return
-        }
-        ctx.drawImage(img, 0, 0, w, h)
-        resolve(canvas.toDataURL('image/jpeg', quality))
       }
-      img.onerror = () => resolve(dataUrl)
+      img.onerror = () => reject(new Error('图片无法读取，请转换为 PNG 或 JPG 后重试。'))
       img.src = dataUrl
     }
-    reader.onerror = () => resolve('')
+    reader.onerror = () => reject(new Error('图片读取失败，请重新选择文件。'))
     reader.readAsDataURL(file)
   })
+}
 
 const toSourceLike = (
   s: Source
@@ -265,24 +566,48 @@ function runModel(
   return new Promise((resolve) => {
     let acc = ''
     let settled = false
+    let publishTimer: number | null = null
+    let lastPublished = ''
+    const publish = (text: string): void => {
+      if (text === lastPublished) return
+      lastPublished = text
+      onAcc(text)
+    }
+    const flush = (text = acc): void => {
+      if (publishTimer !== null) {
+        window.clearTimeout(publishTimer)
+        publishTimer = null
+      }
+      publish(text)
+    }
     const done = (r: { ok: boolean; text: string; error?: string }): void => {
       if (settled) return
       settled = true
+      flush(r.text)
       setAbort(null)
       resolve(r)
     }
-    const handle = window.api.sendChat(messages, {
-      onChunk: (d) => {
-        acc += d
-        onAcc(acc)
-      },
-      onDone: (full) => done({ ok: true, text: full || acc }),
-      onError: (msg) => done({ ok: false, text: acc, error: msg })
-    })
-    setAbort(() => {
-      handle.abort()
-      done({ ok: false, text: acc, error: '已停止' })
-    })
+    try {
+      const handle = window.api.sendChat(messages, {
+        onChunk: (d) => {
+          acc += d
+          if (publishTimer === null) {
+            publishTimer = window.setTimeout(() => {
+              publishTimer = null
+              publish(acc)
+            }, 60)
+          }
+        },
+        onDone: (full) => done({ ok: true, text: full || acc }),
+        onError: (msg) => done({ ok: false, text: acc, error: friendlyError(msg) })
+      })
+      setAbort(() => {
+        handle.abort()
+        done({ ok: false, text: acc, error: '已停止' })
+      })
+    } catch (error) {
+      done({ ok: false, text: acc, error: friendlyError(error) })
+    }
   })
 }
 
@@ -300,10 +625,25 @@ async function runModelRetry(
     !res.ok &&
     n < retries &&
     !res.text &&
-    /fetch failed|ECONNRESET|terminated|network/i.test(res.error || '')
+    /fetch failed|ECONNRESET|terminated|network|网络连接失败|服务繁忙|额度受限|429/i.test(res.error || '')
   ) {
     n++
     onRetry?.(n)
+    if (/服务繁忙|额度受限|429/i.test(res.error || '')) {
+      const wait = res.error?.match(/等待\s*(\d+)\s*秒/)
+      const delay = wait ? Math.min(60, Number(wait[1])) * 1000 : 1200 * n
+      let stopped = false
+      await new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, delay)
+        setAbort(() => {
+          stopped = true
+          window.clearTimeout(timer)
+          resolve()
+        })
+      })
+      setAbort(null)
+      if (stopped) return { ok: false, text: '', error: '已停止' }
+    }
     res = await runModel(messages, onAcc, setAbort)
   }
   return res
@@ -316,6 +656,11 @@ function defaultReportName(ext: string): string {
 }
 
 interface StoreState {
+  initialized: boolean
+  persistencePaused: boolean
+  projectRevision: number
+  analysisSessionId: string
+  previousProjectAvailable: boolean
   settings: AppSettings | null
   settingsOpen: boolean
   sopRules: string
@@ -326,25 +671,33 @@ interface StoreState {
   cleanDetails: { id: string; name: string; text: string }[]
   artifacts: Record<number, string>
   reportMarkdown: string
+  reportStale: boolean
   abortFn: (() => void) | null
   steering: string
   exportStatus: string
+  lastExportPath: string
+  openingExport: boolean
   cleaningProgress: CleaningProgress
 
   init: () => Promise<void>
   setSettingsOpen: (open: boolean) => void
   saveSettings: (s: AppSettings) => Promise<void>
+  resetAnalysis: () => Promise<void>
+  restorePreviousAnalysis: () => Promise<void>
   addSources: (files: FileList | File[]) => Promise<void>
   removeSource: (id: string) => void
   setSourceAttribution: (id: string, attribution: string) => void
+  setUnconfirmedAttribution: (attribution: '自有数据' | '竞品数据') => void
   setSourcePlatform: (id: string, platform: string) => void
   setSourcePurpose: (id: string, purpose: string) => void
   setSourceNote: (id: string, note: string) => void
   startGeneration: () => Promise<void>
   confirmCheckpoint: () => Promise<void>
-  sendMessage: (text: string) => Promise<void>
+  sendMessage: (text: string) => Promise<boolean>
   abort: () => void
   exportReport: (format: 'html' | 'md' | 'docx') => Promise<void>
+  openLastExport: () => Promise<void>
+  showLastExportInFolder: () => Promise<void>
 
   // 内部
   _post: (role: ChatMsg['role'], text: string, kind?: ChatMsg['kind']) => string
@@ -354,7 +707,34 @@ interface StoreState {
   _rerunReport: () => Promise<void>
 }
 
+const invalidatedAnalysis = (): Pick<
+  StoreState,
+  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress'
+> => ({
+  cleanedData: '',
+  phase: 'idle',
+  abortFn: null,
+  exportStatus: '',
+  cleaningProgress: emptyCleaningProgress()
+})
+
+const preserveCommittedReport = (
+  state: StoreState
+): Pick<StoreState, 'artifacts' | 'reportMarkdown' | 'reportStale'> => {
+  const committed = state.artifacts[REPORT_STEP_ID] || state.reportMarkdown
+  return {
+    artifacts: committed ? { [REPORT_STEP_ID]: committed } : {},
+    reportMarkdown: committed,
+    reportStale: Boolean(committed)
+  }
+}
+
 export const useStore = create<StoreState>((set, get) => ({
+  initialized: false,
+  persistencePaused: false,
+  projectRevision: 0,
+  analysisSessionId: crypto.randomUUID(),
+  previousProjectAvailable: false,
   settings: null,
   settingsOpen: false,
   sopRules: '',
@@ -365,39 +745,228 @@ export const useStore = create<StoreState>((set, get) => ({
   cleanDetails: [],
   artifacts: {},
   reportMarkdown: '',
+  reportStale: false,
   abortFn: null,
   steering: '',
   exportStatus: '',
-  cleaningProgress: { total: 0, done: 0, running: [], failed: 0 },
+  lastExportPath: '',
+  openingExport: false,
+  cleaningProgress: emptyCleaningProgress(),
 
   init: async () => {
-    const [settings, sopRules, lastProject] = await Promise.all([
+    const [settings, sopRules, lastProject, previousProject] = await Promise.all([
       window.api.getSettings(),
       window.api.getSopRules(),
-      window.api.loadLastProject()
+      window.api.loadLastProject(),
+      window.api.loadPreviousProject()
     ])
-    set({ settings, sopRules })
-    if (lastProject) {
-      set({
-        sources: lastProject.sources.map((s) => ({ ...s, parsing: false })),
-        messages: lastProject.messages,
-        cleanedData: lastProject.cleanedData || '',
-        cleanDetails: Array.isArray(lastProject.cleanDetails) ? lastProject.cleanDetails : [],
-        artifacts: lastProject.artifacts || {},
-        reportMarkdown: lastProject.reportMarkdown || '',
-        phase: restorePhase(lastProject),
-        steering: lastProject.steering || '',
-        abortFn: null,
-        cleaningProgress: { total: 0, done: 0, running: [], failed: 0 }
+    const restoredReport =
+      lastProject?.phase === 'analyzing'
+        ? lastProject.artifacts?.[REPORT_STEP_ID] || ''
+        : lastProject?.reportMarkdown || ''
+    const restoredArtifacts = { ...(lastProject?.artifacts || {}) }
+    if (restoredReport && !restoredArtifacts[REPORT_STEP_ID]) {
+      restoredArtifacts[REPORT_STEP_ID] = restoredReport
+    }
+    const restoredMessages: ChatMsg[] = lastProject
+      ? lastProject.messages
+          .filter(
+            (message) =>
+              !(
+                isRunningPhase(lastProject.phase as Phase) &&
+                message.kind === 'narration' &&
+                /正在|⏳/.test(message.text)
+              )
+          )
+          .map((message) => ({ ...message }))
+      : []
+    if (lastProject && isRunningPhase(lastProject.phase as Phase)) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'narration',
+        text: '上次任务在执行过程中退出了，已恢复保存好的资料和完整结果。请检查后重新开始。'
       })
     }
-    if (!settings.profiles.length) set({ settingsOpen: true })
+    set({
+      initialized: true,
+      persistencePaused: false,
+      projectRevision: lastProject?.revision || 0,
+      analysisSessionId: crypto.randomUUID(),
+      previousProjectAvailable: Boolean(previousProject),
+      settings,
+      sopRules,
+      settingsOpen: !settings.profiles.length,
+      sources: lastProject
+        ? lastProject.sources.map((source) => ({
+            ...source,
+            parsing: false,
+            error:
+              source.error || source.text || source.dataUrl
+                ? source.error
+                : '上次文件解析未完成，请删除后重新上传。'
+          }))
+        : [],
+      messages: restoredMessages,
+      cleanedData: lastProject?.cleanedData || '',
+      cleanDetails: Array.isArray(lastProject?.cleanDetails) ? lastProject.cleanDetails : [],
+      artifacts: restoredArtifacts,
+      reportMarkdown: restoredReport,
+      reportStale: Boolean(lastProject?.reportStale),
+      phase: lastProject ? restorePhase(lastProject) : 'idle',
+      steering: lastProject?.steering || '',
+      abortFn: null,
+      exportStatus: '',
+      lastExportPath: '',
+      openingExport: false,
+      cleaningProgress: emptyCleaningProgress()
+    })
   },
 
   setSettingsOpen: (open) => set({ settingsOpen: open }),
   saveSettings: async (s) => {
     const saved = await window.api.saveSettings(s)
     set({ settings: saved })
+  },
+
+  resetAnalysis: async () => {
+    const current = get()
+    await window.api.archiveProject(buildProjectSnapshot(current))
+    await window.api.cancelFileParsing().catch(() => undefined)
+    const previousAnalysis = {
+      sources: current.sources,
+      messages: current.messages,
+      cleanedData: current.cleanedData,
+      cleanDetails: current.cleanDetails,
+      artifacts: current.artifacts,
+      reportMarkdown: current.reportMarkdown,
+      reportStale: current.reportStale,
+      phase: current.phase,
+      abortFn: current.abortFn,
+      steering: current.steering,
+      exportStatus: current.exportStatus,
+      lastExportPath: current.lastExportPath,
+      openingExport: false,
+      cleaningProgress: current.cleaningProgress,
+      projectRevision: current.projectRevision,
+      analysisSessionId: current.analysisSessionId,
+      previousProjectAvailable: true,
+      persistencePaused: false
+    }
+    const nextRevision = current.projectRevision + 1
+    const emptyAnalysis = {
+      sources: [] as Source[],
+      messages: [] as ChatMsg[],
+      cleanedData: '',
+      cleanDetails: [] as { id: string; name: string; text: string }[],
+      artifacts: {} as Record<number, string>,
+      reportMarkdown: '',
+      reportStale: false,
+      phase: 'idle' as Phase,
+      abortFn: null,
+      steering: '',
+      exportStatus: '',
+      lastExportPath: '',
+      openingExport: false,
+      cleaningProgress: emptyCleaningProgress(),
+      projectRevision: nextRevision,
+      analysisSessionId: crypto.randomUUID(),
+      previousProjectAvailable: true,
+      persistencePaused: true
+    }
+
+    set(emptyAnalysis)
+    current.abortFn?.()
+    try {
+      await window.api.saveLastProject(buildProjectSnapshot(emptyAnalysis))
+      set({ persistencePaused: false })
+    } catch (error) {
+      const rollbackAnalysis = {
+        ...previousAnalysis,
+        sources: previousAnalysis.sources.map((source) =>
+          source.parsing
+            ? {
+                ...source,
+                parsing: false,
+                error: '文件解析在新建失败期间中断，请删除后重新上传。'
+              }
+            : source
+        ),
+        projectRevision: nextRevision + 1,
+        persistencePaused: false
+      }
+      set(rollbackAnalysis)
+      try {
+        await window.api.saveLastProject(buildProjectSnapshot(rollbackAnalysis))
+      } catch {
+        // 自动保存会继续尝试写入更高 revision 的回滚快照
+      }
+      throw error
+    }
+  },
+
+  restorePreviousAnalysis: async () => {
+    const current = get()
+    const previous = await window.api.loadPreviousProject()
+    if (!previous) {
+      set({ previousProjectAvailable: false })
+      throw new Error('没有找到可恢复的上一份分析。')
+    }
+
+    const restoredReport =
+      previous.phase === 'analyzing'
+        ? previous.artifacts?.[REPORT_STEP_ID] || ''
+        : previous.reportMarkdown || ''
+    const restoredArtifacts = { ...(previous.artifacts || {}) }
+    if (restoredReport && !restoredArtifacts[REPORT_STEP_ID]) {
+      restoredArtifacts[REPORT_STEP_ID] = restoredReport
+    }
+    const interrupted = isRunningPhase(previous.phase as Phase)
+    const restoredMessages: ChatMsg[] = (previous.messages || []).map((message) => ({
+      id: message.id,
+      role: message.role,
+      text: message.text,
+      kind: message.kind
+    }))
+    if (interrupted) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'narration',
+        text: '上一份分析在执行过程中退出了，已恢复已保存的内容。请检查资料后重新开始。'
+      })
+    }
+
+    const restoredState = {
+      sources: previous.sources.map((source) => ({
+        ...source,
+        parsing: false,
+        error:
+          source.error || source.text || source.dataUrl
+            ? source.error
+            : '上次文件解析未完成，请删除后重新上传。'
+      })),
+      messages: restoredMessages,
+      cleanedData: previous.cleanedData || '',
+      cleanDetails: Array.isArray(previous.cleanDetails) ? previous.cleanDetails : [],
+      artifacts: restoredArtifacts,
+      reportMarkdown: restoredReport,
+      reportStale: Boolean(previous.reportStale),
+      phase: restorePhase(previous),
+      steering: previous.steering || '',
+      abortFn: null,
+      exportStatus: '',
+      lastExportPath: '',
+      openingExport: false,
+      cleaningProgress: emptyCleaningProgress(),
+      projectRevision: current.projectRevision + 1,
+      analysisSessionId: crypto.randomUUID(),
+      previousProjectAvailable: false,
+      persistencePaused: true
+    }
+
+    await window.api.saveLastProject(buildProjectSnapshot(restoredState))
+    set({ ...restoredState, persistencePaused: false })
   },
 
   _post: (role, text, kind) => {
@@ -408,6 +977,12 @@ export const useStore = create<StoreState>((set, get) => ({
   _update: (id, text) => set((s) => ({ messages: s.messages.map((m) => (m.id === id ? { ...m, text } : m)) })),
 
   addSources: async (files) => {
+    const sessionId = get().analysisSessionId
+    if (isRunningPhase(get().phase)) return
+    if (get().sources.some((source) => source.parsing)) {
+      get()._post('assistant', '正在读取上一批资料，请等“解析中”全部结束后再继续添加。', 'narration')
+      return
+    }
     const acceptedJobs: Array<{
       id: string
       file: File
@@ -419,9 +994,21 @@ export const useStore = create<StoreState>((set, get) => ({
       purpose: string
     }> = []
     const rejected: Source[] = []
-    let acceptedBytes = get().sources.reduce((sum, s) => sum + ((s as Source & { size?: number }).size || 0), 0)
+    const incomingFiles = Array.from(files)
+    const availableSlots = Math.max(0, MAX_SOURCE_FILES - get().sources.length)
+    if (incomingFiles.length > availableSlots) {
+      get()._post(
+        'assistant',
+        `一次分析最多保留 ${MAX_SOURCE_FILES} 个文件，本次有 ${incomingFiles.length - availableSlots} 个文件未加入。请先完成这一份，再新建分析处理其余文件。`,
+        'error'
+      )
+    }
+    let acceptedBytes = get().sources.reduce(
+      (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
+      0
+    )
 
-    for (const file of Array.from(files)) {
+    for (const file of incomingFiles.slice(0, availableSlots)) {
       const name = displayName(file)
       const e = extOf(file.name)
       if (isJunkName(name)) continue
@@ -470,28 +1057,37 @@ export const useStore = create<StoreState>((set, get) => ({
     const jobs = acceptedJobs
 
     if (!jobs.length && rejected.length) {
-      set((s) => ({ sources: [...s.sources, ...rejected] }))
+      set((s) =>
+        s.analysisSessionId === sessionId && !isRunningPhase(s.phase)
+          ? { sources: [...s.sources, ...rejected] }
+          : s
+      )
       return
     }
 
     if (!jobs.length) return
 
-    set((s) => ({
-      sources: [
-        ...s.sources,
-        ...rejected,
-        ...jobs.map((job) => ({
-          id: job.id,
-          name: job.name,
-          kind: job.kind,
-          size: job.file.size,
-          parsing: true,
-          attribution: job.attribution,
-          platform: job.platform,
-          purpose: job.purpose
-        }))
-      ]
-    }))
+    set((s) => {
+      if (s.analysisSessionId !== sessionId || isRunningPhase(s.phase)) return s
+      return {
+        ...invalidatedAnalysis(),
+        ...preserveCommittedReport(s),
+        sources: [
+          ...s.sources,
+          ...rejected,
+          ...jobs.map((job) => ({
+            id: job.id,
+            name: job.name,
+            kind: job.kind,
+            size: job.file.size,
+            parsing: true,
+            attribution: job.attribution,
+            platform: job.platform,
+            purpose: job.purpose
+          }))
+        ]
+      }
+    })
 
     let next = 0
     const worker = async (): Promise<void> => {
@@ -500,59 +1096,137 @@ export const useStore = create<StoreState>((set, get) => ({
         try {
           if (job.ext === 'zip') {
             const buf = await job.file.arrayBuffer()
-            const items = await window.api.parseArchive(job.name, buf)
-            set((s) => ({
-              sources: [
-                ...s.sources.filter((x) => x.id !== job.id),
-                ...items.map((it) => ({
-                  id: crypto.randomUUID(),
-                  name: it.name,
-                  kind: it.kind,
-                  size: undefined,
-                  dataUrl: it.dataUrl,
-                  text: it.ok ? it.text : undefined,
-                  parsing: false,
-                  error: it.ok ? undefined : it.error,
-                  attribution: inferAttribution(`${job.name}/${it.name}`),
-                  platform: inferPlatform(`${job.name}/${it.name}`),
-                  purpose: inferPurpose(`${job.name}/${it.name}`),
-                  note: `来自压缩包：${job.name}`
-                }))
-              ]
-            }))
+            const archiveItems = await window.api.parseArchive(job.name, buf)
+            const items = [...archiveItems]
+            let imageIndex = 0
+            const processArchiveImages = async (): Promise<void> => {
+              while (imageIndex < archiveItems.length) {
+                const index = imageIndex++
+                const item = archiveItems[index]
+                if (!item.ok || item.kind !== 'image' || !item.dataUrl) continue
+                try {
+                  const blob = await (await fetch(item.dataUrl)).blob()
+                  const imageFile = new File([blob], item.name, { type: blob.type })
+                  items[index] = { ...item, dataUrl: await downscaleImage(imageFile) }
+                } catch (error) {
+                  items[index] = {
+                    ...item,
+                    ok: false,
+                    dataUrl: undefined,
+                    error: error instanceof Error ? error.message : '压缩包内图片无法读取。'
+                  }
+                }
+              }
+            }
+            await Promise.all([processArchiveImages(), processArchiveImages()])
+            set((s) => {
+              if (s.analysisSessionId !== sessionId || !s.sources.some((source) => source.id === job.id)) return s
+              const retainedSources = s.sources.filter((source) => source.id !== job.id)
+              const retainedBytes = retainedSources.reduce(
+                (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
+                0
+              )
+              const availableSlots = Math.max(0, MAX_SOURCE_FILES - retainedSources.length)
+              const overflowCount = Math.max(0, items.length - availableSlots)
+              const itemSlots = overflowCount ? Math.max(0, availableSlots - 1) : availableSlots
+              const retainedItems = items.slice(0, itemSlots)
+              const expandedBytes = retainedItems.reduce((sum, item) => sum + (item.size || 0), 0)
+              if (retainedBytes + expandedBytes > MAX_TOTAL_UPLOAD_BYTES) {
+                return {
+                  sources: [
+                    ...retainedSources,
+                    {
+                      id: job.id,
+                      name: job.name,
+                      kind: 'other',
+                      size: job.file.size,
+                      parsing: false,
+                      error: `已忽略：压缩包解压后的资料会使总量超过 ${formatBytes(MAX_TOTAL_UPLOAD_BYTES)}，请分批分析。`,
+                      attribution: job.attribution,
+                      platform: job.platform,
+                      purpose: job.purpose
+                    }
+                  ]
+                }
+              }
+              return {
+                sources: [
+                  ...retainedSources,
+                  ...retainedItems.map((it) => ({
+                    id: crypto.randomUUID(),
+                    name: it.name,
+                    kind: it.kind,
+                    size: it.size,
+                    dataUrl: it.dataUrl,
+                    text: it.ok ? it.text : undefined,
+                    parsing: false,
+                    error: it.ok ? undefined : it.error,
+                    warning: it.ok ? it.warning : undefined,
+                    attribution: inferAttribution(`${job.name}/${it.name}`),
+                    platform: inferPlatform(`${job.name}/${it.name}`),
+                    purpose: inferPurpose(`${job.name}/${it.name}`),
+                    note: `来自压缩包：${job.name}`
+                  })),
+                  ...(overflowCount && availableSlots
+                    ? [
+                        {
+                          id: crypto.randomUUID(),
+                          name: `${job.name}：数量提示`,
+                          kind: 'other' as const,
+                          parsing: false,
+                          error: `已忽略：压缩包展开后会超过 ${MAX_SOURCE_FILES} 份资料，本包有 ${overflowCount} 个条目未加入。请新建另一份分析处理。`
+                        }
+                      ]
+                    : [])
+                ]
+              }
+            })
             continue
           }
 
           if (job.kind === 'image') {
             const dataUrl = await downscaleImage(job.file)
-            set((s) => ({
-              sources: s.sources.map((a) =>
-                a.id === job.id ? { ...a, parsing: false, dataUrl, error: undefined } : a
-              )
-            }))
+            set((s) =>
+              s.analysisSessionId === sessionId
+                ? {
+                    sources: s.sources.map((a) =>
+                      a.id === job.id ? { ...a, parsing: false, dataUrl, error: undefined } : a
+                    )
+                  }
+                : s
+            )
             continue
           }
 
           const buf = await job.file.arrayBuffer()
           const parsed = await window.api.parseFile(job.file.name, buf)
-          set((s) => ({
-            sources: s.sources.map((a) =>
-              a.id === job.id
-                ? {
-                    ...a,
-                    parsing: false,
-                    text: parsed.ok ? parsed.text : undefined,
-                    error: parsed.ok ? undefined : parsed.error
-                  }
-                : a
-            )
-          }))
+          set((s) =>
+            s.analysisSessionId === sessionId
+              ? {
+                  sources: s.sources.map((a) =>
+                    a.id === job.id
+                      ? {
+                          ...a,
+                          parsing: false,
+                          text: parsed.ok ? parsed.text : undefined,
+                          error: parsed.ok ? undefined : parsed.error,
+                          warning: parsed.ok ? parsed.warning : undefined
+                        }
+                      : a
+                  )
+                }
+              : s
+          )
         } catch (err) {
-          set((s) => ({
-            sources: s.sources.map((a) =>
-              a.id === job.id ? { ...a, parsing: false, error: err instanceof Error ? err.message : String(err) } : a
-            )
-          }))
+          set((s) =>
+            s.analysisSessionId === sessionId
+              ? {
+                  sources: s.sources.map((a) =>
+                    a.id === job.id ? { ...a, parsing: false, error: err instanceof Error ? err.message : String(err) } : a
+                  )
+                }
+              : s
+          )
         }
       }
     }
@@ -560,43 +1234,83 @@ export const useStore = create<StoreState>((set, get) => ({
     await Promise.all(Array.from({ length: Math.min(PARSE_CONCURRENCY, jobs.length) }, () => worker()))
   },
 
-  removeSource: (id) => set((s) => ({ sources: s.sources.filter((a) => a.id !== id) })),
+  removeSource: (id) =>
+    set((s) => {
+      if (isRunningPhase(s.phase) || !s.sources.some((source) => source.id === id)) return s
+      return {
+        ...invalidatedAnalysis(),
+        ...preserveCommittedReport(s),
+        sources: s.sources.filter((source) => source.id !== id),
+        cleanDetails: s.cleanDetails.filter((detail) => detail.id !== id)
+      }
+    }),
 
   setSourceAttribution: (id, attribution) =>
-    set((s) => ({
-      sources: s.sources.map((x) => (x.id === id ? { ...x, attribution } : x)),
-      cleanDetails: s.cleanDetails.filter((d) => d.id !== id),
-      cleanedData: '',
-      artifacts: {},
-      reportMarkdown: ''
-    })),
+    set((s) =>
+      isRunningPhase(s.phase)
+        ? s
+        : {
+            ...invalidatedAnalysis(),
+            ...preserveCommittedReport(s),
+            sources: s.sources.map((x) => (x.id === id ? { ...x, attribution } : x)),
+            cleanDetails: s.cleanDetails.filter((d) => d.id !== id)
+          }
+    ),
+
+  setUnconfirmedAttribution: (attribution) =>
+    set((s) => {
+      if (isRunningPhase(s.phase)) return s
+      const changedIds = new Set(
+        s.sources
+          .filter((source) => (source.dataUrl || source.text) && !source.attribution)
+          .map((source) => source.id)
+      )
+      if (!changedIds.size) return s
+      return {
+        ...invalidatedAnalysis(),
+        ...preserveCommittedReport(s),
+        sources: s.sources.map((source) =>
+          changedIds.has(source.id) ? { ...source, attribution } : source
+        ),
+        cleanDetails: s.cleanDetails.filter((detail) => !changedIds.has(detail.id))
+      }
+    }),
 
   setSourcePlatform: (id, platform) =>
-    set((s) => ({
-      sources: s.sources.map((x) => (x.id === id ? { ...x, platform } : x)),
-      cleanDetails: s.cleanDetails.filter((d) => d.id !== id),
-      cleanedData: '',
-      artifacts: {},
-      reportMarkdown: ''
-    })),
+    set((s) =>
+      isRunningPhase(s.phase)
+        ? s
+        : {
+            ...invalidatedAnalysis(),
+            ...preserveCommittedReport(s),
+            sources: s.sources.map((x) => (x.id === id ? { ...x, platform } : x)),
+            cleanDetails: s.cleanDetails.filter((d) => d.id !== id)
+          }
+    ),
 
   setSourcePurpose: (id, purpose) =>
-    set((s) => ({
-      sources: s.sources.map((x) => (x.id === id ? { ...x, purpose } : x)),
-      cleanDetails: s.cleanDetails.filter((d) => d.id !== id),
-      cleanedData: '',
-      artifacts: {},
-      reportMarkdown: ''
-    })),
+    set((s) =>
+      isRunningPhase(s.phase)
+        ? s
+        : {
+            ...invalidatedAnalysis(),
+            ...preserveCommittedReport(s),
+            sources: s.sources.map((x) => (x.id === id ? { ...x, purpose } : x)),
+            cleanDetails: s.cleanDetails.filter((d) => d.id !== id)
+          }
+    ),
 
   setSourceNote: (id, note) =>
-    set((s) => ({
-      sources: s.sources.map((x) => (x.id === id ? { ...x, note } : x)),
-      cleanDetails: s.cleanDetails.filter((d) => d.id !== id),
-      cleanedData: '',
-      artifacts: {},
-      reportMarkdown: ''
-    })),
+    set((s) =>
+      isRunningPhase(s.phase)
+        ? s
+        : {
+            ...invalidatedAnalysis(),
+            ...preserveCommittedReport(s),
+            sources: s.sources.map((x) => (x.id === id ? { ...x, note } : x)),
+            cleanDetails: s.cleanDetails.filter((d) => d.id !== id)
+          }
+    ),
 
   startGeneration: async () => {
     const { settings, sources, phase } = get()
@@ -607,26 +1321,43 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ settingsOpen: true })
       get()._post(
         'assistant',
-        '还没有完成模型配置。请在设置里确认 ai英雄会 的 Base URL、模型名和 API Key。填好后即可使用；测试连通和测试读图只是可选排障。',
+        '还没有完成模型配置。请打开设置，粘贴 API Key 并完成“测试连通”后保存。',
         'error'
       )
+      return
+    }
+    const activeEndpoint = profile.baseURL.trim().replace(/\/+$/, '')
+    if (!settings?.privacyAccepted || settings.privacyEndpoint !== activeEndpoint) {
+      get()._post('assistant', '开始前请先确认资料将发送到当前模型服务。完成隐私确认后再点“开始生成报告”。', 'error')
       return
     }
     if (sources.some((s) => s.parsing)) {
       get()._post('assistant', '还有文件正在本地解析，请等解析完成后再开始生成。', 'narration')
       return
     }
+    const unconfirmed = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution)
+    if (unconfirmed.length) {
+      get()._post('assistant', `还有 ${unconfirmed.length} 份资料没有确认归属。请在文件下方点“自有数据”或“竞品数据”。`, 'narration')
+      return
+    }
     if (!sources.some((s) => s.dataUrl || s.text)) {
       get()._post('assistant', '还没有可用的资料。请先上传截图/表格/文档/zip/文件夹，再点「开始生成」。', 'narration')
       return
     }
-    set({ artifacts: {}, reportMarkdown: '' })
-    await get()._runCleaning(false)
+    set((state) => preserveCommittedReport(state))
+    try {
+      await get()._runCleaning(false)
+    } catch (error) {
+      set({ phase: 'idle', abortFn: null })
+      get()._post('assistant', `本次分析没有启动成功：${friendlyError(error)}`, 'error')
+    }
   },
 
   // 分批清洗：并发抽取每个文件(最多4个) → 汇总(输入截断+失败重试)，避免大请求被中转掐断
   _runCleaning: async (isRerun) => {
-    set({ phase: 'cleaning' })
+    const sessionId = get().analysisSessionId
+    const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
+    set({ phase: 'cleaning', cleanedData: '' })
     const usable = get().sources.filter((s) => s.dataUrl || s.text)
     const usableIds = new Set(usable.map((s) => s.id))
     // 丢掉已删除文件的旧明细；只抽取还没处理过的文件（支持中断续跑 / 补传后只洗新文件）
@@ -643,7 +1374,7 @@ export const useStore = create<StoreState>((set, get) => ({
     })
 
     if (todo.length) {
-      const conc = Math.min(4, todo.length)
+      const conc = Math.min(MAX_CLEANING_CONCURRENCY, todo.length)
       get()._post(
         'assistant',
         `${isRerun ? '补充' : '开始'}清洗 ${todo.length} 份资料（并发 ${conc} 个，更快）……`,
@@ -675,6 +1406,7 @@ export const useStore = create<StoreState>((set, get) => ({
               if (fn) aborts.add(fn)
             }
           )
+          if (!isCurrentSession()) return
           if (!res.ok) {
             if (!failedRef.current) failedRef.current = { name: s.name, error: res.error || '失败' }
             set((st) => ({
@@ -698,6 +1430,7 @@ export const useStore = create<StoreState>((set, get) => ({
         }
       }
       await Promise.all(Array.from({ length: conc }, () => worker()))
+      if (!isCurrentSession()) return
       set({ abortFn: null })
 
       if (cancelled) {
@@ -722,10 +1455,17 @@ export const useStore = create<StoreState>((set, get) => ({
     const blockId = get()._post('assistant', '', 'report-block')
     const res = await runModelRetry(
       buildSummaryMessages(details, get().steering),
-      (acc) => get()._update(blockId, acc),
-      (fn) => set({ abortFn: fn }),
-      (n) => get()._post('assistant', `汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
+      (acc) => {
+        if (isCurrentSession()) get()._update(blockId, acc)
+      },
+      (fn) => {
+        if (isCurrentSession()) set({ abortFn: fn })
+      },
+      (n) => {
+        if (isCurrentSession()) get()._post('assistant', `汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
+      }
     )
+    if (!isCurrentSession()) return
     if (!res.ok) {
       get()._update(blockId, (res.text || '') + `\n\n⚠️ 汇总失败：${res.error}`)
       set({ phase: get().cleanedData ? 'checkpoint1' : 'idle' })
@@ -751,6 +1491,8 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   _runAnalysis: async () => {
+    const sessionId = get().analysisSessionId
+    const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
     const { sopRules, cleanedData } = get()
     for (const step of SOP_STEPS) {
@@ -765,21 +1507,46 @@ export const useStore = create<StoreState>((set, get) => ({
         output: isReportStep ? compactForFinalReport(get().artifacts[s.id]) : get().artifacts[s.id]
       }))
       if (isReportStep) {
+        const previousReport = get().reportMarkdown
+        const reportFeedback = get().steering
         get()._post('assistant', '⏳ 正在整合成稿…', 'narration')
         const res = await runFinalReportInParts({
           cleanedData: cleanedSummaryOnly(cleanedData),
           priorOutputs,
-          feedback: get().steering,
-          setAbort: (fn) => set({ abortFn: fn }),
-          onProgress: (text) => set({ reportMarkdown: text }),
-          onRetry: (partLabel, n) => get()._post('assistant', `成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+          feedback: reportFeedback,
+          setAbort: (fn) => {
+            if (isCurrentSession()) set({ abortFn: fn })
+          },
+          onProgress: (text) => {
+            if (isCurrentSession()) set({ reportMarkdown: text })
+          },
+          onRetry: (partLabel, n) => {
+            if (isCurrentSession()) get()._post('assistant', `成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+          }
         })
+        if (!isCurrentSession()) return
         if (!res.ok) {
-          get()._post('assistant', `⚠️ 成稿中断：${res.error}。修好后点「确认，继续分析」可继续。`, 'error')
-          set({ phase: 'checkpoint1' })
+          get()._post(
+            'assistant',
+            isUserStop(res.error)
+              ? '已停止生成，上一份完整报告仍然保留。需要时可继续分析。'
+              : `⚠️ 成稿中断：${res.error}。修好后点「确认，继续分析」可继续。`,
+            isUserStop(res.error) ? 'narration' : 'error'
+          )
+          set({ phase: 'checkpoint1', reportMarkdown: previousReport })
           return
         }
-        set((s) => ({ artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text }, reportMarkdown: res.text }))
+        if (get().steering !== reportFeedback) {
+          set({ reportMarkdown: previousReport })
+          get()._post('assistant', '检测到你在成稿期间补充了新要求，正在自动按新要求再修订一次。', 'narration')
+          await get()._rerunReport()
+          return
+        }
+        set((s) => ({
+          artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
+          reportMarkdown: res.text,
+          reportStale: false
+        }))
       } else {
         const messages = buildStepMessages({
           stepId: step.id,
@@ -796,8 +1563,15 @@ export const useStore = create<StoreState>((set, get) => ({
           (fn) => set({ abortFn: fn }),
           (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration')
         )
+        if (!isCurrentSession()) return
         if (!res.ok) {
-          get()._post('assistant', `⚠️ ${step.title}中断：${res.error}。修好后点「确认，继续分析」可继续（已完成的步骤会跳过）。`, 'error')
+          get()._post(
+            'assistant',
+            isUserStop(res.error)
+              ? `已停止「${step.title}」，已完成的内容已经保留。需要时可继续分析。`
+              : `⚠️ ${step.title}中断：${res.error}。修好后点「确认，继续分析」可继续（已完成的步骤会跳过）。`,
+            isUserStop(res.error) ? 'narration' : 'error'
+          )
           set({ phase: 'checkpoint1' })
           return
         }
@@ -805,6 +1579,7 @@ export const useStore = create<StoreState>((set, get) => ({
         get()._post('assistant', `✅ ${step.title} 完成`, 'narration')
       }
     }
+    if (!isCurrentSession()) return
     set({ phase: 'checkpoint2' })
     get()._post(
       'assistant',
@@ -814,7 +1589,11 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   _rerunReport: async () => {
+    const sessionId = get().analysisSessionId
+    const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     const { sopRules, cleanedData, steering, artifacts } = get()
+    const reportFeedback = steering
+    const previousReport = get().reportMarkdown
     set({ phase: 'analyzing' })
     const priorOutputs = SOP_STEPS.filter((s) => s.id < REPORT_STEP_ID && artifacts[s.id]).map((s) => ({
       id: s.id,
@@ -824,24 +1603,61 @@ export const useStore = create<StoreState>((set, get) => ({
     const res = await runFinalReportInParts({
       cleanedData: cleanedSummaryOnly(cleanedData),
       priorOutputs,
-      feedback: steering,
-      setAbort: (fn) => set({ abortFn: fn }),
-      onProgress: (text) => set({ reportMarkdown: text }),
-      onRetry: (partLabel, n) => get()._post('assistant', `修订成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+      feedback: reportFeedback,
+      setAbort: (fn) => {
+        if (isCurrentSession()) set({ abortFn: fn })
+      },
+      onProgress: (text) => {
+        if (isCurrentSession()) set({ reportMarkdown: text })
+      },
+      onRetry: (partLabel, n) => {
+        if (isCurrentSession()) get()._post('assistant', `修订成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+      }
     })
+    if (!isCurrentSession()) return
     if (!res.ok) {
-      get()._post('assistant', `⚠️ 修订中断：${res.error}`, 'error')
-      set({ phase: 'checkpoint2' })
+      get()._post(
+        'assistant',
+        isUserStop(res.error) ? '已停止修订，上一份完整报告仍然保留。' : `⚠️ 修订中断：${res.error}`,
+        isUserStop(res.error) ? 'narration' : 'error'
+      )
+      set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
       return
     }
-    set((s) => ({ artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text }, reportMarkdown: res.text, phase: 'checkpoint2' }))
+    if (get().steering !== reportFeedback) {
+      set({ reportMarkdown: previousReport })
+      get()._post('assistant', '检测到修订期间又有新要求，正在继续按最新要求修订。', 'narration')
+      await get()._rerunReport()
+      return
+    }
+    set((s) => ({
+      artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
+      reportMarkdown: res.text,
+      reportStale: false,
+      phase: 'checkpoint2'
+    }))
     get()._post('assistant', '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。', 'checkpoint')
   },
 
   confirmCheckpoint: async () => {
     const phase = get().phase
-    if (phase === 'checkpoint1') await get()._runAnalysis()
+    if (phase === 'checkpoint1') {
+      if (!get().cleanedData.trim()) {
+        set({ phase: 'idle' })
+        get()._post('assistant', '资料发生过变化，需要重新点「开始生成报告」完成清洗后再继续。', 'error')
+        return
+      }
+      await get()._runAnalysis()
+    }
     else if (phase === 'checkpoint2') {
+      if (
+        !get().reportMarkdown.trim() ||
+        get().reportMarkdown !== get().artifacts[REPORT_STEP_ID]
+      ) {
+        set({ phase: 'checkpoint1' })
+        get()._post('assistant', '报告内容不完整，请重新继续分析后再定稿。', 'error')
+        return
+      }
       set({ phase: 'done' })
       get()._post('assistant', '✅ 报告已定稿，可在右侧导出 HTML / Markdown / Word。', 'narration')
     }
@@ -849,28 +1665,53 @@ export const useStore = create<StoreState>((set, get) => ({
 
   sendMessage: async (text) => {
     const t = text.trim()
-    if (!t) return
+    if (!t) return false
     const phase = get().phase
     get()._post('user', t)
 
-    if (phase === 'cleaning' || phase === 'analyzing') {
+    try {
+      if (phase === 'cleaning' || phase === 'analyzing') {
+        set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
+        get()._post('assistant', '收到，我会在后续步骤里按这个调整。', 'narration')
+        return true
+      }
+      if (phase === 'checkpoint1') {
+        set((s) => {
+          const committedReport = s.artifacts[REPORT_STEP_ID] || s.reportMarkdown
+          return {
+            steering: (s.steering ? s.steering + '\n' : '') + t,
+            artifacts: committedReport ? { [REPORT_STEP_ID]: committedReport } : {},
+            reportStale: Boolean(committedReport)
+          }
+        })
+        get()._post('assistant', '好的，按你的要求重新清洗归一……', 'narration')
+        await get()._runCleaning(true)
+        return true
+      }
+      if (phase === 'checkpoint2' || phase === 'done') {
+        set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
+        get()._post('assistant', '好的，按你的要求修订报告……', 'narration')
+        await get()._rerunReport()
+        return true
+      }
       set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-      get()._post('assistant', '收到，我会在后续步骤里按这个调整。', 'narration')
-      return
+      get()._post('assistant', '已保存为本次分析目标。上传资料后点「开始生成报告」即可。', 'narration')
+      return true
+    } catch (error) {
+      set({
+        abortFn: null,
+        phase:
+          phase === 'checkpoint2' || phase === 'done'
+            ? 'checkpoint2'
+            : phase === 'checkpoint1'
+              ? 'checkpoint1'
+              : get().cleanedData
+                ? 'checkpoint1'
+                : 'idle'
+      })
+      get()._post('assistant', `操作没有完成：${friendlyError(error)}`, 'error')
+      return false
     }
-    if (phase === 'checkpoint1') {
-      set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-      get()._post('assistant', '好的，按你的要求重新清洗归一……', 'narration')
-      await get()._runCleaning(true)
-      return
-    }
-    if (phase === 'checkpoint2' || phase === 'done') {
-      set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-      get()._post('assistant', '好的，按你的要求修订报告……', 'narration')
-      await get()._rerunReport()
-      return
-    }
-    get()._post('assistant', '先上传资料并点「开始生成」。生成过程中你可以随时打字纠偏方向。', 'narration')
   },
 
   abort: () => {
@@ -878,21 +1719,64 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   exportReport: async (format) => {
-    const md = get().reportMarkdown
+    const { reportMarkdown: md, phase, artifacts, reportStale, exportStatus } = get()
+    if (exportStatus === '导出中…') return
+    if (phase === 'cleaning' || phase === 'analyzing') {
+      set({ exportStatus: '报告仍在生成，请完成后再导出。' })
+      return
+    }
+    if (!artifacts[REPORT_STEP_ID] || md !== artifacts[REPORT_STEP_ID]) {
+      set({ exportStatus: '当前预览尚未完成提交，请继续生成后再导出。' })
+      return
+    }
     if (!md.trim()) {
       set({ exportStatus: '还没有报告可导出。' })
       return
     }
-    set({ exportStatus: '导出中…' })
+    if (phase !== 'done' && !reportStale) {
+      set({ exportStatus: '这还是待确认的初稿，请先点击“确认定稿”再导出。' })
+      return
+    }
+    set({ exportStatus: '导出中…', lastExportPath: '' })
     const name = defaultReportName(format)
-    const res =
-      format === 'html'
-        ? await window.api.exportHtml(md, name)
-        : format === 'md'
-          ? await window.api.exportMarkdown(md, name)
-          : await window.api.exportDocx(md, name)
-    if (res.ok) set({ exportStatus: `已导出：${res.path}` })
-    else if (res.canceled) set({ exportStatus: '' })
-    else set({ exportStatus: `导出失败：${res.error || '未知错误'}` })
+    try {
+      const res =
+        format === 'html'
+          ? await window.api.exportHtml(md, name)
+          : format === 'md'
+            ? await window.api.exportMarkdown(md, name)
+            : await window.api.exportDocx(md, name)
+      if (res.ok) set({ exportStatus: `已导出：${res.path}`, lastExportPath: res.path || '' })
+      else if (res.canceled) set({ exportStatus: '', lastExportPath: '' })
+      else set({ exportStatus: `导出失败：${friendlyError(res.error)}`, lastExportPath: '' })
+    } catch (error) {
+      set({ exportStatus: `导出失败：${friendlyError(error)}`, lastExportPath: '' })
+    }
+  },
+
+  openLastExport: async () => {
+    const { lastExportPath: path, openingExport } = get()
+    if (!path || openingExport) return
+    set({ openingExport: true })
+    try {
+      await window.api.openPath(path)
+    } catch (error) {
+      set({ exportStatus: `打开失败：${friendlyError(error)}`, lastExportPath: '' })
+    } finally {
+      set({ openingExport: false })
+    }
+  },
+
+  showLastExportInFolder: async () => {
+    const { lastExportPath: path, openingExport } = get()
+    if (!path || openingExport) return
+    set({ openingExport: true })
+    try {
+      await window.api.showItemInFolder(path)
+    } catch (error) {
+      set({ exportStatus: `打开文件夹失败：${friendlyError(error)}`, lastExportPath: '' })
+    } finally {
+      set({ openingExport: false })
+    }
   }
 }))

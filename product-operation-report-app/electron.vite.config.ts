@@ -7,7 +7,14 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
-        input: { index: resolve(__dirname, 'src/main/index.ts') }
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          'parse-utility': resolve(__dirname, 'src/main/parse-utility.ts')
+        },
+        output: {
+          entryFileNames: '[name].js',
+          chunkFileNames: 'chunks/[name]-[hash].js'
+        }
       }
     }
   },

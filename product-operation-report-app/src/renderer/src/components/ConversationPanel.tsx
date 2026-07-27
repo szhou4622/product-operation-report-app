@@ -12,6 +12,7 @@ export default function ConversationPanel(): JSX.Element {
   const addSources = useStore((s) => s.addSources)
   const removeSource = useStore((s) => s.removeSource)
   const setSourceAttribution = useStore((s) => s.setSourceAttribution)
+  const setUnconfirmedAttribution = useStore((s) => s.setUnconfirmedAttribution)
   const setSourcePlatform = useStore((s) => s.setSourcePlatform)
   const setSourcePurpose = useStore((s) => s.setSourcePurpose)
   const setSourceNote = useStore((s) => s.setSourceNote)
@@ -21,12 +22,16 @@ export default function ConversationPanel(): JSX.Element {
   const abort = useStore((s) => s.abort)
 
   const [text, setText] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState('')
   const [dragover, setDragover] = useState(false)
   const [sourceHeight, setSourceHeight] = useState(280)
   const [confirmHeight, setConfirmHeight] = useState(220)
   const fileRef = useRef<HTMLInputElement>(null)
   const folderRef = useRef<HTMLInputElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef(true)
 
   useEffect(() => {
     if (folderRef.current) {
@@ -36,16 +41,22 @@ export default function ConversationPanel(): JSX.Element {
   }, [])
 
   useEffect(() => {
-    requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }))
+    if (!stickToBottomRef.current) return
+    requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: 'auto' }))
   }, [messages])
 
   const running = phase === 'cleaning' || phase === 'analyzing'
   const hasUsable = sources.some((s) => s.dataUrl || s.text)
   const parsedCount = sources.filter((s) => s.dataUrl || s.text).length
   const parsingCount = sources.filter((s) => s.parsing).length
-  const explainedCount = sources.filter((s) => s.attribution && s.platform && s.purpose && s.note).length
+  const processedCount = sources.filter((s) => !s.parsing).length
+  const importLocked = running || parsingCount > 0
+  const unconfirmedCount = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution).length
+  const confirmedAttributionCount = sources.filter(
+    (s) => (s.dataUrl || s.text) && Boolean(s.attribution)
+  ).length
   const competitorSources = sources.filter((s) => /竞品|竞对|对标|对手/.test(s.attribution ?? ''))
-  const parsePercent = sources.length ? Math.round((parsedCount / sources.length) * 100) : 0
+  const parsePercent = sources.length ? Math.round((processedCount / sources.length) * 100) : 0
   const cleanPercent = cleaningProgress.total
     ? Math.round(((cleaningProgress.done + cleaningProgress.failed) / cleaningProgress.total) * 100)
     : 0
@@ -61,8 +72,18 @@ export default function ConversationPanel(): JSX.Element {
 
   const onSend = async (): Promise<void> => {
     const t = text
-    setText('')
-    await sendMessage(t)
+    if (!t.trim() || sending) return
+    setSending(true)
+    setSendError('')
+    try {
+      const sent = await sendMessage(t)
+      if (sent) setText('')
+      else setSendError('没有处理成功，输入内容已保留，请检查上方提示后重试。')
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : '发送失败，请重试。')
+    } finally {
+      setSending(false)
+    }
   }
 
   const startVerticalResize = (
@@ -97,10 +118,17 @@ export default function ConversationPanel(): JSX.Element {
             ? '写清楚本次分析目标：如「帮我判断这个酸菜产品的视频号内容主线和核心人群」'
             : '有补充或要求可以先写在这里'
 
+  const confirmAllUnassigned = (attribution: '自有数据' | '竞品数据'): void => {
+    const rerunNotice = phase === 'idle' ? '' : ' 修改后需要重新生成分析，上一份完整报告仍会保留。'
+    if (!window.confirm(`将把 ${unconfirmedCount} 份未确认资料全部设为“${attribution}”。已手动确认的资料不会变化。${rerunNotice}确定继续吗？`)) return
+    setUnconfirmedAttribution(attribution)
+  }
+
   return (
     <div
       className={`pane chat ${dragover ? 'dragover' : ''} ${isPrepareEmpty ? 'prepare-empty' : ''}`}
       onDragOver={(e) => {
+        if (importLocked) return
         e.preventDefault()
         setDragover(true)
       }}
@@ -108,7 +136,7 @@ export default function ConversationPanel(): JSX.Element {
       onDrop={(e) => {
         e.preventDefault()
         setDragover(false)
-        if (e.dataTransfer.files.length) void addSources(e.dataTransfer.files)
+        if (!importLocked && e.dataTransfer.files.length) void addSources(e.dataTransfer.files)
       }}
     >
       <div className="pane-title">{phaseTitle}</div>
@@ -146,6 +174,7 @@ export default function ConversationPanel(): JSX.Element {
           ref={fileRef}
           type="file"
           multiple
+          disabled={importLocked}
           style={{ display: 'none' }}
           accept=".png,.jpg,.jpeg,.webp,.gif,.xlsx,.xls,.csv,.pdf,.docx,.doc,.pptx,.ppt,.md,.markdown,.txt,.zip"
           onChange={(e) => {
@@ -157,6 +186,7 @@ export default function ConversationPanel(): JSX.Element {
           ref={folderRef}
           type="file"
           multiple
+          disabled={importLocked}
           style={{ display: 'none' }}
           onChange={(e) => {
             if (e.target.files?.length) void addSources(e.target.files)
@@ -168,13 +198,13 @@ export default function ConversationPanel(): JSX.Element {
             <div className="welcome-kicker">AI 经营研究室</div>
             <h1>把资料交给系统，生成一份可交付的产品经营报告</h1>
             <p>
-              上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会先清洗归类，再在关键节点停下来让你确认。
+              上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会自动整理，只在资料整理后和报告初稿完成后请你确认。
             </p>
             <div className="welcome-actions">
-              <button className="btn primary big" onClick={() => fileRef.current?.click()}>
+              <button className="btn primary big" disabled={importLocked} onClick={() => fileRef.current?.click()}>
                 上传产品资料
               </button>
-              <button className="btn big" onClick={() => folderRef.current?.click()}>
+              <button className="btn big" disabled={importLocked} onClick={() => folderRef.current?.click()}>
                 选择资料文件夹
               </button>
             </div>
@@ -195,17 +225,44 @@ export default function ConversationPanel(): JSX.Element {
         ) : (
           <div className="src-strip-head">
             <span>资料源（{sources.length}）</span>
-            <button className="btn xs" onClick={() => fileRef.current?.click()}>
+            <button className="btn xs" disabled={importLocked} onClick={() => fileRef.current?.click()}>
               ＋ 文件
             </button>
-            <button className="btn xs" onClick={() => folderRef.current?.click()}>
+            <button className="btn xs" disabled={importLocked} onClick={() => folderRef.current?.click()}>
               ＋ 文件夹
             </button>
           </div>
         )}
         {sources.length > 0 && (
           <>
-            <div className="src-tip">归属只能二选一：自有数据 / 竞品数据；平台、信息类型和补充说明可按实际资料填写。被忽略或解析失败的文件不会参与分析。</div>
+            <div className="src-tip">归属只能二选一：自有数据 / 竞品数据；平台、信息类型和补充说明都是选填。被忽略或解析失败的文件不会参与分析。</div>
+            {unconfirmedCount > 0 && (
+              <div className="src-bulk-attribution">
+                <span>
+                  {parsingCount
+                    ? `还有文件正在读取，全部完成后可批量确认（当前 ${unconfirmedCount} 份待确认）`
+                    : `还有 ${unconfirmedCount} 份可用资料未确认归属`}
+                </span>
+                <button
+                  className="btn xs"
+                  type="button"
+                  disabled={importLocked}
+                  title={parsingCount ? '请等待全部文件读取完成' : undefined}
+                  onClick={() => confirmAllUnassigned('自有数据')}
+                >
+                  未确认项全部设为自有
+                </button>
+                <button
+                  className="btn xs"
+                  type="button"
+                  disabled={importLocked}
+                  title={parsingCount ? '请等待全部文件读取完成' : undefined}
+                  onClick={() => confirmAllUnassigned('竞品数据')}
+                >
+                  未确认项全部设为竞品
+                </button>
+              </div>
+            )}
             <div className="src-list">
               {sources.map((s) => (
                 <div className="src-row" key={s.id}>
@@ -218,9 +275,23 @@ export default function ConversationPanel(): JSX.Element {
                     <span className="src-name" title={s.error || s.name}>
                       {s.name}
                     </span>
-                    <span className="x" onClick={() => removeSource(s.id)}>
+                    <button
+                      className="x"
+                      type="button"
+                      disabled={importLocked}
+                      aria-label={`删除资料 ${s.name}`}
+                      onClick={() => {
+                        if (
+                          phase !== 'idle' &&
+                          !window.confirm('删除这份资料后，需要重新生成分析。上一份完整报告仍会保留。确定删除吗？')
+                        ) {
+                          return
+                        }
+                        removeSource(s.id)
+                      }}
+                    >
                       ✕
-                    </span>
+                    </button>
                   </div>
                   <div className="src-meta-row">
                     <div className="src-attr-toggle" aria-label="资料归属">
@@ -228,6 +299,7 @@ export default function ConversationPanel(): JSX.Element {
                         <button
                           key={value}
                           type="button"
+                          disabled={importLocked}
                           className={s.attribution === value ? 'active' : ''}
                           onClick={() => setSourceAttribution(s.id, value)}
                         >
@@ -238,15 +310,17 @@ export default function ConversationPanel(): JSX.Element {
                     <input
                       className="src-select"
                       list="source-platform-options"
-                      placeholder="平台/来源"
+                      placeholder="平台/来源（选填）"
                       value={s.platform ?? ''}
+                      disabled={importLocked}
                       onChange={(e) => setSourcePlatform(s.id, e.target.value)}
                     />
                     <input
                       className="src-select"
                       list="source-purpose-options"
-                      placeholder="信息类型"
+                      placeholder="信息类型（选填）"
                       value={s.purpose ?? ''}
+                      disabled={importLocked}
                       onChange={(e) => setSourcePurpose(s.id, e.target.value)}
                     />
                     <span className={`src-status ${s.parsing ? 'parsing' : s.error ? 'error' : 'ready'}`}>
@@ -263,8 +337,9 @@ export default function ConversationPanel(): JSX.Element {
                   </div>
                   <input
                     className="src-note"
-                    placeholder="补充信息/说明：如 这是视频号近30天成交人群截图 / 文件里没写但这是自有爆款素材"
+                    placeholder="补充说明（选填）：如 这是视频号近30天成交人群截图"
                     value={s.note ?? ''}
+                    disabled={importLocked}
                     onChange={(e) => setSourceNote(s.id, e.target.value)}
                   />
                   {s.error && <div className="src-err">{s.error.startsWith('已忽略') ? s.error : `解析失败：${s.error}`}</div>}
@@ -290,7 +365,9 @@ export default function ConversationPanel(): JSX.Element {
             <div className="progress-head">
               <b>本地解析</b>
               <span>
-                {parsedCount}/{sources.length} 可分析{parsingCount ? `，${parsingCount} 个解析中` : ''}
+                  已处理 {processedCount}/{sources.length}；可分析 {parsedCount}
+                  {sources.length - parsingCount - parsedCount ? `，失败/忽略 ${sources.length - parsingCount - parsedCount}` : ''}
+                  {parsingCount ? `，解析中 ${parsingCount}` : ''}
               </span>
             </div>
             <div className="progress-track">
@@ -328,7 +405,7 @@ export default function ConversationPanel(): JSX.Element {
             </div>
             <div className="checkpoint-stats">
               <em>{parsedCount}/{sources.length} 可分析</em>
-              <em>{explainedCount}/{sources.length} 已标注完整</em>
+              <em>{confirmedAttributionCount}/{parsedCount} 归属已确认</em>
             </div>
           </div>
           <div className="checkpoint-branch">
@@ -339,25 +416,28 @@ export default function ConversationPanel(): JSX.Element {
             )}
           </div>
           <div className="checkpoint-table">
-            {sources.map((s) => (
-              <div className="checkpoint-row" key={s.id}>
-                <span title={s.name}>{s.name}</span>
-                <b>{s.attribution || '待确认'}</b>
-                <b>{s.platform || '未填平台'}</b>
-                <b>{s.purpose || '未填信息类型'}</b>
-                <em>
-                  {s.parsing
-                    ? '解析中'
-                    : s.error
-                      ? s.error.startsWith('已忽略')
-                        ? '已忽略'
-                        : '解析失败'
-                      : s.dataUrl || s.text
-                        ? '可分析'
-                        : '待处理'}
-                </em>
-              </div>
-            ))}
+            {sources.map((s) => {
+              const usable = Boolean(s.dataUrl || s.text)
+              return (
+                <div className="checkpoint-row" key={s.id}>
+                  <span title={s.name}>{s.name}</span>
+                  <b>{usable ? s.attribution || '待确认' : '无需确认'}</b>
+                  <b>{usable ? s.platform || '平台（选填）' : '—'}</b>
+                  <b>{usable ? s.purpose || '类型（选填）' : '—'}</b>
+                  <em>
+                    {s.parsing
+                      ? '解析中'
+                      : s.error
+                        ? s.error.startsWith('已忽略')
+                          ? '已忽略'
+                          : '解析失败'
+                        : usable
+                          ? '可分析'
+                          : '待处理'}
+                  </em>
+                </div>
+              )
+            })}
           </div>
           {parsingCount > 0 && <div className="checkpoint-warn">仍有文件在本地解析中，建议等解析完成后再继续。</div>}
         </div>
@@ -373,7 +453,15 @@ export default function ConversationPanel(): JSX.Element {
       )}
 
       {/* 对话流 */}
-      <div className="messages">
+      <div
+        className="messages"
+        ref={messagesRef}
+        onScroll={() => {
+          const element = messagesRef.current
+          if (!element) return
+          stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+        }}
+      >
         {messages.length === 0 && !isPrepareEmpty && (
           <div className="empty-hint">
             这里会显示 AI 分析过程、资料校验结果和等待你确认的关键结论。
@@ -398,8 +486,16 @@ export default function ConversationPanel(): JSX.Element {
         {isPrepareEmpty && <div className="composer-label">分析目标</div>}
         <div className="primary-actions">
           {phase === 'idle' && (
-            <button className="btn primary big" disabled={!hasUsable} onClick={() => void startGeneration()}>
-              开始生成报告
+            <button
+              className="btn primary big"
+              disabled={!hasUsable || parsingCount > 0 || unconfirmedCount > 0}
+              onClick={() => void startGeneration()}
+            >
+              {parsingCount > 0
+                ? `正在读取资料（还有 ${parsingCount} 份）`
+                : unconfirmedCount > 0
+                  ? `请先确认 ${unconfirmedCount} 份资料归属`
+                  : '开始生成报告'}
             </button>
           )}
           {phase === 'checkpoint1' && (
@@ -421,19 +517,22 @@ export default function ConversationPanel(): JSX.Element {
         <div className="composer-row">
           <textarea
             value={text}
+            disabled={sending}
             placeholder={placeholder}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
+                if (e.nativeEvent.isComposing || e.keyCode === 229) return
                 e.preventDefault()
                 void onSend()
               }
             }}
           />
-          <button className="btn" onClick={onSend}>
-            发送
+          <button className="btn" disabled={sending || !text.trim()} onClick={() => void onSend()}>
+            {sending ? '处理中…' : '发送'}
           </button>
         </div>
+        {sendError && <div className="src-err" role="alert">{sendError}</div>}
       </div>
     </div>
   )

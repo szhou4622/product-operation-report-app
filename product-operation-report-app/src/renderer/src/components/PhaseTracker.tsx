@@ -98,8 +98,8 @@ export default function PhaseTracker(): JSX.Element {
         <div className="analysis-flow">
           <div className="analysis-flow-head">
             <div>
-              <b>正式分析任务</b>
-              <span>{phase === 'analyzing' ? 'AI 正在逐项处理' : '确认资料后自动推进'}</span>
+              <b>9 项自动分析</b>
+              <span>{phase === 'analyzing' ? '系统正在逐项处理' : '确认资料后自动完成'}</span>
             </div>
             <em>
               {doneCount}/{analysisTasks.length}
@@ -117,7 +117,6 @@ export default function PhaseTracker(): JSX.Element {
                   <div className="analysis-task-main">
                     <div className="analysis-task-title">
                       <span>{task.title}</span>
-                      {task.confirm && <i>确认点</i>}
                     </div>
                     <div className="analysis-task-desc">{task.desc}</div>
                   </div>
@@ -158,7 +157,7 @@ export default function PhaseTracker(): JSX.Element {
           )}
         </div>
         <div className="macro-note">
-          关键节点会停下来等你确认；过程中可以随时补充要求，系统会带入后续分析。
+          只需确认两次：资料整理完成后一次、报告初稿完成后一次。过程中可随时补充要求。
         </div>
       </div>
     </div>

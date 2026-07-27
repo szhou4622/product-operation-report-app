@@ -1,6 +1,16 @@
 import { dialog } from 'electron'
-import { writeFile } from 'fs/promises'
+import { rename, rm, writeFile } from 'fs/promises'
 import type { ExportResult } from '../shared/types'
+
+async function writeExportAtomically(filePath: string, content: string | Uint8Array): Promise<void> {
+  const temp = `${filePath}.tmp-${process.pid}-${Date.now()}`
+  try {
+    await writeFile(temp, content)
+    await rename(temp, filePath)
+  } finally {
+    await rm(temp, { force: true }).catch(() => undefined)
+  }
+}
 
 export async function exportMarkdown(content: string, defaultName: string): Promise<ExportResult> {
   const { canceled, filePath } = await dialog.showSaveDialog({
@@ -10,7 +20,7 @@ export async function exportMarkdown(content: string, defaultName: string): Prom
   })
   if (canceled || !filePath) return { ok: false, canceled: true }
   try {
-    await writeFile(filePath, content, 'utf8')
+    await writeExportAtomically(filePath, Buffer.from(content, 'utf8'))
     return { ok: true, path: filePath }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -26,7 +36,7 @@ export async function exportDocx(content: string, defaultName: string): Promise<
   if (canceled || !filePath) return { ok: false, canceled: true }
   try {
     const buffer = await markdownToDocxBuffer(content)
-    await writeFile(filePath, buffer)
+    await writeExportAtomically(filePath, buffer)
     return { ok: true, path: filePath }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -42,7 +52,7 @@ export async function exportHtml(content: string, defaultName: string): Promise<
   if (canceled || !filePath) return { ok: false, canceled: true }
   try {
     const html = await markdownToHtmlDocument(content)
-    await writeFile(filePath, html, 'utf8')
+    await writeExportAtomically(filePath, Buffer.from(html, 'utf8'))
     return { ok: true, path: filePath }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
