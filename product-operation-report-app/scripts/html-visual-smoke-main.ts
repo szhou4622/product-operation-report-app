@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { app, BrowserWindow } from 'electron'
@@ -31,6 +31,7 @@ const viewports: Viewport[] = [
   { width: 1440, height: 1000 },
   { width: 2560, height: 1080 }
 ]
+let activeWindow: BrowserWindow | null = null
 
 const SAMPLE_REPORT = `# 示例产品 产品经营报告
 生成日期：2026-07-27
@@ -182,7 +183,7 @@ async function readPdfAudit(pdfPath: string): Promise<{
   }
 }
 
-async function run(): Promise<void> {
+async function runAudit(): Promise<void> {
   let markdown = SAMPLE_REPORT
   let projectName = '内置匿名样本'
   if (projectPath) {
@@ -214,10 +215,13 @@ async function run(): Promise<void> {
   const html = await markdownToHtmlDocument(markdown)
   const htmlPath = join(outputDir, 'report-preview.html')
   writeFileSync(htmlPath, html, 'utf8')
+  if (process.env.HTML_VISUAL_TEST_FORCE_FAILURE === '1') {
+    throw new Error('HTML visual cleanup failure-path probe')
+  }
 
   const errors: string[] = []
   const externalRequests: string[] = []
-  const window = new BrowserWindow({
+  const window = (activeWindow = new BrowserWindow({
     show: false,
     width: 1440,
     height: 1000,
@@ -227,7 +231,7 @@ async function run(): Promise<void> {
       nodeIntegration: false,
       sandbox: true
     }
-  })
+  }))
   window.webContents.on('console-message', (_event, level, message) => {
     if (level >= 2) errors.push(message)
   })
@@ -374,10 +378,10 @@ async function run(): Promise<void> {
     captures.push(file)
   }
   window.close()
+  activeWindow = null
 
   assert.deepEqual(errors, [], `HTML 控制台出现错误：${errors.join('；')}`)
   assert.deepEqual(externalRequests, [], `HTML 发起了外部请求：${externalRequests.join('；')}`)
-  if (!keepOutputs) rmSync(outputDir, { recursive: true, force: true })
   const result = JSON.stringify(
     {
       project: projectName,
@@ -403,6 +407,18 @@ async function run(): Promise<void> {
     2
   )
   process.stdout.write(`${result}\n`)
+}
+
+async function run(): Promise<void> {
+  try {
+    await runAudit()
+  } finally {
+    if (activeWindow && !activeWindow.isDestroyed()) activeWindow.close()
+    activeWindow = null
+    if (!keepOutputs && existsSync(outputDir)) {
+      rmSync(outputDir, { recursive: true, force: true })
+    }
+  }
 }
 
 app
