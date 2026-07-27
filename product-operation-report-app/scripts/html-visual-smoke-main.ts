@@ -358,7 +358,7 @@ async function runAudit(): Promise<void> {
     }))`
   )) as Array<{ section: string; top: number; height: number }>
   const sectionPositions: Record<string, number> = {}
-  for (const sectionNumber of ['3', '7', '10']) {
+  for (const sectionNumber of ['1', '3', '4', '7', '9', '10', '11']) {
     sectionPositions[sectionNumber] = await window.webContents.executeJavaScript(
       `(() => {
         const target = document.querySelector('[data-section="${sectionNumber}"]')
@@ -374,6 +374,35 @@ async function runAudit(): Promise<void> {
     await new Promise((resolveWait) => setTimeout(resolveWait, 80))
     const image = await window.webContents.capturePage()
     const file = join(outputDir, `report-1440-section-${sectionNumber}.png`)
+    writeFileSync(file, image.toPNG())
+    captures.push(file)
+  }
+  window.setContentSize(320, 760)
+  await new Promise((resolveWait) => setTimeout(resolveWait, 120))
+  const mobileSectionPositions: Record<string, number> = {}
+  for (const sectionNumber of ['3', '7', '9', '10']) {
+    mobileSectionPositions[sectionNumber] = await window.webContents.executeJavaScript(
+      `(() => {
+        const target = document.querySelector('[data-section="${sectionNumber}"]')
+        if (!target) return -1
+        const top = target.getBoundingClientRect().top + window.scrollY
+        const previous = document.documentElement.style.scrollBehavior
+        document.documentElement.style.scrollBehavior = 'auto'
+        window.scrollTo({ top, behavior: 'auto' })
+        document.documentElement.style.scrollBehavior = previous
+        return window.scrollY
+      })()`
+    )
+    await new Promise((resolveWait) => setTimeout(resolveWait, 80))
+    const mobileLayout = (await window.webContents.executeJavaScript(
+      `({ innerWidth: window.innerWidth, scrollWidth: document.documentElement.scrollWidth })`
+    )) as { innerWidth: number; scrollWidth: number }
+    assert.ok(
+      mobileLayout.scrollWidth <= mobileLayout.innerWidth + 1,
+      `320px 章节 ${sectionNumber} 出现横向滚动：内容 ${mobileLayout.scrollWidth}px，视口 ${mobileLayout.innerWidth}px。`
+    )
+    const image = await window.webContents.capturePage()
+    const file = join(outputDir, `report-320-section-${sectionNumber}.png`)
     writeFileSync(file, image.toPNG())
     captures.push(file)
   }
@@ -393,6 +422,7 @@ async function runAudit(): Promise<void> {
       viewportLayout,
       sectionLayout,
       sectionPositions,
+      mobileSectionPositions,
       keyboardAudit: {
         firstClass: keyboardAudit.firstClass,
         summaryFocused: keyboardAudit.summaryFocused,

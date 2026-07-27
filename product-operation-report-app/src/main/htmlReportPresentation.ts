@@ -58,6 +58,8 @@ export interface HtmlReportPercentItemPresentation {
 
 export interface HtmlReportPercentFacetPresentation {
   context: string
+  group: string
+  mode: 'stat' | 'bars'
   items: HtmlReportPercentItemPresentation[]
 }
 
@@ -104,7 +106,7 @@ const HAS_METRIC_PATTERN =
 const PLATFORM_TERM_PATTERN =
   /巨量云图|微信小店|示例平台|视频号|抖音|快手|小红书|淘宝|天猫|京东|拼多多|抖店|千川|云图/g
 const DISTRIBUTION_CONTEXT_PATTERN =
-  /成交人群|购买画像|性别|年龄|地域|地区|城市线级|人群构成|用户构成|内容构成|素材结构|来源构成|类目构成|占比分布|分布/
+  /成交人群|购买画像|人群|性别|年龄|地域|地区|城市线级|用户构成|内容构成|素材结构|来源构成|类目构成|占比分布|分布/
 
 function text(value: string): string {
   return value
@@ -177,7 +179,7 @@ function sourceRef(
   }
 }
 
-function buildPercentFacets(section: HtmlReportSection): HtmlReportPercentFacetPresentation[] {
+function buildStrictPercentFacets(section: HtmlReportSection): HtmlReportPercentFacetPresentation[] {
   return section.tables.flatMap((table, tableIndex) => {
     const platformIndex = findHeaderIndex(table, /平台|渠道|数据来源|来源/)
     if (
@@ -298,12 +300,103 @@ function buildPercentFacets(section: HtmlReportSection): HtmlReportPercentFacetP
             context: [table.context, platform, dimension, text(table.headers[valueIndex] || '')]
               .filter(Boolean)
               .join(' · '),
+            group: [table.context, platform].filter(Boolean).join(' · '),
+            mode: 'bars' as const,
             items: completeItems
           }
         })
-        .filter((facet): facet is HtmlReportPercentFacetPresentation => Boolean(facet))
+        .filter((facet): facet is NonNullable<typeof facet> => Boolean(facet))
     })
   })
+}
+
+const INLINE_DISTRIBUTION_DIMENSION_PATTERN =
+  /^(?:性别|年龄|婚育|人群标签|地域|地区|家庭结构|消费层级|城市线级)$/
+const INLINE_PERCENT_SEGMENT_PATTERN = /^(.+?)\s*(\d+(?:\.\d+)?)\s*%$/
+
+function parseInlinePercentItems(
+  rawValue: string
+): Array<{ label: string; value: number; display: string }> {
+  const normalized = text(rawValue)
+  if (!normalized || /约|近|超过|不足|以上占比|合计|大约/.test(normalized)) return []
+  const segments = normalized
+    .split(/[，,、；;]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+  if (segments.length === 0 || segments.length > 6) return []
+  const items = segments.map((segment) => {
+    const match = segment.match(INLINE_PERCENT_SEGMENT_PATTERN)
+    if (!match) return null
+    const value = Number(match[2])
+    const label = text(match[1])
+      .replace(/^(?:其中|约)\s*/, '')
+      .replace(/[：:]$/, '')
+      .trim()
+    if (
+      !label ||
+      !Number.isFinite(value) ||
+      value < 0 ||
+      value > 100 ||
+      /复购|转化|点击|客单|ROI|GMV|成交额|销售额|金额|订单/.test(label)
+    ) {
+      return null
+    }
+    return {
+      label: shorten(label, 30),
+      value,
+      display: `${match[2]}%`
+    }
+  })
+  if (items.some((item) => item === null)) return []
+  const completeItems = items.filter(
+    (item): item is { label: string; value: number; display: string } => Boolean(item)
+  )
+  if (new Set(completeItems.map((item) => item.label)).size !== completeItems.length) return []
+  return completeItems
+}
+
+function buildInlinePercentFacets(
+  section: HtmlReportSection
+): HtmlReportPercentFacetPresentation[] {
+  return section.tables.flatMap((table, tableIndex) => {
+    if (
+      platformTerms(table.context).length !== 1 ||
+      !DISTRIBUTION_CONTEXT_PATTERN.test(text(table.context))
+    ) {
+      return []
+    }
+    const dimensionIndex = table.headers.findIndex((header) =>
+      /^(?:维度|画像维度|人群维度)$/.test(text(header))
+    )
+    const valueIndex = table.headers.findIndex(
+      (header) => /关键数据|占比数据|人群数据/.test(text(header)) && !/经营含义/.test(text(header))
+    )
+    const categoryIndex = table.headers.findIndex((header) =>
+      /类别|选项|区间|细分/.test(text(header))
+    )
+    if (dimensionIndex < 0 || valueIndex < 0 || categoryIndex >= 0) return []
+    return table.rows.flatMap((row, rowIndex) => {
+      const dimension = text(row[dimensionIndex] || '')
+      if (!INLINE_DISTRIBUTION_DIMENSION_PATTERN.test(dimension)) return []
+      const parsedItems = parseInlinePercentItems(row[valueIndex] || '')
+      if (parsedItems.length === 0) return []
+      return [
+        {
+          context: dimension,
+          group: table.context || `第 ${section.number} 章`,
+          mode: parsedItems.length === 1 ? ('stat' as const) : ('bars' as const),
+          items: parsedItems.map((item) => ({
+            ...item,
+            source: sourceRef(section, tableIndex, rowIndex, valueIndex)
+          }))
+        }
+      ]
+    })
+  })
+}
+
+function buildPercentFacets(section: HtmlReportSection): HtmlReportPercentFacetPresentation[] {
+  return [...buildStrictPercentFacets(section), ...buildInlinePercentFacets(section)]
 }
 
 function buildContentMix(section: HtmlReportSection): HtmlReportContentMixPresentation | null {
@@ -389,7 +482,7 @@ function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVis
         (table) =>
           tableMatches(table, [/竞品开头/, /打法本质/]) ||
           tableMatches(table, [/类型/, /原始\s*3\s*秒开头/, /可复用方向/])
-      ).slice(0, 1)
+      ).slice(0, 2)
     }
     case 'selling-point-matrix':
       return matches((table) => tableMatches(table, [/卖点维度/, /我方产品卖点/])).slice(0, 1)

@@ -377,6 +377,15 @@ function plannedTable(
   return tableIndex === undefined ? undefined : section.tables[tableIndex]
 }
 
+function plannedTables(
+  section: HtmlReportSection,
+  plan: HtmlReportSectionPresentation
+): HtmlReportTable[] {
+  return plan.visualSourceTableIndexes
+    .map((tableIndex) => section.tables[tableIndex])
+    .filter((table): table is HtmlReportTable => Boolean(table))
+}
+
 function renderFigure(title: string, content: string, className = ''): string {
   const signature = `${title}|${className}`
   let hash = 0
@@ -418,18 +427,32 @@ function renderSourceVisual(
 ): string {
   const table = plannedTable(section, plan)
   if (!table || table.rows.length === 0) return ''
+  const typeIndex = Math.max(0, table.headers.findIndex((header) => header.includes('数据类型')))
+  const sourceIndex = Math.max(0, table.headers.findIndex((header) => header.includes('来源')))
+  const purposeIndex = Math.max(0, table.headers.findIndex((header) => header.includes('用途')))
   return renderFigure(
-    '证据来源地图',
-    `<div class="source-map">${table.rows
+    '证据如何进入经营判断',
+    `<div class="source-stream">${table.rows
       .slice(0, 8)
       .map(
-        (row) => `<div class="source-item">
-          <strong>${escapeHtml(shorten(row[0] || '数据来源', 36))}</strong>
-          <span>${escapeHtml(shorten(row[1] || '来源待补充', 44))}</span>
-          <p>${escapeHtml(shorten(row[2] || '', 76))}</p>
+        (row, index) => `<div class="source-flow">
+          <span class="source-flow__index">${String(index + 1).padStart(2, '0')}</span>
+          <div class="source-flow__type">
+            <small>证据类型</small>
+            <strong>${escapeHtml(shorten(row[typeIndex] || '数据来源', 32))}</strong>
+          </div>
+          <div class="source-flow__file">
+            <small>原始来源</small>
+            <span>${escapeHtml(shorten(row[sourceIndex] || '来源待补充', 46))}</span>
+          </div>
+          <div class="source-flow__purpose">
+            <small>用于判断</small>
+            <p>${escapeHtml(shorten(row[purposeIndex] || '', 74))}</p>
+          </div>
         </div>`
       )
-      .join('')}</div>`,
+      .join('')}</div>
+      <p class="visual-note">每条路径都从原始资料指向本报告中的具体用途；完整文件名和说明保留在下方原表。</p>`,
     'source-visual'
   )
 }
@@ -459,27 +482,64 @@ function renderPercentBars(
   plan: HtmlReportSectionPresentation,
   title = '一方数据分口径对比'
 ): string {
-  const groups = plan.percentFacets
-  if (groups.length === 0) return ''
+  const facets = plan.percentFacets
+  if (facets.length === 0) return ''
+  const grouped = Array.from(
+    facets.reduce((map, facet) => {
+      const key = facet.group || '同口径数据'
+      const current = map.get(key) || []
+      current.push(facet)
+      map.set(key, current)
+      return map
+    }, new Map<string, typeof facets>())
+  )
   return renderFigure(
     title,
-    `<div class="facet-grid">${groups
-      .slice(0, 4)
-      .map(
-        (group) => `<section class="bar-facet">
-          <h3>${escapeHtml(shorten(group.context || '同口径数据', 48))}</h3>
-          ${group.items
+    `<div class="profile-board">${grouped
+      .map(([groupName, groupFacets], groupIndex) => {
+        const statFacets = groupFacets.filter((facet) => facet.mode === 'stat')
+        const barFacets = groupFacets.filter((facet) => facet.mode === 'bars')
+        return `<section class="profile-panel">
+          <header class="profile-panel__head">
+            <span>${String(groupIndex + 1).padStart(2, '0')}</span>
+            <h3>${escapeHtml(shorten(groupName, 52))}</h3>
+          </header>
+          ${
+            statFacets.length
+              ? `<div class="profile-kpis">${statFacets
+                  .flatMap((facet) =>
+                    facet.items.map(
+                      (item) => `<div class="profile-kpi" role="img" aria-label="${escapeHtml(
+                        `${facet.context} ${item.label} ${item.display}`
+                      )}">
+                        <span>${escapeHtml(facet.context)}</span>
+                        <strong>${escapeHtml(item.display)}</strong>
+                        <small>${escapeHtml(item.label)}</small>
+                      </div>`
+                    )
+                  )
+                  .join('')}</div>`
+              : ''
+          }
+          <div class="profile-facets">${barFacets
             .map(
-              (item) => `<div class="bar-row" role="img" aria-label="${escapeHtml(`${item.label} ${item.display}`)}">
-                <div class="bar-label"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.display)}</strong></div>
-                <div class="bar-track" aria-hidden="true"><span style="--bar-size:${item.value}%"></span></div>
-              </div>`
+              (facet) => `<section class="bar-facet">
+                <h4>${escapeHtml(shorten(facet.context || '同口径数据', 42))}</h4>
+                ${facet.items
+                  .map(
+                    (item) => `<div class="bar-row" role="img" aria-label="${escapeHtml(`${item.label} ${item.display}`)}">
+                      <div class="bar-label"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.display)}</strong></div>
+                      <div class="bar-track" aria-hidden="true"><span style="--bar-size:${item.value}%"></span></div>
+                    </div>`
+                  )
+                  .join('')}
+              </section>`
             )
-            .join('')}
+            .join('')}</div>
         </section>`
-      )
+      })
       .join('')}</div>
-      <p class="visual-note">每个小图只比较同一数据表中的百分比，不合并不同平台口径。</p>`,
+      <p class="visual-note">单项占比用数字卡呈现；同一维度的多个百分比才使用同尺度条形图。不同平台不合并、不排名。</p>`,
     'bars-visual'
   )
 }
@@ -490,20 +550,37 @@ function renderMaterialVisual(
 ): string {
   const percentVisual = renderPercentBars(plan, '素材结构比例')
   if (percentVisual) return percentVisual
-  const table = plannedTable(section, plan)
-  if (!table) return ''
+  const tables = plannedTables(section, plan)
+  if (tables.length === 0) return ''
   return renderFigure(
-    '素材打法提炼',
-    `<div class="method-grid">${table.rows
-      .slice(0, 6)
+    '素材打法迁移链',
+    `<div class="method-playbooks">${tables
       .map(
-        (row, index) => `<div class="method-item">
-          <span>${String(index + 1).padStart(2, '0')}</span>
-          <strong>${escapeHtml(shorten(row[0] || '素材方向', 42))}</strong>
-          <p>${escapeHtml(shorten(row.slice(1).filter(Boolean).join('：'), 100))}</p>
-        </div>`
+        (table, tableIndex) => `<section class="method-playbook">
+          <header><span>${tableIndex === 0 ? '自有素材' : '竞品借鉴'}</span><strong>${escapeHtml(
+            shorten(table.context || table.headers.join(' → '), 58)
+          )}</strong></header>
+          <div class="method-flow-list">${table.rows
+            .slice(0, 6)
+            .map(
+              (row, index) => `<div class="method-flow-row">
+                <span class="method-flow-row__index">${String(index + 1).padStart(2, '0')}</span>
+                <div><small>${escapeHtml(shorten(table.headers[0] || '起点', 16))}</small><strong>${escapeHtml(
+                  shorten(row[0] || '素材方向', 52)
+                )}</strong></div>
+                <div><small>${escapeHtml(shorten(table.headers[1] || '方法', 16))}</small><p>${escapeHtml(
+                  shorten(row[1] || '', 86)
+                )}</p></div>
+                <div><small>${escapeHtml(shorten(table.headers[2] || '迁移', 16))}</small><p>${escapeHtml(
+                  shorten(row[2] || '', 92)
+                )}</p></div>
+              </div>`
+            )
+            .join('')}</div>
+        </section>`
       )
-      .join('')}</div>`,
+      .join('')}</div>
+      <p class="visual-note">阅读顺序固定为“原始钩子或观察 → 打法本质 → 我方可执行方向”，不把竞品事实直接写成我方事实。</p>`,
     'methods-visual'
   )
 }
@@ -563,19 +640,30 @@ function renderAudienceVisual(
   const audienceIndex = Math.max(0, table.headers.findIndex((header) => header.includes('成交人群')))
   const sellingIndex = Math.max(0, table.headers.findIndex((header) => header.includes('核心卖点')))
   const sceneIndex = Math.max(0, table.headers.findIndex((header) => header.includes('核心场景')))
+  const evidenceIndex = table.headers.findIndex((header) => /数据依据|特征/.test(header))
   return renderFigure(
-    '人群、场景与卖点匹配',
-    `<div class="audience-grid">${table.rows
+    '人群、场景与卖点匹配路径',
+    `<div class="audience-routes">${table.rows
       .slice(0, 5)
       .map(
-        (row, index) => `<div class="audience-item">
-          <span class="audience-order">${String(index + 1).padStart(2, '0')}</span>
-          <strong>${escapeHtml(shorten(row[audienceIndex] || '', 58))}</strong>
-          <dl>
-            <div><dt>场景</dt><dd>${escapeHtml(shorten(row[sceneIndex] || '需补充', 60))}</dd></div>
-            <div><dt>卖点</dt><dd>${escapeHtml(shorten(row[sellingIndex] || '需补充', 60))}</dd></div>
-          </dl>
-        </div>`
+        (row, index) => `<article class="audience-route">
+          <header>
+            <span class="audience-order">${String(index + 1).padStart(2, '0')}</span>
+            <strong>${escapeHtml(shorten(row[audienceIndex] || '', 68))}</strong>
+          </header>
+          <div class="audience-route__path">
+            <div><small>发生在</small><p>${escapeHtml(shorten(row[sceneIndex] || '需补充', 72))}</p></div>
+            <span class="route-arrow" aria-hidden="true">→</span>
+            <div><small>重点讲</small><p>${escapeHtml(shorten(row[sellingIndex] || '需补充', 72))}</p></div>
+          </div>
+          ${
+            evidenceIndex >= 0
+              ? `<p class="audience-evidence"><span>依据</span>${escapeHtml(
+                  shorten(row[evidenceIndex] || '需补充', 110)
+                )}</p>`
+              : ''
+          }
+        </article>`
       )
       .join('')}</div>`,
     'audience-visual'
@@ -671,12 +759,38 @@ function renderExecutionVisual(
       return value === label || value === `${label}视角`
     }).length
   }))
+  const matrix = classes.map((classItem) => ({
+    label: classItem.label,
+    cells: perspectives.map((perspective) => {
+      const perspectiveLabel = perspective.label.replace(/视角$/, '')
+      return uniqueRows.filter((row) => {
+        const rowClass = readClass(row[classIndex] || '')
+        const rowPerspective = plainText(row[perspectiveIndex] || '').replace(/\s+/g, '').replace(/视角$/, '')
+        return rowClass === classItem.label && rowPerspective === perspectiveLabel
+      }).length
+    })
+  }))
+  const matrixMax = Math.max(...matrix.flatMap((row) => row.cells), 1)
   return renderFigure(
     '第一轮脚本组合',
     `<div class="count-grid">${renderCountBars(classes, '视频分类')}${renderCountBars(
       perspectives,
       '内容视角'
     )}</div>
+    <div class="execution-matrix" role="img" aria-label="视频分类与内容视角交叉分布">
+      <div class="execution-matrix__corner">分类 × 视角</div>
+      ${perspectives.map((item) => `<div class="execution-matrix__head">${escapeHtml(item.label)}</div>`).join('')}
+      ${matrix
+        .map(
+          (row) => `<div class="execution-matrix__rowhead">${escapeHtml(row.label)}</div>${row.cells
+            .map(
+              (value) =>
+                `<div class="execution-matrix__cell" style="--heat:${value / matrixMax}"><strong>${value}</strong><span>条</span></div>`
+            )
+            .join('')}`
+        )
+        .join('')}
+    </div>
     <p class="visual-note">数量来自第一轮建议选题表，共 ${uniqueRows.length} 条有效且编号唯一的脚本。</p>`,
     'execution-visual'
   )
@@ -721,7 +835,14 @@ function renderActionVisual(section: HtmlReportSection): string {
   }
   return renderFigure(
     '优先行动路线',
-    `<div class="action-roadmap">${groups
+    `<div class="action-phase-track">${groups
+      .map(
+        (group, index) => `<div><span>${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(
+          group.title
+        )}</strong><small>${group.items.length} 项</small></div>`
+      )
+      .join('')}</div>
+    <div class="action-roadmap">${groups
       .map(
         (group) => `<section>
           <h3>${escapeHtml(group.title)}</h3>
@@ -743,12 +864,34 @@ function renderActionVisual(section: HtmlReportSection): string {
 
 function renderLimitationsVisual(section: HtmlReportSection): string {
   if (section.listItems.length === 0) return ''
+  const classify = (item: string): 'evidence' | 'expression' | 'scope' => {
+    if (/补充|证明|报告|截图|检测|授权|资质|确认/.test(item)) return 'evidence'
+    if (/不得|不能|不要|避免|功效|宣称|夸大|表达/.test(item)) return 'expression'
+    return 'scope'
+  }
+  const groups = [
+    { key: 'evidence' as const, title: '证据待补', mark: 'E' },
+    { key: 'expression' as const, title: '表达边界', mark: 'R' },
+    { key: 'scope' as const, title: '数据范围', mark: 'S' }
+  ]
+    .map((group) => ({
+      ...group,
+      items: section.listItems.filter((item) => classify(item) === group.key)
+    }))
+    .filter((group) => group.items.length > 0)
   return renderFigure(
-    '使用前请核对',
-    `<ul class="limitation-list">${section.listItems
-      .slice(0, 8)
-      .map((item) => `<li>${escapeHtml(shorten(item, 130))}</li>`)
-      .join('')}</ul>`,
+    '发布前风险护栏',
+    `<div class="guardrail-grid">${groups
+      .map(
+        (group) => `<section class="guardrail-group">
+          <header><span>${group.mark}</span><strong>${escapeHtml(group.title)}</strong><small>${group.items.length} 项</small></header>
+          <ul>${group.items
+            .slice(0, 5)
+            .map((item) => `<li>${escapeHtml(shorten(item, 130))}</li>`)
+            .join('')}</ul>
+        </section>`
+      )
+      .join('')}</div>`,
     'limitations-visual'
   )
 }

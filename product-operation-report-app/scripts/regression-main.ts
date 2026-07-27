@@ -1145,10 +1145,13 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(html, /data-source-value=/)
   assert.match(html, /data-source-cell-count=/)
   assert.match(html, /一方数据分口径对比/)
+  assert.match(html, /证据如何进入经营判断/)
   assert.match(html, /用户决策顺序/)
   assert.match(html, /人群、场景与卖点匹配/)
   assert.match(html, /建议内容结构/)
   assert.match(html, /第一轮脚本组合/)
+  assert.match(html, /class="execution-matrix"/)
+  assert.match(html, /发布前风险护栏/)
   assert.match(html, /data-label="脚本编号"/)
   assert.match(html, /scope="col"/)
   assert.match(html, /@media \(max-width: 414px\)/)
@@ -1247,6 +1250,14 @@ async function testHtmlReportRenderer(): Promise<void> {
   )
   assert.equal(genericMaterialList.includes('素材打法提炼'), false)
 
+  const dualMaterialPlaybook = await markdownToHtmlDocument(
+    '# 双来源素材测试\n\n## 4. 竞品与素材打法判断\n### 4.1 自有素材\n| 类型 | 原始 3 秒开头 | 可复用方向 |\n|---|---|---|\n| 场景钩子 | 今晚不知道吃什么 | 下饭菜场景 |\n\n### 4.2 竞品素材\n| 竞品开头 | 打法本质 | 我方可迁移方向 |\n|---|---|---|\n| 会吃的人跟时令走 | 生活方式起势 | 家庭餐桌表达 |'
+  )
+  assert.match(dualMaterialPlaybook, /素材打法迁移链/)
+  assert.match(dualMaterialPlaybook, /data-source-tables="0,1"/)
+  assert.match(dualMaterialPlaybook, /自有素材/)
+  assert.match(dualMaterialPlaybook, /竞品借鉴/)
+
   const invalidEntity = await markdownToHtmlDocument(
     '# 极端实体 &#9999999999;\n\n## 0. 结论先行\n仍可正常导出。'
   )
@@ -1279,6 +1290,34 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(groupedDimensions, /视频号成交人群 · 视频号 · 年龄 · 关键数据/)
   assert.match(groupedDimensions, />女性<\/span><strong>60%<\/strong>/)
   assert.match(groupedDimensions, />31-40岁<\/span><strong>45%<\/strong>/)
+
+  const inlineProfileMarkdown =
+    '# 复合人群数据测试\n\n## 3. 一方数据核心判断\n### 3.1 抖店成交人群\n| 维度 | 关键数据 | 经营含义 |\n|---|---|---|\n| 性别 | 女性占比 78.14% | 女性决策者为主 |\n| 年龄 | 31-35岁 30.11%，36-40岁 17.02%，41-45岁 9.88% | 主力年龄 |\n| 婚育 | 已育 72.96% | 家庭场景 |\n| 人群标签 | 精致妈妈 24.95%、资深中产 23.07% | 重点标签 |\n| 地域 | 江苏 19.09%，浙江 9.68%，上海 5.87% | 华东突出 |'
+  const inlineProfileModel = parseHtmlReportModel(inlineProfileMarkdown)
+  const inlineProfilePlan = buildHtmlReportPresentation(inlineProfileModel).sections.find(
+    (section) => section.sectionNumber === '3'
+  )
+  assert.equal(inlineProfilePlan?.percentFacets.length, 5)
+  assert.equal(inlineProfilePlan?.percentFacets.filter((facet) => facet.mode === 'stat').length, 2)
+  assert.equal(inlineProfilePlan?.percentFacets.filter((facet) => facet.mode === 'bars').length, 3)
+  assert.deepEqual(inlineProfilePlan?.visualSourceTableIndexes, [0])
+  const inlineProfileSection = inlineProfileModel.sections.find((section) => section.number === '3')
+  for (const source of inlineProfilePlan?.visualSources || []) {
+    assert.equal(
+      inlineProfileSection?.tables[source.tableIndex!]?.rows[source.rowIndex!]?.[source.columnIndex!],
+      source.rawValue
+    )
+  }
+  const inlineProfileHtml = await markdownToHtmlDocument(inlineProfileMarkdown)
+  assert.match(inlineProfileHtml, /class="profile-board"/)
+  assert.match(inlineProfileHtml, /class="profile-kpi"/)
+  assert.match(inlineProfileHtml, />31-35岁<\/span><strong>30\.11%<\/strong>/)
+  assert.match(inlineProfileHtml, /单项占比用数字卡呈现/)
+
+  const unsafeInlineProfile = await markdownToHtmlDocument(
+    '# 不确定复合数据测试\n\n## 3. 一方数据核心判断\n### 3.1 抖店成交人群\n| 维度 | 关键数据 |\n|---|---|\n| 年龄 | 31-35岁约30.11%，36-40岁17.02% |\n| 地域 | 江苏 119%，浙江 9.68% |'
+  )
+  assert.equal(unsafeInlineProfile.includes('一方数据分口径对比'), false)
 
   const emptyCategories = await markdownToHtmlDocument(
     '# 空类别测试\n\n## 3. 一方数据核心判断\n### 视频号成交人群\n| 平台 | 维度 | 类别 | 关键数据 |\n|---|---|---|---|\n| 视频号 | 性别 |  | 60% |\n| 视频号 | 性别 |  | 40% |'
