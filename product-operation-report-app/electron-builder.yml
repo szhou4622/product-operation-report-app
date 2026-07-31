@@ -12,7 +12,7 @@ asarUnpack:
 afterPack: build/afterPack.cjs
 mac:
   icon: build/icon.png
-  artifactName: ${productName}-macOS-${version}-${arch}.${ext}
+  artifactName: Product-Operation-Report-macOS-${version}-${arch}.${ext}
   target:
     - dmg
   category: public.app-category.productivity
@@ -22,7 +22,7 @@ win:
   target:
     - nsis
 nsis:
-  artifactName: ${productName}-Windows-${version}-${arch}-Setup.${ext}
+  artifactName: Product-Operation-Report-Windows-${version}-${arch}-Setup.${ext}
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
   oneClick: false
