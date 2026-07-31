@@ -50,12 +50,15 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: product-operation-report-app/package-lock.json
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Audit packaged dependencies
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Type check
         run: npm run typecheck
@@ -66,6 +69,31 @@ jobs:
       - name: Verify packaged Windows runtime
         if: matrix.os == 'windows-latest'
         run: npm run test:packaged-utility
+
+      - name: Verify packaged macOS app
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
+          if [[ -z "${app_path}" ]]; then
+            echo "No packaged .app bundle found" >&2
+            exit 1
+          fi
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Contents/Info.plist")"
+          executable_path="${app_path}/Contents/MacOS/${executable_name}"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          signature_details="$(codesign -dvvv "${app_path}" 2>&1)"
+          printf '%s\n' "${signature_details}"
+          grep -q 'Signature=adhoc' <<<"${signature_details}"
+          binary_details="$(file "${executable_path}")"
+          printf '%s\n' "${binary_details}"
+          if [[ "${{ matrix.arch }}" == "x64" ]]; then
+            expected_arch="x86_64"
+          else
+            expected_arch="arm64"
+          fi
+          grep -q "${expected_arch}" <<<"${binary_details}"
 
       - name: Upload installer
         uses: actions/upload-artifact@v6

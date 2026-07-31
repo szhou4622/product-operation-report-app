@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "产品经营报告 桌面 App — 按 SOP 把一方/竞品/素材数据生成产品经营报告",
   "main": "./out/main/index.js",
   "author": "",
@@ -32,19 +32,20 @@
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.20.1",
     "@types/papaparse": "^5.3.14",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^31.7.7",
-    "electron-builder": "^24.13.3",
-    "electron-vite": "^2.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "iconv-lite": "^0.7.3",
     "rcedit": "^5.0.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "typescript": "^5.5.3",
-    "vite": "^5.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
     "zustand": "^4.5.4"
   }
 }
