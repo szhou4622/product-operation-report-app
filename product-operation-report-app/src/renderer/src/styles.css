@@ -3553,3 +3553,82 @@ body.resizing .pane-resizer {
     transition-duration: 0ms;
   }
 }
+
+/* ---------- 顶栏自适应：新建分析后出现“恢复上一份”时仍保持三组互不遮挡 ---------- */
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 16px;
+}
+
+.topbar .brand {
+  min-width: 0;
+  justify-self: start;
+}
+
+.topbar .right {
+  min-width: 0;
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.tutorial-link {
+  position: static;
+  inset: auto;
+  justify-self: center;
+  width: 240px;
+  transform: none;
+}
+
+.tutorial-link:hover,
+.tutorial-link:active {
+  transform: translateY(-1px);
+}
+
+.tutorial-link:active {
+  transform: translateY(0);
+}
+
+.topbar .model-pill {
+  display: none;
+}
+
+@media (min-width: 96rem) {
+  .topbar .model-pill {
+    display: inline-flex;
+    align-items: center;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 70rem) {
+  .topbar {
+    padding-inline: 16px;
+    gap: 12px;
+  }
+
+  .topbar .brand {
+    min-width: 0;
+  }
+
+  .topbar .brand .sub {
+    display: none;
+  }
+
+  .tutorial-link {
+    width: 200px;
+  }
+}
+
+@media (max-width: 60rem) {
+  .app-version {
+    display: none;
+  }
+
+  .topbar .right {
+    gap: 8px;
+  }
+}

@@ -18,9 +18,20 @@ npm run dev        # 启动开发模式（electron-vite）
 npm run typecheck  # 类型检查
 npm run test:regression # 核心异常回归检查
 npm run build      # 构建
-npm run dist:mac   # 打包 macOS dmg
+npm run dist:mac:arm64 # 打包 macOS Apple 芯片 dmg
+npm run dist:mac:x64   # 打包 macOS Intel 芯片 dmg
 npm run dist:win   # 打包 Windows nsis
 ```
+
+## GitHub 自动打包
+
+推送 `v*` 标签后，GitHub Actions 会分别生成：
+
+- Windows x64 安装程序；
+- macOS Apple 芯片 arm64 安装包；
+- macOS Intel 芯片 x64 安装包。
+
+三种安装包会自动上传到对应版本的 GitHub Release；手动运行工作流时也会保留为 Actions 构建产物。
 
 ## 当前能力
 

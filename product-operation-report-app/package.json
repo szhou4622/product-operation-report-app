@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "产品经营报告 桌面 App — 按 SOP 把一方/竞品/素材数据生成产品经营报告",
   "main": "./out/main/index.js",
   "author": "",
@@ -16,6 +16,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "start": "electron-vite preview",
     "dist:mac": "electron-vite build && electron-builder --mac",
+    "dist:mac:arm64": "electron-vite build && electron-builder --mac --arm64",
+    "dist:mac:x64": "electron-vite build && electron-builder --mac --x64",
     "dist:win": "electron-vite build && electron-builder --win --config.electronDist=node_modules/electron/dist"
   },
   "dependencies": {

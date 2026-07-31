@@ -1,0 +1,100 @@
+name: Build desktop installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: product-operation-report-app
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            script: dist:win
+            arch: x64
+            artifact: product-operation-report-windows-x64
+            path: product-operation-report-app/dist/*.exe
+          - name: macOS Apple Silicon
+            os: macos-15
+            script: dist:mac
+            arch: arm64
+            artifact: product-operation-report-macos-arm64
+            path: product-operation-report-app/dist/*.dmg
+          - name: macOS Intel
+            os: macos-15-intel
+            script: dist:mac
+            arch: x64
+            artifact: product-operation-report-macos-x64
+            path: product-operation-report-app/dist/*.dmg
+
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: product-operation-report-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Build installer
+        run: npm run ${{ matrix.script }} -- --${{ matrix.arch }}
+
+      - name: Verify packaged Windows runtime
+        if: matrix.os == 'windows-latest'
+        run: npm run test:packaged-utility
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${GITHUB_REF_NAME}"
+          release-assets/*
+          --repo "${GITHUB_REPOSITORY}"
+          --title "产品经营报告 ${GITHUB_REF_NAME}"
+          --generate-notes

@@ -6,7 +6,8 @@ import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
 
-const SOP_GUIDE_URL = 'https://my.feishu.cn/docx/FU5FdRkHFoNH7JxUp6wciLksnEe'
+const SOP_GUIDE_URL =
+  'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
 
 function friendlyUiError(value: unknown, fallback: string): string {
   const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
@@ -442,7 +443,7 @@ export default function App(): JSX.Element {
           href={SOP_GUIDE_URL}
           target="_blank"
           rel="noreferrer"
-          aria-label="打开使用教程 SOP 文档"
+          aria-label="打开使用教程"
           onClick={(event) => {
             event.preventDefault()
             openExternalLink(SOP_GUIDE_URL)
@@ -457,7 +458,7 @@ export default function App(): JSX.Element {
           </span>
           <span className="tutorial-copy">
             <span className="tutorial-title">使用教程</span>
-            <span className="tutorial-subtitle">SOP 文档</span>
+            <span className="tutorial-subtitle">新手操作指南</span>
           </span>
           <span className="tutorial-external" aria-hidden="true">
             <svg viewBox="0 0 16 16" focusable="false">

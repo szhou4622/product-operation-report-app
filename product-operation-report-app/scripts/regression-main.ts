@@ -1,8 +1,8 @@
 import { strict as assert } from 'node:assert'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { app } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import JSZip from 'jszip'
 import Papa from 'papaparse'
 import iconv from 'iconv-lite'
@@ -32,6 +32,7 @@ import type { ChatStreamEvent, ModelProfile } from '../src/shared/types'
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
 app.setPath('userData', tempUserData)
+let topbarAuditWindow: BrowserWindow | null = null
 
 function snapshot(revision: number, reportMarkdown: string): SavedProject {
   return {
@@ -956,6 +957,129 @@ function testExportButtonContract(): void {
   assert.equal(component.includes('其他格式'), false)
 }
 
+async function testWorkbenchTopbarContract(): Promise<void> {
+  const appComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'),
+    'utf8'
+  )
+  const expectedGuideUrl =
+    'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
+  assert.ok(appComponent.includes(expectedGuideUrl))
+  assert.equal(appComponent.includes('FU5FdRkHFoNH7JxUp6wciLksnEe'), false)
+
+  const styles = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
+    'utf8'
+  ).replace(/<\/style/gi, '<\\/style')
+  const htmlPath = join(tempUserData, 'topbar-layout.html')
+  writeFileSync(
+    htmlPath,
+    `<!doctype html><html><head><meta charset="UTF-8"><style>${styles}</style></head><body>
+      <div class="app">
+        <div class="topbar">
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <span class="brand-copy">
+              <span class="brand-main">产品经营报告</span>
+              <span class="sub">专业的产品经营分析与报告系统</span>
+            </span>
+          </div>
+          <a class="tutorial-link" href="${expectedGuideUrl}">
+            <span class="tutorial-icon"></span>
+            <span class="tutorial-copy">
+              <span class="tutorial-title">使用教程</span>
+              <span class="tutorial-subtitle">新手操作指南</span>
+            </span>
+            <span class="tutorial-external"></span>
+          </a>
+          <div class="right">
+            <span class="model-pill">模型：ai英雄会（gpt-5.5）</span>
+            <button class="btn new-analysis-button"><span class="new-analysis-icon">＋</span><span>新建分析</span></button>
+            <button class="btn restore-analysis-button">恢复上一份</button>
+            <span class="app-version">v0.2.3</span>
+            <button class="btn">设置</button>
+          </div>
+        </div>
+      </div>
+    </body></html>`,
+    'utf8'
+  )
+
+  const window = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 180,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      partition: 'topbar-layout-audit'
+    }
+  })
+  topbarAuditWindow = window
+  try {
+    await window.loadFile(htmlPath)
+    for (const width of [880, 960, 1005, 1120, 1280, 1536, 1600]) {
+      window.setContentSize(width, 180)
+      let layout: {
+        innerWidth: number
+        scrollWidth: number
+        brand: { left: number; right: number; width: number } | null
+        tutorial: { left: number; right: number; width: number } | null
+        actions: { left: number; right: number; width: number } | null
+        modelDisplay: string
+      }
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50))
+        layout = (await window.webContents.executeJavaScript(
+          `(() => {
+            const rect = (selector) => {
+              const element = document.querySelector(selector)
+              if (!(element instanceof HTMLElement)) return null
+              const box = element.getBoundingClientRect()
+              return { left: box.left, right: box.right, width: box.width }
+            }
+            const model = document.querySelector('.model-pill')
+            return {
+              innerWidth: window.innerWidth,
+              scrollWidth: document.documentElement.scrollWidth,
+              brand: rect('.brand'),
+              tutorial: rect('.tutorial-link'),
+              actions: rect('.topbar .right'),
+              modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
+            }
+          })()`
+        )) as typeof layout
+        if (layout.innerWidth === width) break
+      }
+      layout ??= {
+        innerWidth: -1,
+        scrollWidth: -1,
+        brand: null,
+        tutorial: null,
+        actions: null,
+        modelDisplay: ''
+      }
+      assert.equal(layout.innerWidth, width)
+      assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
+      assert.ok(layout.brand && layout.tutorial && layout.actions)
+      assert.ok(
+        layout.brand!.right + 8 <= layout.tutorial!.left,
+        `${width}px 品牌区与教程入口重叠`
+      )
+      assert.ok(
+        layout.tutorial!.right + 8 <= layout.actions!.left,
+        `${width}px 教程入口与操作区重叠`
+      )
+      assert.equal(layout.modelDisplay !== 'none', width >= 1536)
+    }
+  } catch (error) {
+    if (!window.isDestroyed()) window.destroy()
+    topbarAuditWindow = null
+    throw error
+  }
+}
+
 const HTML_REPORT_FIXTURE = `# 盐中甜酸菜 产品经营报告
 生成日期：2026-07-27
 <!-- Product visual brief
@@ -1541,19 +1665,46 @@ async function run(): Promise<void> {
   await testBulkAttributionAndExportOpen()
   console.log('Regression: original export button contract')
   testExportButtonContract()
+  console.log('Regression: adaptive workbench topbar')
+  await testWorkbenchTopbarContract()
   console.log('Regression: adaptive HTML report renderer')
   await testHtmlReportRenderer()
   console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
 }
 
 void app.whenReady().then(async () => {
+  let exitCode = 0
   try {
     await run()
-    app.exit(0)
   } catch (error) {
     console.error(error)
-    app.exit(1)
+    exitCode = 1
   } finally {
-    rmSync(tempUserData, { recursive: true, force: true })
+    if (topbarAuditWindow && !topbarAuditWindow.isDestroyed()) {
+      topbarAuditWindow.destroy()
+    }
+    topbarAuditWindow = null
+    for (let attempt = 0; attempt < 12 && existsSync(tempUserData); attempt++) {
+      try {
+        rmSync(tempUserData, { recursive: true, force: true })
+      } catch (error) {
+        if (
+          !(
+            error instanceof Error &&
+            /(?:EBUSY|EPERM|resource busy|operation not permitted)/i.test(error.message)
+          )
+        ) {
+          console.error(error)
+          exitCode = 1
+          break
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100))
+      }
+    }
+    if (existsSync(tempUserData)) {
+      console.error(`Regression cleanup failed: ${tempUserData}`)
+      exitCode = 1
+    }
   }
+  app.exit(exitCode)
 })
