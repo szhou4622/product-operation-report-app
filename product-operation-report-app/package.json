@@ -18,7 +18,7 @@
     "dist:mac": "electron-vite build && electron-builder --mac",
     "dist:mac:arm64": "electron-vite build && electron-builder --mac --arm64",
     "dist:mac:x64": "electron-vite build && electron-builder --mac --x64",
-    "dist:win": "electron-vite build && electron-builder --win --config.electronDist=node_modules/electron/dist"
+    "dist:win": "electron-vite build && electron-builder --win"
   },
   "dependencies": {
     "docx": "^9.7.1",
