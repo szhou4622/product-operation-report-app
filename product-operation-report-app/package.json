@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "产品经营报告 桌面 App — 按 SOP 把一方/竞品/素材数据生成产品经营报告",
   "main": "./out/main/index.js",
   "author": "",
@@ -15,6 +15,7 @@
     "test:managed-model": "node scripts/run-managed-model-smoke.cjs",
     "config:managed:import": "electron scripts/import-managed-model-config.cjs",
     "config:managed:set-key": "electron scripts/set-managed-model-key.cjs",
+    "config:managed:sync-github": "electron scripts/sync-managed-model-secret.cjs",
     "config:managed:from-env": "node scripts/write-managed-model-config.cjs",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",

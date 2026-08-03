@@ -19,6 +19,7 @@ npm run typecheck  # 类型检查
 npm run test:regression # 核心异常回归检查
 npm run test:managed-model # 使用本机私有配置检查内置服务连通性
 npm run config:managed:set-key # 弹出本机密码框，测试成功后加密替换内置 Key
+npm run config:managed:sync-github # 将本机加密配置安全同步为 GitHub Actions Secret
 npm run build      # 构建
 npm run dist:mac:arm64 # 打包 macOS Apple 芯片 dmg
 npm run dist:mac:x64   # 打包 macOS Intel 芯片 dmg
