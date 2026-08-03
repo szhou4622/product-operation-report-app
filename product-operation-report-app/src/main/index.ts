@@ -3,7 +3,8 @@ import { randomUUID } from 'crypto'
 import { isAbsolute, join } from 'path'
 import { existsSync } from 'fs'
 import type { AppSettings, ChatMessage, SavedProject, TestModelOptions } from '../shared/types'
-import { getActiveProfile, loadSettings, saveSettings } from './settings'
+import { getActiveProfile, loadRendererSettings, saveRendererSettings } from './settings'
+import { getManagedModelState } from './managedModel'
 import { chatStream, listModels, testModel } from './model'
 import {
   cancelParsingForOwner,
@@ -214,11 +215,11 @@ function createWindow(): void {
 // ---- IPC：设置 ----
 ipcMain.handle('settings:get', () => {
   ensureActivated()
-  return loadSettings()
+  return loadRendererSettings()
 })
 ipcMain.handle('settings:save', (_e, settings: AppSettings) => {
   ensureActivated()
-  return saveSettings(settings)
+  return saveRendererSettings(settings)
 })
 ipcMain.handle('shell:openExternal', (_e, url: string) => openExternalUrl(url))
 ipcMain.handle('shell:openPath', async (_e, path: string) => {
@@ -259,10 +260,20 @@ ipcMain.handle('project:loadPrevious', () => {
 // ---- IPC：测试模型 ----
 ipcMain.handle('model:test', (_e, opts: TestModelOptions) => {
   ensureActivated()
+  const managed = getManagedModelState()
+  if (managed.enabled) {
+    if (!managed.profile) return { ok: false, message: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    return testModel({ ...opts, profile: managed.profile })
+  }
   return testModel(opts)
 })
 ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => {
   ensureActivated()
+  const managed = getManagedModelState()
+  if (managed.enabled) {
+    if (!managed.profile) return { ok: false, error: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    return listModels(managed.profile)
+  }
   return listModels(profile)
 })
 
@@ -321,7 +332,13 @@ ipcMain.on(
     }
     const profile = getActiveProfile()
     if (!profile) {
-      event.sender.send(channel, { type: 'error', message: '未配置模型，请先在设置里添加模型配置。' })
+      const managed = getManagedModelState()
+      event.sender.send(channel, {
+        type: 'error',
+        message: managed.enabled
+          ? managed.info?.error || '内置模型服务暂不可用，请联系软件管理员。'
+          : '未配置模型，请先在设置里添加模型配置。'
+      })
       return
     }
     const controller = new AbortController()

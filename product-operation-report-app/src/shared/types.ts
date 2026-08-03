@@ -11,6 +11,17 @@ export interface ModelProfile {
   temperature?: number
 }
 
+/** 内置模型的公开状态。真实 API Key 只存在于主进程，不得传给渲染进程。 */
+export interface ManagedModelInfo {
+  enabled: boolean
+  configured: boolean
+  name: string
+  baseURL: string
+  model: string
+  supportsVision: boolean
+  error?: string
+}
+
 /** 应用设置 */
 export interface AppSettings {
   profiles: ModelProfile[]
@@ -18,6 +29,7 @@ export interface AppSettings {
   projectsDir: string // 报告工程默认保存目录
   privacyAccepted: boolean // 是否已确认“资料会发送到当前模型服务商”
   privacyEndpoint?: string // 上次确认隐私说明时使用的模型服务地址
+  managedModel?: ManagedModelInfo // 仅公开信息，不包含 API Key
 }
 
 /** 聊天消息内容块 */

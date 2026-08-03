@@ -75,7 +75,7 @@ export function friendlyError(value: unknown): string {
     return '文件名或保存路径太长。请缩短文件名，或直接保存到桌面。'
   }
   if (/timeout|timed out|超时/i.test(raw)) return '请求超时，请检查网络后重试。'
-  if (/401|unauthorized|invalid api key|authentication/i.test(raw)) return '模型授权失败，请检查 API Key。'
+  if (/401|unauthorized|invalid api key|authentication/i.test(raw)) return '模型服务授权失败，请联系软件管理员。'
   if (/404|model.*not found|not found.*model/i.test(raw)) return '模型地址或模型名称不正确，请到设置中检查。'
   if (/429|rate limit|quota|insufficient_quota/i.test(raw)) {
     const wait = raw.match(/等待\s*(\d+)\s*秒/)
@@ -811,7 +811,7 @@ export const useStore = create<StoreState>((set, get) => ({
       previousProjectAvailable: Boolean(previousProject),
       settings,
       sopRules,
-      settingsOpen: !settings.profiles.length,
+      settingsOpen: settings.managedModel?.enabled ? !settings.managedModel.configured : !settings.profiles.length,
       sources: lastProject
         ? lastProject.sources.map((source) => ({
             ...source,
@@ -1330,18 +1330,24 @@ export const useStore = create<StoreState>((set, get) => ({
   startGeneration: async () => {
     const { settings, sources, phase } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
+    const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
     const profile =
       settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
-    if (!profile || !profile.baseURL.trim() || !profile.model.trim() || !profile.apiKey.trim()) {
+    const modelConfigured = managed?.configured || Boolean(
+      profile && profile.baseURL.trim() && profile.model.trim() && profile.apiKey.trim()
+    )
+    if (!modelConfigured) {
       set({ settingsOpen: true })
       get()._post(
         'assistant',
-        '还没有完成模型配置。请打开设置，粘贴 API Key 并完成“测试连通”后保存。',
+        managed
+          ? managed.error || '内置模型服务暂不可用，请联系软件管理员。'
+          : '还没有完成模型配置。请打开设置，粘贴 API Key 并完成“测试连通”后保存。',
         'error'
       )
       return
     }
-    const activeEndpoint = profile.baseURL.trim().replace(/\/+$/, '')
+    const activeEndpoint = managed?.baseURL.trim().replace(/\/+$/, '') || profile?.baseURL.trim().replace(/\/+$/, '') || ''
     if (!settings?.privacyAccepted || settings.privacyEndpoint !== activeEndpoint) {
       get()._post('assistant', '开始前请先确认资料将发送到当前模型服务。完成隐私确认后再点“开始生成报告”。', 'error')
       return

@@ -1,0 +1,148 @@
+import { app, safeStorage } from 'electron'
+import { existsSync, readFileSync, statSync } from 'fs'
+import { isAbsolute, join, resolve } from 'path'
+import type { ManagedModelInfo, ModelProfile } from '../shared/types'
+
+const MAX_CONFIG_BYTES = 32 * 1024
+const MANAGED_PROFILE_ID = 'managed-model'
+
+interface ManagedModelFile {
+  version?: number
+  enabled?: boolean
+  name?: unknown
+  baseURL?: unknown
+  apiKey?: unknown
+  apiKeyEnc?: unknown
+  model?: unknown
+  supportsVision?: unknown
+  temperature?: unknown
+}
+
+export interface ManagedModelState {
+  enabled: boolean
+  profile: ModelProfile | null
+  info?: ManagedModelInfo
+}
+
+function disabledState(): ManagedModelState {
+  return { enabled: false, profile: null }
+}
+
+function invalidState(message = '内置模型服务配置不可用，请联系软件管理员。'): ManagedModelState {
+  return {
+    enabled: true,
+    profile: null,
+    info: {
+      enabled: true,
+      configured: false,
+      name: '内置 AI 服务',
+      baseURL: '',
+      model: '',
+      supportsVision: false,
+      error: message
+    }
+  }
+}
+
+function parseConfig(raw: unknown): ManagedModelState {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return invalidState()
+  const input = raw as ManagedModelFile
+  if (input.enabled === false) return disabledState()
+  if (input.version !== undefined && input.version !== 1) return invalidState('内置模型服务配置版本不受支持，请联系软件管理员。')
+
+  const baseURL = typeof input.baseURL === 'string' ? input.baseURL.trim().replace(/\/+$/, '') : ''
+  const apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : ''
+  const model = typeof input.model === 'string' ? input.model.trim() : ''
+  const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '内置 AI 服务'
+  const temperature = input.temperature === undefined ? 0.3 : Number(input.temperature)
+  if (!baseURL || !apiKey || !model) return invalidState()
+  if (baseURL.length > 2048 || apiKey.length > 4096 || model.length > 200 || name.length > 80) return invalidState()
+  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) return invalidState()
+
+  let parsed: URL
+  try {
+    parsed = new URL(baseURL)
+  } catch {
+    return invalidState()
+  }
+  const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
+  if (parsed.protocol !== 'https:' && !(local && parsed.protocol === 'http:')) return invalidState()
+
+  const profile: ModelProfile = {
+    id: MANAGED_PROFILE_ID,
+    name,
+    baseURL,
+    apiKey,
+    model,
+    supportsVision: input.supportsVision !== false,
+    temperature
+  }
+  return {
+    enabled: true,
+    profile,
+    info: {
+      enabled: true,
+      configured: true,
+      name: profile.name,
+      baseURL: profile.baseURL,
+      model: profile.model,
+      supportsVision: profile.supportsVision
+    }
+  }
+}
+
+function readConfigFile(path: string): ManagedModelState {
+  try {
+    if (statSync(path).size > MAX_CONFIG_BYTES) return invalidState()
+    const input = JSON.parse(readFileSync(path, 'utf8')) as ManagedModelFile
+    if ((!input.apiKey || typeof input.apiKey !== 'string') && typeof input.apiKeyEnc === 'string') {
+      const stored = input.apiKeyEnc
+      if (stored.startsWith('plain:')) {
+        input.apiKey = Buffer.from(stored.slice('plain:'.length), 'base64').toString('utf8')
+      } else if (safeStorage.isEncryptionAvailable()) {
+        try {
+          input.apiKey = safeStorage.decryptString(Buffer.from(stored, 'base64'))
+        } catch {
+          return invalidState()
+        }
+      }
+    }
+    return parseConfig(input)
+  } catch {
+    return invalidState()
+  }
+}
+
+function explicitConfigPath(): string | null {
+  const configured = process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_PATH?.trim()
+  if (!configured) return null
+  return isAbsolute(configured) ? configured : resolve(configured)
+}
+
+/**
+ * 读取顺序：环境变量 JSON -> 显式私有文件 -> 开发私有文件 -> 打包资源文件。
+ * 该函数永远不会把 API Key 写入日志或错误信息。
+ */
+export function getManagedModelState(): ManagedModelState {
+  if (process.env.PRODUCT_REPORT_DISABLE_MANAGED_MODEL === '1') return disabledState()
+
+  const inline = process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON?.trim()
+  if (inline) {
+    try {
+      return parseConfig(JSON.parse(inline))
+    } catch {
+      return invalidState()
+    }
+  }
+
+  const explicit = explicitConfigPath()
+  if (explicit) return existsSync(explicit) ? readConfigFile(explicit) : invalidState()
+
+  const candidates = app.isPackaged
+    ? [join(process.resourcesPath, 'managed-model.json')]
+    : [join(app.getAppPath(), 'managed-model.local.json')]
+  const existing = candidates.find((candidate) => existsSync(candidate))
+  return existing ? readConfigFile(existing) : disabledState()
+}
+
+export const managedModelInternals = { parseConfig }

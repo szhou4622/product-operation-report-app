@@ -6,3 +6,5 @@ dist/
 .vite/
 .codex-runtime/
 settings.json
+managed-model.local.json
+managed-model.json

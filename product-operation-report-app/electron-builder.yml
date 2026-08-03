@@ -9,6 +9,10 @@ files:
   - package.json
 asarUnpack:
   - assets/**/*
+# 发布流程从私有构建变量生成该文件；它被 Git 忽略，不能提交真实 API Key。
+extraResources:
+  - from: managed-model.json
+    to: managed-model.json
 afterPack: build/afterPack.cjs
 electronFuses:
   runAsNode: false

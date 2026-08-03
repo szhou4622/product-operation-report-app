@@ -136,6 +136,49 @@ export default function SettingsModal(): JSX.Element | null {
 
   if (!open) return null
 
+  const managed = settings?.managedModel
+  if (managed?.enabled) {
+    return (
+      <div className="modal-mask">
+        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-head">
+            <h3 id="settings-title">设置 · AI 服务</h3>
+            <button className="btn" onClick={() => setSettingsOpen(false)}>
+              关闭
+            </button>
+          </div>
+          <div className="modal-body">
+            <div className="settings-guide">
+              <div className="settings-guide-main">
+                <span className="settings-guide-kicker">无需填写 API Key</span>
+                <b>{managed.configured ? '内置 AI 服务已就绪' : '内置 AI 服务需要维护'}</b>
+                <span>
+                  {managed.configured
+                    ? '模型和授权已由软件配置完成，直接上传资料并开始生成报告即可。'
+                    : managed.error || '内置模型服务暂不可用，请联系软件管理员。'}
+                </span>
+              </div>
+            </div>
+            <div className={`test-result ${managed.configured ? 'ok' : 'err'}`} role="status">
+              {managed.configured ? '✓ 服务配置正常' : '✗ 服务配置异常'}
+              {'\n'}
+              {managed.configured
+                ? `${managed.name} · ${managed.model}${managed.supportsVision ? ' · 支持图片识别' : ''}`
+                : '用户无需自行修改设置，请把此提示反馈给软件管理员。'}
+            </div>
+            <div className="hint">为避免误操作，模型地址、模型名称和授权信息不会显示在用户界面中。</div>
+          </div>
+          <div className="modal-foot">
+            <div />
+            <button className="btn primary" onClick={() => setSettingsOpen(false)}>
+              我知道了
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   const patch = (p: Partial<ModelProfile>): void => {
     setDraft((d) => ({
       ...d,

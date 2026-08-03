@@ -196,12 +196,14 @@ export default function App(): JSX.Element {
 
   const active =
     settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
+  const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
 
   const [columns, setColumns] = useState({ left: 240, right: 380 })
   const [windowWidth, setWindowWidth] = useState(() => window.innerWidth || 1280)
-  const activeEndpoint = active?.baseURL.trim().replace(/\/+$/, '') || ''
+  const activeEndpoint = managed?.baseURL.trim().replace(/\/+$/, '') || active?.baseURL.trim().replace(/\/+$/, '') || ''
+  const modelConfigured = Boolean(managed?.configured || active)
   const needsPrivacyConsent = Boolean(
-    settings && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
+    settings && modelConfigured && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
   )
 
   useEffect(() => {
@@ -469,7 +471,13 @@ export default function App(): JSX.Element {
         </a>
         <div className="right">
           <span className="model-pill">
-            {active ? `模型：${active.name}（${active.model}）` : '未配置模型'}
+            {managed
+              ? managed.configured
+                ? `内置模型：${managed.model}`
+                : '内置模型需要维护'
+              : active
+                ? `模型：${active.name}（${active.model}）`
+                : '未配置模型'}
           </span>
           <button
             className="btn new-analysis-button"
@@ -506,10 +514,10 @@ export default function App(): JSX.Element {
           <button
             className="btn"
             disabled={analysisBusy}
-            title={analysisBusy ? '当前分析完成或停止后才能修改模型设置' : '打开模型设置'}
+            title={analysisBusy ? '当前分析完成或停止后才能查看设置' : managed ? '查看内置 AI 服务状态' : '打开模型设置'}
             onClick={() => setSettingsOpen(true)}
           >
-            ⚙ 设置
+            ⚙ {managed ? '服务状态' : '设置'}
           </button>
         </div>
       </div>
@@ -556,32 +564,42 @@ export default function App(): JSX.Element {
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">
           <div className="privacy-card">
             <div className="privacy-kicker">首次使用确认</div>
-            <h2 id="privacy-title">上传资料会发送到当前配置的 AI 模型服务商</h2>
+            <h2 id="privacy-title">上传资料会发送到{managed ? '软件内置的' : '当前配置的'} AI 模型服务</h2>
             <p>
               本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给当前模型接口处理。
-              请确认你有权使用这些资料，并已了解相关商业数据会进入你配置的 AI 服务。
+              请确认你有权使用这些资料，并已了解相关商业数据会进入{managed ? '软件内置的' : '你配置的'} AI 服务。
             </p>
             <div className="privacy-endpoint">
               <span>当前模型服务</span>
-              <b>{active ? `${active.name} · ${active.baseURL}` : '尚未配置，稍后将在设置中选择模型服务'}</b>
+              <b>
+                {managed
+                  ? managed.configured
+                    ? `${managed.name} · ${managed.model}`
+                    : '内置服务配置异常，请联系软件管理员'
+                  : active
+                    ? `${active.name} · ${active.baseURL}`
+                    : '尚未配置，稍后将在设置中选择模型服务'}
+              </b>
             </div>
             <ul className="privacy-list">
-              <li>软件会尽量在本机保存配置，但 AI 分析需要调用你配置的模型接口。</li>
+              <li>AI 分析需要联网调用{managed ? '软件内置的模型服务' : '你配置的模型接口'}。</li>
               <li>如果资料包含客户隐私、合同、价格政策等敏感信息，请先确认是否允许上传分析。</li>
-              <li>你可以在设置中更换模型服务商或 API Key。</li>
+              <li>{managed ? '模型授权由软件统一管理，你不需要填写或保存 API Key。' : '你可以在设置中更换模型服务商或 API Key。'}</li>
             </ul>
             {privacyError && <div className="privacy-error">{privacyError}</div>}
             <div className="privacy-actions">
-              <button className="btn" onClick={() => setSettingsOpen(true)}>
-                先去设置模型
-              </button>
+              {!managed?.configured && (
+                <button className="btn" onClick={() => setSettingsOpen(true)}>
+                  {managed ? '查看服务状态' : '先去设置模型'}
+                </button>
+              )}
               <button
                 className="btn primary"
-                disabled={privacySaving || !active}
-                title={active ? '' : '请先完成模型设置'}
+                disabled={privacySaving || !modelConfigured}
+                title={modelConfigured ? '' : managed ? '内置模型服务暂不可用' : '请先完成模型设置'}
                 onClick={() => void acceptPrivacy()}
               >
-                {privacySaving ? '保存中…' : active ? '我已知晓，继续使用' : '请先设置模型'}
+                {privacySaving ? '保存中…' : modelConfigured ? '我已知晓，继续使用' : managed ? '服务暂不可用' : '请先设置模型'}
               </button>
             </div>
           </div>

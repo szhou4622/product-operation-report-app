@@ -12,7 +12,14 @@ import { chatStream, listModels, testModel } from '../src/main/model'
 import { loadLastProject, saveLastProject } from '../src/main/project'
 import { getActivationStatus } from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
-import { loadSettings, saveSettings } from '../src/main/settings'
+import {
+  getActiveProfile,
+  loadRendererSettings,
+  loadSettings,
+  saveRendererSettings,
+  saveSettings
+} from '../src/main/settings'
+import { managedModelInternals } from '../src/main/managedModel'
 import { readBundledSopRules } from '../src/main/sopRules'
 import {
   buildHtmlReportPresentation,
@@ -107,6 +114,59 @@ async function testActivationAndSettingsBackup(): Promise<void> {
       }),
     /https/
   )
+}
+
+function testManagedModelIsolation(): void {
+  const secret = 'managed-secret-never-rendered'
+  const validConfig = {
+    version: 1,
+    enabled: true,
+    name: '内置 AI 服务',
+    baseURL: 'https://managed.example.com/v1/',
+    apiKey: secret,
+    model: 'managed-model',
+    supportsVision: true,
+    temperature: 0.3
+  }
+  const parsed = managedModelInternals.parseConfig(validConfig)
+  assert.equal(parsed.enabled, true)
+  assert.equal(parsed.profile?.apiKey, secret)
+  assert.equal(parsed.profile?.baseURL, 'https://managed.example.com/v1')
+  assert.equal(JSON.stringify(parsed.info).includes(secret), false)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, apiKey: '' }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, baseURL: 'http://remote.example.com/v1' }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, enabled: false }).enabled, false)
+
+  process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON = JSON.stringify(validConfig)
+  try {
+    const rendererSettings = loadRendererSettings()
+    assert.equal(rendererSettings.profiles.length, 0)
+    assert.equal(rendererSettings.managedModel?.configured, true)
+    assert.equal(JSON.stringify(rendererSettings).includes(secret), false)
+    assert.equal(getActiveProfile()?.apiKey, secret)
+
+    const saved = saveRendererSettings({
+      ...rendererSettings,
+      profiles: [
+        {
+          id: 'injected',
+          name: '恶意替换',
+          baseURL: 'https://attacker.example.com/v1',
+          apiKey: 'attacker-key',
+          model: 'attacker-model',
+          supportsVision: false
+        }
+      ],
+      activeProfileId: 'injected',
+      privacyAccepted: true,
+      privacyEndpoint: 'https://attacker.example.com/v1'
+    })
+    assert.equal(saved.profiles.length, 0)
+    assert.equal(saved.privacyEndpoint, 'https://managed.example.com/v1')
+    assert.equal(getActiveProfile()?.id, 'managed-model')
+  } finally {
+    delete process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON
+  }
 }
 
 async function testSourceInvalidation(): Promise<void> {
@@ -1633,6 +1693,8 @@ async function run(): Promise<void> {
   await testProjectRevisionAndBackup()
   console.log('Regression: activation and settings backup')
   await testActivationAndSettingsBackup()
+  console.log('Regression: managed model secret isolation')
+  testManagedModelIsolation()
   console.log('Regression: source invalidation')
   await testSourceInvalidation()
   console.log('Regression: reset save rollback')
