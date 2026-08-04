@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import type { ActivationStatus } from '../../shared/types'
+import type { ActivationStatus, UpdateDownloadProgress, UpdateInfo } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
 import ConversationPanel from './components/ConversationPanel'
@@ -88,7 +88,18 @@ export default function App(): JSX.Element {
   const [initError, setInitError] = useState('')
   const [autosaveError, setAutosaveError] = useState('')
   const [appVersion, setAppVersion] = useState('')
+  const [licenseEntryOpen, setLicenseEntryOpen] = useState(false)
+  const [replacementCode, setReplacementCode] = useState('')
+  const [replacementError, setReplacementError] = useState('')
+  const [replacementBusy, setReplacementBusy] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [updateDismissed, setUpdateDismissed] = useState(false)
+  const [updateBusy, setUpdateBusy] = useState<'idle' | 'download' | 'install'>('idle')
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null)
+  const [updateError, setUpdateError] = useState('')
   const autosaveAttempt = useRef(0)
+  const activationRefreshAttempted = useRef(false)
+  const updateCheckAttempted = useRef(false)
   const reportForEmergencyCache =
     phase === 'cleaning' || phase === 'analyzing' ? artifacts[9] || '' : reportMarkdown
 
@@ -119,6 +130,19 @@ export default function App(): JSX.Element {
       alive = false
     }
   }, [])
+
+  useEffect(() => window.api.onActivationStatusChanged(setActivationStatus), [])
+
+  useEffect(() => {
+    if ((!activationStatus?.activated && activationStatus?.source !== 'server') || activationRefreshAttempted.current) return
+    activationRefreshAttempted.current = true
+    void window.api
+      .refreshActivationStatus()
+      .then(setActivationStatus)
+      .catch(() => undefined)
+  }, [activationStatus?.activated, activationStatus?.source])
+
+  useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
 
   useEffect(() => {
     if (!activationStatus?.activated || initialized) return
@@ -205,15 +229,41 @@ export default function App(): JSX.Element {
   const needsPrivacyConsent = Boolean(
     settings && modelConfigured && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
   )
+  const updateVisible = Boolean(updateInfo?.available && !updateDismissed)
+  const licenseLabel = activationStatus?.unlimited
+    ? '无限授权'
+    : activationStatus?.licenseType === 'credits'
+      ? `剩余 ${activationStatus?.creditsRemaining ?? 0} 积分`
+      : '已授权'
+
+  useEffect(() => {
+    if (
+      !initialized ||
+      !activationStatus?.activated ||
+      needsPrivacyConsent ||
+      updateCheckAttempted.current
+    ) return
+    updateCheckAttempted.current = true
+    void window.api
+      .checkForUpdates()
+      .then((info) => {
+        if (info.available) {
+          setUpdateInfo(info)
+          setUpdateDismissed(false)
+        }
+      })
+      .catch(() => undefined)
+  }, [activationStatus?.activated, initialized, needsPrivacyConsent])
 
   useEffect(() => {
     const elements = Array.from(document.querySelectorAll<HTMLElement>('.topbar, .panes'))
+    const blocked = needsPrivacyConsent || updateVisible || licenseEntryOpen
     for (const element of elements) {
-      if (needsPrivacyConsent) element.setAttribute('inert', '')
+      if (blocked) element.setAttribute('inert', '')
       else element.removeAttribute('inert')
     }
     return () => elements.forEach((element) => element.removeAttribute('inert'))
-  }, [needsPrivacyConsent])
+  }, [licenseEntryOpen, needsPrivacyConsent, updateVisible])
 
   const analysisBusy = phase === 'cleaning' || phase === 'analyzing'
   const hasAnalysis = Boolean(
@@ -314,6 +364,57 @@ export default function App(): JSX.Element {
     }
   }
 
+  const submitReplacementActivation = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    if (replacementBusy) return
+    setReplacementBusy(true)
+    setReplacementError('')
+    try {
+      const result = await window.api.activate(replacementCode)
+      setActivationStatus(result.status)
+      if (result.ok) {
+        setReplacementCode('')
+        setLicenseEntryOpen(false)
+      } else {
+        setReplacementError(result.message)
+      }
+    } catch (error) {
+      setReplacementError(friendlyUiError(error, '激活失败，请检查网络后重试。'))
+    } finally {
+      setReplacementBusy(false)
+    }
+  }
+
+  const handleDownloadUpdate = async (): Promise<void> => {
+    if (updateBusy !== 'idle') return
+    setUpdateBusy('download')
+    setUpdateError('')
+    setUpdateProgress({ receivedBytes: 0, percent: 0 })
+    try {
+      const result = await window.api.downloadUpdate()
+      if (result.info) setUpdateInfo(result.info)
+      if (!result.ok) setUpdateError(result.message)
+    } catch (error) {
+      setUpdateError(friendlyUiError(error, '更新下载失败，旧版本仍可继续使用。'))
+    } finally {
+      setUpdateBusy('idle')
+    }
+  }
+
+  const handleInstallUpdate = async (): Promise<void> => {
+    if (updateBusy !== 'idle') return
+    setUpdateBusy('install')
+    setUpdateError('')
+    try {
+      const result = await window.api.installUpdate()
+      if (result.info) setUpdateInfo(result.info)
+      if (!result.ok) setUpdateError(result.message)
+    } catch (error) {
+      setUpdateError(friendlyUiError(error, '无法启动安装程序，请重新下载。'))
+      setUpdateBusy('idle')
+    }
+  }
+
   const startResize = (side: 'left' | 'right', startX: number): void => {
     const start = { ...columns }
     const onMove = (event: MouseEvent): void => {
@@ -373,7 +474,7 @@ export default function App(): JSX.Element {
           </div>
           <div className="activation-kicker">产品经营报告</div>
           <h1>首次使用需要激活</h1>
-          <p>请输入管理员发放的激活码。激活成功后，本设备可永久使用。</p>
+          <p>请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。</p>
           <label className="activation-field">
             <span>激活码</span>
             <input
@@ -394,7 +495,7 @@ export default function App(): JSX.Element {
             {activationBusy ? '正在激活...' : '激活并进入软件'}
           </button>
           <div className="activation-note">
-            激活码不会明文保存在软件包中；本机会保存一份授权记录。
+            本地只保存加密授权记录，不保存服务器密钥或 API Key。
           </div>
         </form>
       </div>
@@ -510,6 +611,17 @@ export default function App(): JSX.Element {
               {restoreBusy ? '正在恢复…' : '恢复上一份'}
             </button>
           )}
+          <button
+            className={`license-pill${activationStatus.offline ? ' offline' : ''}${activationStatus.creditsRemaining === 0 ? ' empty' : ''}`}
+            type="button"
+            title={activationStatus.message || '查看授权状态或输入新的激活码'}
+            onClick={() => {
+              setReplacementError('')
+              setLicenseEntryOpen(true)
+            }}
+          >
+            {licenseLabel}{activationStatus.offline ? ' · 离线可用' : ''}
+          </button>
           {appVersion && <span className="app-version">v{appVersion}</span>}
           <button
             className="btn"
@@ -559,6 +671,105 @@ export default function App(): JSX.Element {
       </div>
 
       <SettingsModal />
+
+      {licenseEntryOpen && (
+        <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="license-entry-title">
+          <form className="privacy-card license-entry-card" onSubmit={(event) => void submitReplacementActivation(event)}>
+            <div className="privacy-kicker">授权管理</div>
+            <h2 id="license-entry-title">输入新的激活码</h2>
+            <p>新激活码校验成功后会替换当前授权；校验失败不会影响现在的授权。</p>
+            <label className="activation-field">
+              <span>激活码</span>
+              <input
+                autoFocus
+                value={replacementCode}
+                onChange={(event) => setReplacementCode(event.target.value.toUpperCase())}
+                placeholder="请输入管理员发放的激活码"
+                spellCheck={false}
+              />
+            </label>
+            <div className="activation-device">
+              <span>当前设备码</span>
+              <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+            </div>
+            {replacementError && <div className="privacy-error">{replacementError}</div>}
+            <div className="privacy-actions">
+              <button
+                className="btn"
+                type="button"
+                disabled={replacementBusy}
+                onClick={() => {
+                  setLicenseEntryOpen(false)
+                  setReplacementError('')
+                }}
+              >
+                取消
+              </button>
+              <button className="btn primary" disabled={replacementBusy || !replacementCode.trim()}>
+                {replacementBusy ? '正在校验…' : '校验并启用'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {updateVisible && updateInfo && (
+        <div className="privacy-mask update-mask" role="dialog" aria-modal="true" aria-labelledby="update-title">
+          <div className="privacy-card update-card">
+            <div className="update-heading">
+              <div>
+                <div className="privacy-kicker">{updateInfo.force ? '必须更新' : '发现新版本'}</div>
+                <h2 id="update-title">产品经营报告 {updateInfo.latestVersion}</h2>
+              </div>
+              <span className={`update-badge${updateInfo.force ? ' force' : ''}`}>
+                {updateInfo.force ? '更新后才能继续' : '可稍后更新'}
+              </span>
+            </div>
+            <div className="update-versions">
+              <div><span>当前版本</span><b>v{updateInfo.currentVersion}</b></div>
+              <div className="update-arrow" aria-hidden="true">→</div>
+              <div><span>最新版本</span><b>v{updateInfo.latestVersion}</b></div>
+            </div>
+            <div className="update-notes">
+              <strong>本次更新</strong>
+              {updateInfo.notes.length ? (
+                <ul>{updateInfo.notes.map((note, index) => <li key={`${index}-${note}`}>{note}</li>)}</ul>
+              ) : (
+                <p>修复问题并提升使用体验。</p>
+              )}
+            </div>
+            {updateBusy === 'download' && (
+              <div className="update-progress" aria-live="polite">
+                <div><span>正在下载更新包</span><b>{updateProgress?.percent === undefined ? '请稍候' : `${updateProgress.percent}%`}</b></div>
+                <progress max={100} value={updateProgress?.percent ?? undefined} />
+              </div>
+            )}
+            {updateError && <div className="privacy-error">{updateError}</div>}
+            <div className="privacy-actions update-actions">
+              {!updateInfo.force && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={updateBusy !== 'idle'}
+                  onClick={() => setUpdateDismissed(true)}
+                >
+                  稍后更新
+                </button>
+              )}
+              {updateInfo.downloaded ? (
+                <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleInstallUpdate()}>
+                  {updateBusy === 'install' ? '正在启动安装…' : '立即安装'}
+                </button>
+              ) : (
+                <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleDownloadUpdate()}>
+                  {updateBusy === 'download' ? '正在下载…' : updateError ? '重新下载' : '立即下载'}
+                </button>
+              )}
+            </div>
+            <div className="update-safety-note">下载完成后会自动校验 SHA256，校验通过才会启动安装。</div>
+          </div>
+        </div>
+      )}
 
       {needsPrivacyConsent && (
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">

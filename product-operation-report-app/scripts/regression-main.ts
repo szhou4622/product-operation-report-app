@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { app, BrowserWindow } from 'electron'
@@ -10,7 +11,12 @@ import type { SavedProject } from '../src/shared/types'
 import { parseArchive, parseFile } from '../src/main/ingest'
 import { chatStream, listModels, testModel } from '../src/main/model'
 import { loadLastProject, saveLastProject } from '../src/main/project'
-import { getActivationStatus } from '../src/main/activation'
+import {
+  activateWithCode,
+  consumeAnalysisCredit,
+  getActivationStatus,
+  getActivationStatusWithServerCheck
+} from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
   getActiveProfile,
@@ -21,6 +27,7 @@ import {
 } from '../src/main/settings'
 import { managedModelInternals } from '../src/main/managedModel'
 import { readBundledSopRules } from '../src/main/sopRules'
+import { checkForUpdates, compareVersions, downloadUpdate } from '../src/main/updater'
 import {
   buildHtmlReportPresentation,
   markdownToHtmlDocument,
@@ -87,7 +94,12 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   }
   writeFileSync(join(tempUserData, 'activation.json'), '{broken', 'utf8')
   writeFileSync(join(tempUserData, 'activation.json.bak'), JSON.stringify(activationRecord), 'utf8')
-  assert.equal(getActivationStatus().activated, true)
+  const activationStatus = getActivationStatus()
+  assert.equal(activationStatus.activated, true)
+  assert.equal(activationStatus.appName, 'ProductOperationReport')
+  assert.equal(activationStatus.source, 'legacy')
+  assert.equal(activationStatus.unlimited, true)
+  assert.equal(activationStatus.offline, false)
 
   const firstSettings = {
     profiles: [{ ...profile, name: '第一配置', apiKey: ' key-one ' }],
@@ -114,6 +126,147 @@ async function testActivationAndSettingsBackup(): Promise<void> {
       }),
     /https/
   )
+}
+
+async function testServerActivationAndCredits(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'SERVER-POINTS-TEST-CODE'
+  let requestBody: Record<string, unknown> = {}
+  try {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        ok: true,
+        license: {
+          license_id: 'license-test-points',
+          license_type: 'credits',
+          credits: 100,
+          unlimited: false,
+          status: 'active'
+        },
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.licenseType, 'credits')
+    assert.equal(activated.status.creditsRemaining, 100)
+    assert.equal(requestBody.app_name, 'ProductOperationReport')
+    assert.equal(requestBody.activation_code, code)
+    assert.equal(requestBody.machine_code, activated.status.deviceId)
+    assert.equal(typeof requestBody.software_version, 'string')
+    assert.equal(typeof requestBody.platform, 'string')
+    assert.doesNotMatch(readFileSync(join(tempUserData, 'activation.json'), 'utf8'), new RegExp(code))
+
+    const firstUse = consumeAnalysisCredit('analysis-session-one')
+    assert.equal(firstUse.ok, true)
+    assert.equal(firstUse.status.creditsRemaining, 99)
+    const repeatedUse = consumeAnalysisCredit('analysis-session-one')
+    assert.equal(repeatedUse.status.creditsRemaining, 99)
+
+    const refreshed = await getActivationStatusWithServerCheck()
+    assert.equal(refreshed.activated, true)
+    assert.equal(refreshed.creditsRemaining, 99)
+    assert.equal(refreshed.offline, false)
+
+    globalThis.fetch = (async () => { throw new TypeError('network unavailable') }) as typeof fetch
+    const offline = await getActivationStatusWithServerCheck()
+    assert.equal(offline.activated, true)
+    assert.equal(offline.offline, true)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: false,
+      error: '激活码已禁用'
+    }), { status: 403, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const disabled = await getActivationStatusWithServerCheck()
+    assert.equal(disabled.activated, false)
+    assert.match(disabled.message || '', /禁用/)
+  } finally {
+    globalThis.fetch = originalFetch
+    const deviceId = getActivationStatus().deviceId
+    writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify({
+      version: 1,
+      codeHash: ACTIVATION_CODE_HASHES[0],
+      deviceId,
+      activatedAt: new Date().toISOString()
+    }), 'utf8')
+  }
+}
+
+function testUpdateVersionComparison(): void {
+  assert.equal(compareVersions('0.3.0', '0.2.5'), 1)
+  assert.equal(compareVersions('v1.0.0', '1.0'), 0)
+  assert.equal(compareVersions('1.0.0-beta.2', '1.0.0-beta.11'), -1)
+  assert.equal(compareVersions('1.0.0', '1.0.0-rc.1'), 1)
+  assert.equal(compareVersions('2.0.0', '10.0.0'), -1)
+}
+
+async function testUpdateConfigAndChecksum(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const payload = Buffer.from('verified-update-payload', 'utf8')
+  const correctChecksum = createHash('sha256').update(payload).digest('hex')
+  let requestedUrl = ''
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      requestedUrl = String(input)
+      return new Response(JSON.stringify({
+        app_name: 'ProductOperationReport',
+        version: '999.0.0',
+        min_supported_version: '998.0.0',
+        download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.bin' },
+        sha256: { windows_x64: '0'.repeat(64) },
+        notes: ['测试更新'],
+        force: false
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const forced = await checkForUpdates()
+    assert.equal(new URL(requestedUrl).searchParams.get('app_name'), 'ProductOperationReport')
+    assert.equal(forced.available, true)
+    assert.equal(forced.force, true)
+    assert.equal(forced.latestVersion, '999.0.0')
+
+    globalThis.fetch = (async () => {
+      const response = new Response(payload, {
+        status: 200,
+        headers: { 'content-length': String(payload.length) }
+      })
+      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.bin' })
+      return response
+    }) as typeof fetch
+    const rejected = await downloadUpdate()
+    assert.equal(rejected.ok, false)
+    assert.match(rejected.message, /校验失败/)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'ProductOperationReport',
+      version: '999.0.1',
+      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.bin' },
+      sha256: { windows_x64: correctChecksum },
+      notes: '通过校验',
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const offered = await checkForUpdates()
+    assert.equal(offered.available, true)
+    assert.equal(offered.force, false)
+
+    globalThis.fetch = (async () => {
+      const response = new Response(payload, {
+        status: 200,
+        headers: { 'content-length': String(payload.length) }
+      })
+      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.bin' })
+      return response
+    }) as typeof fetch
+    const accepted = await downloadUpdate()
+    assert.equal(accepted.ok, true)
+    assert.equal(existsSync(accepted.info?.downloadPath || ''), true)
+
+    globalThis.fetch = (async () => new Response('{}', { status: 404 })) as typeof fetch
+    const noConfig = await checkForUpdates()
+    assert.equal(noConfig.available, false)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 }
 
 function testManagedModelIsolation(): void {
@@ -1693,6 +1846,12 @@ async function run(): Promise<void> {
   await testProjectRevisionAndBackup()
   console.log('Regression: activation and settings backup')
   await testActivationAndSettingsBackup()
+  console.log('Regression: server activation, offline grace and idempotent credits')
+  await testServerActivationAndCredits()
+  console.log('Regression: update version comparison')
+  testUpdateVersionComparison()
+  console.log('Regression: update config and SHA256 guard')
+  await testUpdateConfigAndChecksum()
   console.log('Regression: managed model secret isolation')
   testManagedModelIsolation()
   console.log('Regression: source invalidation')

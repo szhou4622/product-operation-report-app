@@ -20,8 +20,15 @@ import {
   saveLastProject,
   saveLastProjectSync
 } from './project'
-import { activateWithCode, getActivationStatus } from './activation'
+import {
+  activateWithCode,
+  canStartLicensedAnalysis,
+  consumeAnalysisCredit,
+  getActivationStatus,
+  getActivationStatusWithServerCheck
+} from './activation'
 import { readBundledSopRules } from './sopRules'
+import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
@@ -233,7 +240,46 @@ ipcMain.handle('shell:showItemInFolder', (_e, path: string) => {
 })
 ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
-ipcMain.handle('activation:activate', (_e, code: string) => activateWithCode(code))
+ipcMain.handle('activation:refresh', async () => {
+  const status = await getActivationStatusWithServerCheck()
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('activation:changed', status)
+  }
+  return status
+})
+ipcMain.handle('activation:activate', async (_e, code: string) => {
+  const result = await activateWithCode(code)
+  if (result.ok) {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('activation:changed', result.status)
+    }
+  }
+  return result
+})
+ipcMain.handle('license:canStartAnalysis', () => canStartLicensedAnalysis())
+ipcMain.handle('license:consumeAnalysisCredit', (_e, operationId: string) => {
+  const result = consumeAnalysisCredit(operationId)
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('activation:changed', result.status)
+  }
+  return result
+})
+
+// ---- IPC：自动更新 ----
+ipcMain.handle('update:check', () => {
+  ensureActivated()
+  return checkForUpdates()
+})
+ipcMain.handle('update:download', (event) => {
+  ensureActivated()
+  return downloadUpdate((progress) => {
+    if (!event.sender.isDestroyed()) event.sender.send('update:progress', progress)
+  })
+})
+ipcMain.handle('update:install', () => {
+  ensureActivated()
+  return installDownloadedUpdate()
+})
 
 // ---- IPC：项目快照（不包含模型配置 / API Key）----
 ipcMain.handle('project:loadLast', () => {

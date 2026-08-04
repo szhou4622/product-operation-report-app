@@ -9,10 +9,14 @@ import type {
   ExportResult,
   ModelListResult,
   ModelProfile,
+  LicenseUsageResult,
   ParsedFile,
   SavedProject,
   TestModelOptions,
-  TestModelResult
+  TestModelResult,
+  UpdateActionResult,
+  UpdateDownloadProgress,
+  UpdateInfo
 } from '../shared/types'
 
 export interface ChatHandlers {
@@ -26,8 +30,34 @@ const api = {
 
   getActivationStatus: (): Promise<ActivationStatus> => ipcRenderer.invoke('activation:status'),
 
+  refreshActivationStatus: (): Promise<ActivationStatus> => ipcRenderer.invoke('activation:refresh'),
+
+  onActivationStatusChanged: (handler: (status: ActivationStatus) => void): (() => void) => {
+    const listener = (_event: unknown, status: ActivationStatus): void => handler(status)
+    ipcRenderer.on('activation:changed', listener)
+    return () => ipcRenderer.removeListener('activation:changed', listener)
+  },
+
   activate: (code: string): Promise<ActivationResult> =>
     ipcRenderer.invoke('activation:activate', code),
+
+  canStartLicensedAnalysis: (): Promise<LicenseUsageResult> =>
+    ipcRenderer.invoke('license:canStartAnalysis'),
+
+  consumeAnalysisCredit: (operationId: string): Promise<LicenseUsageResult> =>
+    ipcRenderer.invoke('license:consumeAnalysisCredit', operationId),
+
+  checkForUpdates: (): Promise<UpdateInfo> => ipcRenderer.invoke('update:check'),
+
+  downloadUpdate: (): Promise<UpdateActionResult> => ipcRenderer.invoke('update:download'),
+
+  installUpdate: (): Promise<UpdateActionResult> => ipcRenderer.invoke('update:install'),
+
+  onUpdateProgress: (handler: (progress: UpdateDownloadProgress) => void): (() => void) => {
+    const listener = (_event: unknown, progress: UpdateDownloadProgress): void => handler(progress)
+    ipcRenderer.on('update:progress', listener)
+    return () => ipcRenderer.removeListener('update:progress', listener)
+  },
 
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),
 
