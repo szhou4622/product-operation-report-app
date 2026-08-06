@@ -1330,6 +1330,16 @@ export const useStore = create<StoreState>((set, get) => ({
   startGeneration: async () => {
     const { settings, sources, phase } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
+    const licenseApi = window.api as typeof window.api & {
+      canStartLicensedAnalysis?: typeof window.api.canStartLicensedAnalysis
+    }
+    if (typeof licenseApi.canStartLicensedAnalysis === 'function') {
+      const license = await licenseApi.canStartLicensedAnalysis()
+      if (!license.ok) {
+        get()._post('assistant', license.message, 'error')
+        return
+      }
+    }
     const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
     const profile =
       settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
@@ -1601,6 +1611,17 @@ export const useStore = create<StoreState>((set, get) => ({
       }
     }
     if (!isCurrentSession()) return
+    const licenseApi = window.api as typeof window.api & {
+      consumeAnalysisCredit?: typeof window.api.consumeAnalysisCredit
+    }
+    if (typeof licenseApi.consumeAnalysisCredit === 'function') {
+      try {
+        const usage = await licenseApi.consumeAnalysisCredit(sessionId)
+        if (!usage.ok) get()._post('assistant', `报告已生成，但积分记录失败：${usage.message}`, 'error')
+      } catch {
+        get()._post('assistant', '报告已生成，但暂时无法更新积分显示；重新打开软件后会自动恢复。', 'error')
+      }
+    }
     set({ phase: 'checkpoint2' })
     get()._post(
       'assistant',

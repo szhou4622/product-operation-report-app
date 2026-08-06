@@ -39,12 +39,51 @@ export interface ActivationStatus {
   activatedAt?: string
   licenseId?: string
   codeCount: number
+  appName: string
+  source?: 'server' | 'legacy'
+  licenseType?: 'credits' | 'unlimited' | 'standard'
+  unlimited: boolean
+  creditsRemaining?: number
+  expiresAt?: string
+  offline: boolean
+  offlineUntil?: string
+  message?: string
 }
 
 export interface ActivationResult {
   ok: boolean
   message: string
   status: ActivationStatus
+}
+
+export interface LicenseUsageResult {
+  ok: boolean
+  message: string
+  status: ActivationStatus
+}
+
+export interface UpdateInfo {
+  available: boolean
+  appName: string
+  currentVersion: string
+  latestVersion?: string
+  minSupportedVersion?: string
+  notes: string[]
+  force: boolean
+  downloaded: boolean
+  downloadPath?: string
+}
+
+export interface UpdateDownloadProgress {
+  receivedBytes: number
+  totalBytes?: number
+  percent?: number
+}
+
+export interface UpdateActionResult {
+  ok: boolean
+  message: string
+  info?: UpdateInfo
 }
 
 export type ContentPart =
