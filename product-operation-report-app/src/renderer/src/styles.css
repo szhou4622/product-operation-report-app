@@ -3529,6 +3529,52 @@ body.resizing .pane-resizer {
   white-space: nowrap;
 }
 
+.update-check-button {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.update-check-button:hover,
+.update-check-button:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  outline: none;
+}
+
+.update-check-button.available {
+  border-color: rgba(37, 99, 235, 0.25);
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--primary);
+  font-weight: 800;
+}
+
+.update-check-button.downloaded {
+  border-color: rgba(22, 163, 74, 0.28);
+  background: rgba(22, 163, 74, 0.1);
+  color: #15803d;
+}
+
+.update-check-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.update-check-notice {
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid rgba(37, 99, 235, 0.3);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--primary);
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: var(--shadow);
+}
+
 .license-pill {
   min-height: 32px;
   padding: 0 10px;

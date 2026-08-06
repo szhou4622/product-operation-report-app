@@ -92,6 +92,16 @@ function selectPlatformValue(value: unknown, key: string): string | undefined {
   return record ? asString(record[key]) : asString(value)
 }
 
+function validateArtifactUrl(value: string, key: 'windows_x64' | 'mac_arm64' | 'mac_x64'): URL {
+  const parsed = new URL(value)
+  if (parsed.protocol !== 'https:') throw new Error('更新下载地址必须使用 HTTPS。')
+  const expectedExtension = key === 'windows_x64' ? '.exe' : '.dmg'
+  if (!decodeURIComponent(parsed.pathname).toLowerCase().endsWith(expectedExtension)) {
+    throw new Error(`更新配置不是当前电脑需要的 ${expectedExtension} 安装包。`)
+  }
+  return parsed
+}
+
 function updateRoot(): string {
   return join(app.getPath('userData'), 'updates', LICENSE_APP_NAME)
 }
@@ -164,7 +174,11 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
   try {
     const url = new URL(UPDATE_LATEST_URL)
     url.searchParams.set('app_name', LICENSE_APP_NAME)
-    const response = await fetch(url, { headers: { accept: 'application/json' }, signal: controller.signal })
+    const response = await fetch(url, {
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+      signal: controller.signal
+    })
     if (response.status === 404) {
       cachedConfig = null
       return toInfo(null, false)
@@ -179,12 +193,14 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
     const checksum = selectPlatformValue(body.sha256, key)?.toLowerCase()
     if (!version || !versionParts(version)) throw new Error('更新配置缺少有效版本号。')
     if (!downloadUrl) throw new Error('更新配置没有当前电脑对应的下载地址。')
-    const parsedDownload = new URL(downloadUrl)
-    if (parsedDownload.protocol !== 'https:') throw new Error('更新下载地址必须使用 HTTPS。')
+    validateArtifactUrl(downloadUrl, key)
     if (!checksum || !/^[a-f0-9]{64}$/.test(checksum)) throw new Error('更新配置缺少有效的 SHA256。')
     const minSupportedVersion = asString(body.min_supported_version)
+    if (minSupportedVersion && !versionParts(minSupportedVersion)) {
+      throw new Error('更新配置包含无效的最低支持版本号。')
+    }
     const forceByMinimum = Boolean(
-      minSupportedVersion && versionParts(minSupportedVersion) && compareVersions(app.getVersion(), minSupportedVersion) < 0
+      minSupportedVersion && compareVersions(app.getVersion(), minSupportedVersion) < 0
     )
     cachedConfig = {
       version,

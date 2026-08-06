@@ -131,3 +131,102 @@ jobs:
           --repo "${GITHUB_REPOSITORY}"
           --title "产品经营报告 ${GITHUB_REF_NAME}"
           --generate-notes
+
+  publish-update-server:
+    name: Publish automatic update
+    if: startsWith(github.ref, 'refs/tags/v') && vars.AUTO_PUBLISH_UPDATE_SERVER == 'true'
+    needs:
+      - package
+      - release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+      UPDATE_SERVER_USER: ${{ secrets.UPDATE_SERVER_USER }}
+      UPDATE_SERVER_PORT: ${{ vars.UPDATE_SERVER_PORT }}
+      UPDATE_SERVER_SSH_PRIVATE_KEY: ${{ secrets.UPDATE_SERVER_SSH_PRIVATE_KEY }}
+      UPDATE_SERVER_KNOWN_HOSTS: ${{ secrets.UPDATE_SERVER_KNOWN_HOSTS }}
+      MIN_SUPPORTED_VERSION: ${{ vars.PRODUCT_OPERATION_REPORT_MIN_SUPPORTED_VERSION }}
+      FORCE_UPDATE: ${{ vars.FORCE_PRODUCT_OPERATION_REPORT_UPDATE }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download all installers
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          args=(
+            product-operation-report-app/scripts/prepare-update-release.cjs
+            --version "${version}"
+            --artifacts-dir release-assets
+            --notes-file product-operation-report-app/release-notes.txt
+            --output update-package/latest.json
+          )
+          if [[ -n "${MIN_SUPPORTED_VERSION:-}" ]]; then
+            args+=(--min-supported-version "${MIN_SUPPORTED_VERSION}")
+          fi
+          if [[ "${FORCE_UPDATE:-false}" == "true" ]]; then
+            args+=(--force)
+          fi
+          node "${args[@]}"
+          cp product-operation-report-app/scripts/deploy-update-release.sh update-package/
+          cp release-assets/* update-package/
+          (cd update-package && zip -q "../ProductOperationReport-update-${version}.zip" ./*)
+
+      - name: Configure update server SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${UPDATE_SERVER_HOST:?Missing UPDATE_SERVER_HOST secret}"
+          : "${UPDATE_SERVER_USER:?Missing UPDATE_SERVER_USER secret}"
+          : "${UPDATE_SERVER_SSH_PRIVATE_KEY:?Missing UPDATE_SERVER_SSH_PRIVATE_KEY secret}"
+          : "${UPDATE_SERVER_KNOWN_HOSTS:?Missing UPDATE_SERVER_KNOWN_HOSTS secret}"
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${UPDATE_SERVER_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/update_server"
+          chmod 0600 "${HOME}/.ssh/update_server"
+          printf '%s\n' "${UPDATE_SERVER_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 0600 "${HOME}/.ssh/known_hosts"
+
+      - name: Deploy update atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          port="${UPDATE_SERVER_PORT:-22}"
+          archive="ProductOperationReport-update-${version}.zip"
+          remote_archive="/tmp/${archive}"
+          remote_stage="/tmp/ProductOperationReport-update-${version}"
+          ssh_args=(-i "${HOME}/.ssh/update_server" -p "${port}" -o BatchMode=yes)
+          scp -i "${HOME}/.ssh/update_server" -P "${port}" -o BatchMode=yes \
+            "${archive}" "${UPDATE_SERVER_USER}@${UPDATE_SERVER_HOST}:${remote_archive}"
+          ssh "${ssh_args[@]}" "${UPDATE_SERVER_USER}@${UPDATE_SERVER_HOST}" \
+            "set +e; rm -rf -- '${remote_stage}'; mkdir -p -- '${remote_stage}'; unzip -q '${remote_archive}' -d '${remote_stage}'; rc=\$?; if [ \$rc -eq 0 ]; then bash '${remote_stage}/deploy-update-release.sh'; rc=\$?; fi; rm -f -- '${remote_archive}'; rm -rf -- '${remote_stage}'; exit \$rc"
+
+      - name: Verify public update endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          curl --fail --silent --show-error \
+            'https://update.dadaozixun.com/api/update/latest?app_name=ProductOperationReport' \
+            --output published-update.json
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("published-update.json", "utf8"));
+            const expected = process.argv[1];
+            if (body.app_name !== "ProductOperationReport" || body.version !== expected) process.exit(1);
+          ' "${version}"

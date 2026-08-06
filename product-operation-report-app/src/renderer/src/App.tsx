@@ -94,9 +94,10 @@ export default function App(): JSX.Element {
   const [replacementBusy, setReplacementBusy] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [updateDismissed, setUpdateDismissed] = useState(false)
-  const [updateBusy, setUpdateBusy] = useState<'idle' | 'download' | 'install'>('idle')
+  const [updateBusy, setUpdateBusy] = useState<'idle' | 'check' | 'download' | 'install'>('idle')
   const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null)
   const [updateError, setUpdateError] = useState('')
+  const [updateCheckNotice, setUpdateCheckNotice] = useState('')
   const autosaveAttempt = useRef(0)
   const activationRefreshAttempted = useRef(false)
   const updateCheckAttempted = useRef(false)
@@ -143,6 +144,12 @@ export default function App(): JSX.Element {
   }, [activationStatus?.activated, activationStatus?.source])
 
   useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
+
+  useEffect(() => {
+    if (!updateCheckNotice) return
+    const handle = window.setTimeout(() => setUpdateCheckNotice(''), 5000)
+    return () => window.clearTimeout(handle)
+  }, [updateCheckNotice])
 
   useEffect(() => {
     if (!activationStatus?.activated || initialized) return
@@ -401,6 +408,26 @@ export default function App(): JSX.Element {
     }
   }
 
+  const handleCheckForUpdates = async (): Promise<void> => {
+    if (updateBusy !== 'idle') return
+    setUpdateBusy('check')
+    setUpdateError('')
+    setUpdateCheckNotice('')
+    try {
+      const info = await window.api.checkForUpdates()
+      setUpdateInfo(info)
+      if (info.available) {
+        setUpdateDismissed(false)
+      } else {
+        setUpdateCheckNotice(`当前已经是最新版本 v${info.currentVersion}`)
+      }
+    } catch (error) {
+      setUpdateCheckNotice(friendlyUiError(error, '暂时无法检查更新，请稍后重试。'))
+    } finally {
+      setUpdateBusy('idle')
+    }
+  }
+
   const handleInstallUpdate = async (): Promise<void> => {
     if (updateBusy !== 'idle') return
     setUpdateBusy('install')
@@ -622,7 +649,27 @@ export default function App(): JSX.Element {
           >
             {licenseLabel}{activationStatus.offline ? ' · 离线可用' : ''}
           </button>
-          {appVersion && <span className="app-version">v{appVersion}</span>}
+          {appVersion && (
+            <button
+              className={`app-version update-check-button${updateInfo?.available ? ' available' : ''}${updateInfo?.downloaded ? ' downloaded' : ''}`}
+              type="button"
+              disabled={updateBusy !== 'idle'}
+              title={updateInfo?.downloaded
+                ? '更新包已经下载完成，点击开始安装'
+                : updateInfo?.available
+                  ? '有新版本，点击查看更新说明'
+                  : '手动检查是否有新版本'}
+              onClick={() => void handleCheckForUpdates()}
+            >
+              {updateBusy === 'check'
+                ? '正在检查…'
+                : updateInfo?.downloaded
+                  ? '安装更新'
+                  : updateInfo?.available
+                    ? `新版本 v${updateInfo.latestVersion}`
+                    : `v${appVersion} · 检查更新`}
+            </button>
+          )}
           <button
             className="btn"
             disabled={analysisBusy}
@@ -634,7 +681,7 @@ export default function App(): JSX.Element {
         </div>
       </div>
 
-      {(newAnalysisError || autosaveError) && (
+      {(newAnalysisError || autosaveError || updateCheckNotice) && (
         <div className="app-alert-stack">
           {newAnalysisError && (
             <div className="new-analysis-error" role="alert">
@@ -644,6 +691,11 @@ export default function App(): JSX.Element {
           {autosaveError && (
             <div className="new-analysis-error" role="alert">
               自动保存失败，当前内容可能尚未写入磁盘：{autosaveError}
+            </div>
+          )}
+          {updateCheckNotice && (
+            <div className="update-check-notice" role="status">
+              {updateCheckNotice}
             </div>
           )}
         </div>

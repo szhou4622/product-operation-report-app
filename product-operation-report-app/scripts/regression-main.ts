@@ -181,6 +181,30 @@ async function testServerActivationAndCredits(): Promise<void> {
     const disabled = await getActivationStatusWithServerCheck()
     assert.equal(disabled.activated, false)
     assert.match(disabled.message || '', /禁用/)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: true,
+      success: true,
+      code_id: 'license-test-unlimited',
+      license_type: 'unlimited',
+      credits: 0,
+      unlimited: true,
+      status: 'active',
+      message: '激活成功'
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const unlimited = await activateWithCode('SERVER-UNLIMITED-TEST-CODE')
+    assert.equal(unlimited.ok, true)
+    assert.equal(unlimited.status.licenseType, 'unlimited')
+    assert.equal(unlimited.status.unlimited, true)
+    const unlimitedUse = consumeAnalysisCredit('analysis-session-unlimited')
+    assert.equal(unlimitedUse.ok, true)
+    assert.equal(unlimitedUse.status.unlimited, true)
+
+    const wrongDeviceRecord = JSON.parse(readFileSync(join(tempUserData, 'activation.json'), 'utf8')) as Record<string, unknown>
+    wrongDeviceRecord.deviceId = 'another-machine'
+    writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(wrongDeviceRecord), 'utf8')
+    writeFileSync(join(tempUserData, 'activation.json.bak'), JSON.stringify(wrongDeviceRecord), 'utf8')
+    assert.equal(getActivationStatus().activated, false)
   } finally {
     globalThis.fetch = originalFetch
     const deviceId = getActivationStatus().deviceId
@@ -213,7 +237,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         app_name: 'ProductOperationReport',
         version: '999.0.0',
         min_supported_version: '998.0.0',
-        download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.bin' },
+        download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
         sha256: { windows_x64: '0'.repeat(64) },
         notes: ['测试更新'],
         force: false
@@ -230,7 +254,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.bin' })
+      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.exe' })
       return response
     }) as typeof fetch
     const rejected = await downloadUpdate()
@@ -240,7 +264,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'ProductOperationReport',
       version: '999.0.1',
-      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.bin' },
+      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
       sha256: { windows_x64: correctChecksum },
       notes: '通过校验',
       force: false
@@ -254,7 +278,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.bin' })
+      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.exe' })
       return response
     }) as typeof fetch
     const accepted = await downloadUpdate()
@@ -264,6 +288,26 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response('{}', { status: 404 })) as typeof fetch
     const noConfig = await checkForUpdates()
     assert.equal(noConfig.available, false)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'ProductOperationReport',
+      version: '999.0.2',
+      download_url: { windows_x64: 'https://downloads.example.test/not-an-installer.html' },
+      sha256: { windows_x64: correctChecksum },
+      notes: [],
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await assert.rejects(checkForUpdates(), /\.exe/)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'AnotherProduct',
+      version: '999.0.3',
+      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
+      sha256: { windows_x64: correctChecksum },
+      notes: [],
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await assert.rejects(checkForUpdates(), /软件标识不匹配/)
   } finally {
     globalThis.fetch = originalFetch
   }
