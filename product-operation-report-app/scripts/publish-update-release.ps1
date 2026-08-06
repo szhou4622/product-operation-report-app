@@ -6,7 +6,8 @@ param(
   [switch]$Force,
   [string]$ServerHost = "124.174.46.12",
   [string]$ServerUser = "root",
-  [int]$ServerPort = 22
+  [int]$ServerPort = 22,
+  [string]$IdentityFile = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +29,19 @@ $remoteArchive = "/tmp/ProductOperationReport-update-$Version.zip"
 $remoteStage = "/tmp/ProductOperationReport-update-$Version"
 $scp = "$env:SystemRoot\System32\OpenSSH\scp.exe"
 $ssh = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
+$defaultIdentityFile = Join-Path $HOME '.ssh\ProductOperationReport-update-server-ed25519'
+
+if (-not $IdentityFile -and (Test-Path -LiteralPath $defaultIdentityFile -PathType Leaf)) {
+  $IdentityFile = $defaultIdentityFile
+}
+
+$sshAuthArgs = @()
+$scpAuthArgs = @()
+if ($IdentityFile) {
+  $resolvedIdentityFile = (Resolve-Path -LiteralPath $IdentityFile).Path
+  $sshAuthArgs = @('-i', $resolvedIdentityFile, '-o', 'BatchMode=yes')
+  $scpAuthArgs = @('-i', $resolvedIdentityFile, '-o', 'BatchMode=yes')
+}
 
 if (-not (Test-Path -LiteralPath $scp) -or -not (Test-Path -LiteralPath $ssh)) {
   throw 'Windows OpenSSH is required to upload the update release.'
@@ -69,13 +83,21 @@ try {
 
   Compress-Archive -Path (Join-Path $releaseStage '*') -DestinationPath $archivePath -CompressionLevel Optimal
 
-  Write-Host 'STEP 1/2: Uploading three installers. Enter the server password.' -ForegroundColor Cyan
-  & $scp -P $ServerPort $archivePath "${ServerUser}@${ServerHost}:$remoteArchive"
+  if ($IdentityFile) {
+    Write-Host 'STEP 1/2: Uploading three installers with the project SSH key.' -ForegroundColor Cyan
+  } else {
+    Write-Host 'STEP 1/2: Uploading three installers. Enter the server password.' -ForegroundColor Cyan
+  }
+  & $scp @scpAuthArgs -P $ServerPort $archivePath "${ServerUser}@${ServerHost}:$remoteArchive"
   if ($LASTEXITCODE -ne 0) { throw "Upload failed with exit code $LASTEXITCODE" }
 
-  Write-Host 'STEP 2/2: Verifying SHA256 and publishing atomically. Enter the password again.' -ForegroundColor Yellow
+  if ($IdentityFile) {
+    Write-Host 'STEP 2/2: Verifying SHA256 and publishing atomically.' -ForegroundColor Yellow
+  } else {
+    Write-Host 'STEP 2/2: Verifying SHA256 and publishing atomically. Enter the password again.' -ForegroundColor Yellow
+  }
   $remoteCommand = "set +e; rm -rf -- '$remoteStage'; mkdir -p -- '$remoteStage'; unzip -q '$remoteArchive' -d '$remoteStage'; rc=`$?; if [ `$rc -eq 0 ]; then bash '$remoteStage/deploy-update-release.sh'; rc=`$?; fi; rm -f -- '$remoteArchive'; rm -rf -- '$remoteStage'; exit `$rc"
-  & $ssh -tt -p $ServerPort "${ServerUser}@${ServerHost}" $remoteCommand
+  & $ssh @sshAuthArgs -tt -p $ServerPort "${ServerUser}@${ServerHost}" $remoteCommand
   if ($LASTEXITCODE -ne 0) { throw "Server deployment failed with exit code $LASTEXITCODE" }
 
   $endpoint = "https://update.dadaozixun.com/api/update/latest?app_name=ProductOperationReport"

@@ -92,7 +92,7 @@
 
 如果更新接口对该 `app_name` 返回 404，客户端会安静地视为“暂无更新”，不会给用户显示报错。
 
-## GitHub 自动发布到更新服务器
+## GitHub 自动发布到更新服务器（可选）
 
 仓库的 `.github/workflows/build-desktop.yml` 已增加 `publish-update-server`。推送 `v*` 标签后，它会在三个安装包和 GitHub Release 全部成功后：
 
@@ -118,6 +118,8 @@
 
 未配置 `AUTO_PUBLISH_UPDATE_SERVER=true` 时，只构建安装包和 GitHub Release，不会修改更新服务器。
 
+当前仓库默认将 `AUTO_PUBLISH_UPDATE_SERVER` 保持为 `false`。GitHub 继续负责三平台构建和 Release；构建完成后使用下方本机命令同步已校验的同版本资产。这样可以避免 GitHub Runner 跨境上传大文件过慢，不影响客户端自动检查更新。
+
 ## Windows 本机手动发布
 
 三个安装包已经放在 `dist` 后，可在项目目录执行：
@@ -126,10 +128,22 @@
 npm run update:publish -- -Version 0.2.7 -MinSupportedVersion 0.2.6
 ```
 
+脚本会优先使用：
+
+`%USERPROFILE%\.ssh\ProductOperationReport-update-server-ed25519`
+
+也可以显式指定另一把项目专用密钥：
+
+```powershell
+npm run update:publish -- -Version 0.2.7 -MinSupportedVersion 0.2.6 -IdentityFile 'C:\安全目录\项目专用密钥'
+```
+
 普通更新不要加 `-Force`。只有确实必须阻止旧版继续运行时才执行：
 
 ```powershell
 npm run update:publish -- -Version 0.3.2 -MinSupportedVersion 0.3.2 -Force
 ```
 
-本机发布会要求输入两次服务器密码：第一次上传，第二次校验并发布。密码不会写入脚本或日志。发布失败时不会替换线上 `latest.json`。
+找到项目专用密钥时，本机发布无需输入服务器密码；没有密钥时才会回退到密码登录。密钥和密码都不会写入仓库、更新清单或日志。发布脚本会在服务器核对 SHA256 后原子替换 `latest.json`，失败时不会覆盖线上版本。
+
+v0.2.5 本身没有自动更新模块，因此需要一次性手动安装 v0.2.6。安装 v0.2.6 后，今后发布 v0.2.7 及更高版本时，用户会在软件内收到更新提示，不再需要逐个发送下载链接。
