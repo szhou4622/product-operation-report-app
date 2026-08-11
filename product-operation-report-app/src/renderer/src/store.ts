@@ -1,8 +1,21 @@
 import { create } from 'zustand'
-import type { AppSettings, ChatMessage, ProjectPhase, SavedProject } from '../../shared/types'
+import type {
+  AppSettings,
+  ChatMessage,
+  CostOptimizationEvent,
+  ModelTaskContext,
+  ProjectPhase,
+  ReportResultCacheInput,
+  ReportResultCacheLookupResult,
+  ReportResultCacheSnapshot,
+  SavedProject,
+  SourceCleanCacheInput,
+  StepDependencyMap
+} from '../../shared/types'
 import { SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
 import { buildExtractMessages, buildFinalReportPartMessages, buildStepMessages, buildSummaryMessages, type PriorOutput } from './sop'
+import { buildLocalTableCleanDetail, preprocessTableForModel, sourceForModel } from './tablePreprocess'
 
 export interface Source {
   id: string
@@ -30,6 +43,17 @@ const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
 const MAX_SOURCE_FILES = 200
 
+export const STEP_DEPENDENCY_MAP: StepDependencyMap = Object.freeze({
+  1: Object.freeze([]),
+  2: Object.freeze([1]),
+  3: Object.freeze([1, 2]),
+  4: Object.freeze([1, 2, 3]),
+  5: Object.freeze([1, 4]),
+  6: Object.freeze([4, 5]),
+  7: Object.freeze([4, 5, 6]),
+  8: Object.freeze([5, 6, 7])
+})
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)}MB`
   if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`
@@ -54,6 +78,103 @@ export interface CleaningProgress {
 
 const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0 })
 const isRunningPhase = (phase: Phase): boolean => phase === 'cleaning' || phase === 'analyzing'
+
+function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
+  return {
+    name: source.name,
+    kind: source.kind,
+    text: source.text,
+    dataUrl: source.dataUrl,
+    attribution: source.attribution,
+    platform: source.platform,
+    purpose: source.purpose,
+    note: source.note
+  }
+}
+
+function reportResultCacheInput(sources: Source[], userRequirements: string): ReportResultCacheInput {
+  return {
+    sources: sources.filter((source) => source.dataUrl || source.text).map(toSourceCleanCacheInput),
+    userRequirements
+  }
+}
+
+function hasCompleteReportSections(markdown: string): boolean {
+  return Array.from({ length: 12 }, (_, section) =>
+    new RegExp(`^##\\s+${section}(?:\\.|、|\\s)`, 'mu').test(markdown)
+  ).every(Boolean)
+}
+
+function validReportCacheSnapshot(snapshot: ReportResultCacheSnapshot | undefined): snapshot is ReportResultCacheSnapshot {
+  if (!snapshot?.cleanedData.trim() || !snapshot.reportMarkdown.trim()) return false
+  if (!hasCompleteReportSections(snapshot.reportMarkdown)) return false
+  return Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => snapshot.artifacts[id]?.trim())
+}
+
+function snapshotForReportCache(state: StoreState): ReportResultCacheSnapshot | null {
+  if (!hasCompleteReportSections(state.reportMarkdown)) return null
+  if (!Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => state.artifacts[id]?.trim())) return null
+  const detailsById = new Map(state.cleanDetails.map((detail) => [detail.id, detail]))
+  const cleanDetails = state.sources.flatMap((source) => {
+    const detail = detailsById.get(source.id)
+    return detail ? [{ name: source.name, text: detail.text }] : []
+  })
+  if (cleanDetails.length !== state.sources.filter((source) => source.dataUrl || source.text).length) return null
+  return {
+    cleanedData: state.cleanedData,
+    cleanDetails,
+    artifacts: { ...state.artifacts },
+    reportMarkdown: state.reportMarkdown
+  }
+}
+
+async function storeCompleteReportResult(state: StoreState): Promise<void> {
+  const snapshot = snapshotForReportCache(state)
+  if (!snapshot) return
+  await window.api.storeReportResultCache(
+    reportResultCacheInput(state.sources, state.steering),
+    snapshot
+  )
+}
+
+function optimizationEvent(
+  id: string,
+  reportSessionId: string,
+  type: CostOptimizationEvent['type'],
+  values: Partial<Pick<CostOptimizationEvent, 'localCompletedFiles' | 'sourceCacheHits' | 'skippedModelRequests' | 'reusedReports'>>
+): CostOptimizationEvent {
+  return {
+    schemaVersion: 1,
+    id,
+    reportSessionId,
+    type,
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: values.localCompletedFiles || 0,
+    sourceCacheHits: values.sourceCacheHits || 0,
+    skippedModelRequests: values.skippedModelRequests || 0,
+    reusedReports: values.reusedReports || 0
+  }
+}
+
+async function recordOptimizationEvent(event: CostOptimizationEvent): Promise<void> {
+  const api = window.api as typeof window.api & {
+    recordCostOptimization?: typeof window.api.recordCostOptimization
+  }
+  if (typeof api.recordCostOptimization !== 'function') return
+  await api.recordCostOptimization(event).catch(() => undefined)
+}
+
+export function priorOutputsForStep(
+  stepId: number,
+  artifacts: Record<number, string>
+): PriorOutput[] {
+  const dependencies = STEP_DEPENDENCY_MAP[stepId] || []
+  return dependencies.flatMap((id) => {
+    const output = artifacts[id]
+    const step = SOP_STEPS.find((candidate) => candidate.id === id)
+    return output && step ? [{ id, title: `第${id}步 ${step.title}`, output }] : []
+  })
+}
 
 export function friendlyError(value: unknown): string {
   const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
@@ -545,9 +666,17 @@ async function runFinalReportInParts(params: {
   setAbort: (fn: (() => void) | null) => void
   onProgress: (text: string) => void
   onRetry: (partLabel: string, n: number) => void
+  taskContext: {
+    reportSessionId: string
+    taskType: 'final_part' | 'revision_part'
+    taskKeyPrefix: string
+    sourceCount: number
+    imageCount: number
+  }
+  parts?: typeof FINAL_REPORT_PARTS
 }): Promise<{ ok: boolean; text: string; error?: string }> {
   let full = ''
-  for (const part of FINAL_REPORT_PARTS) {
+  for (const part of params.parts || FINAL_REPORT_PARTS) {
     const messages = buildFinalReportPartMessages({
       part,
       cleanedData: params.cleanedData,
@@ -563,7 +692,16 @@ async function runFinalReportInParts(params: {
       },
       params.setAbort,
       (n) => params.onRetry(part.label, n),
-      2
+      2,
+      {
+        reportSessionId: params.taskContext.reportSessionId,
+        taskType: params.taskContext.taskType,
+        taskKey: `${params.taskContext.taskKeyPrefix}:${part.id}`,
+        isVision: false,
+        sourceCount: params.taskContext.sourceCount,
+        imageCount: params.taskContext.imageCount,
+        partId: part.id
+      }
     )
     if (!res.ok) return { ok: false, text: full + current, error: res.error }
     full = `${full}${res.text.trim()}\n\n`
@@ -572,11 +710,103 @@ async function runFinalReportInParts(params: {
   return { ok: true, text: full.trim() }
 }
 
+const REVISION_PART_KEYWORDS: Record<(typeof FINAL_REPORT_PARTS)[number]['id'], RegExp> = {
+  'part-0-4': /结论|数据来源|产品基础|一方数据|竞品|素材打法/u,
+  'part-5-8': /卖点|人群|场景|内容主线/u,
+  'part-9': /脚本|选题|3\s*秒|执行方向|视频分类|创作视角/u,
+  'part-10-11': /经营建议|行动建议|限制|风险|近期|中期|验证项/u
+}
+
+function partForSection(section: number): (typeof FINAL_REPORT_PARTS)[number] | undefined {
+  return FINAL_REPORT_PARTS.find((part) => part.sections.includes(String(section)))
+}
+
+export function selectRevisionParts(feedback: string): typeof FINAL_REPORT_PARTS {
+  const selected = new Set<string>()
+  for (const match of feedback.matchAll(/(?:第\s*)?(10|11|[0-9])\s*[-—至到]\s*(10|11|[0-9])\s*章/gu)) {
+    const start = Number(match[1])
+    const end = Number(match[2])
+    for (let section = Math.min(start, end); section <= Math.max(start, end); section++) {
+      const part = partForSection(section)
+      if (part) selected.add(part.id)
+    }
+  }
+  for (const match of feedback.matchAll(/(?:第\s*)?(10|11|[0-9])\s*章/gu)) {
+    const part = partForSection(Number(match[1]))
+    if (part) selected.add(part.id)
+  }
+  if (!selected.size) {
+    for (const part of FINAL_REPORT_PARTS) {
+      if (REVISION_PART_KEYWORDS[part.id].test(feedback)) selected.add(part.id)
+    }
+  }
+  return selected.size
+    ? (FINAL_REPORT_PARTS.filter((part) => selected.has(part.id)) as typeof FINAL_REPORT_PARTS)
+    : FINAL_REPORT_PARTS
+}
+
+function sectionHeadingStart(markdown: string, section: string): number {
+  const escaped = section.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  const match = new RegExp(`^##\\s*${escaped}(?:[.、：:\\s]|$)`, 'mu').exec(markdown)
+  return match?.index ?? -1
+}
+
+function partBounds(
+  markdown: string,
+  part: (typeof FINAL_REPORT_PARTS)[number]
+): { start: number; end: number; text: string } | null {
+  for (const section of part.sections) {
+    if (sectionHeadingStart(markdown, section) < 0) return null
+  }
+  const start = part.id === 'part-0-4' ? 0 : sectionHeadingStart(markdown, part.sections[0])
+  if (start < 0) return null
+  const laterBoundaries = part.id === 'part-0-4'
+    ? ['5', '9', '10']
+    : part.id === 'part-5-8'
+      ? ['9', '10']
+      : part.id === 'part-9'
+        ? ['10']
+        : []
+  const ends = laterBoundaries.map((section) => sectionHeadingStart(markdown, section)).filter((index) => index > start)
+  const end = ends.length ? Math.min(...ends) : markdown.length
+  return { start, end, text: markdown.slice(start, end).trim() }
+}
+
+function extractedPart(markdown: string, part: (typeof FINAL_REPORT_PARTS)[number]): string | null {
+  return partBounds(markdown, part)?.text ?? null
+}
+
+export function mergeRevisionParts(
+  previousReport: string,
+  generatedParts: string,
+  selectedParts: typeof FINAL_REPORT_PARTS
+): string | null {
+  let merged = previousReport
+  const replacements = selectedParts.map((part) => ({
+    part,
+    previous: partBounds(previousReport, part),
+    replacement: extractedPart(generatedParts, part)
+  }))
+  if (replacements.some((item) => !item.previous || !item.replacement)) return null
+  const positions = replacements.map((item) => {
+    const previous = item.previous!
+    return { ...item, start: previous.start, end: previous.end }
+  }).sort((a, b) => b.start - a.start)
+  for (const item of positions) {
+    const before = merged.slice(0, item.start)
+    const after = merged.slice(item.end)
+    const separator = after && !item.replacement!.endsWith('\n\n') ? '\n\n' : ''
+    merged = `${before}${item.replacement!.trim()}${separator}${after}`
+  }
+  return merged.trim()
+}
+
 // 包装流式调用为 Promise，并暴露中止函数
 function runModel(
   messages: ChatMessage[],
   onAcc: (acc: string) => void,
-  setAbort: (fn: (() => void) | null) => void
+  setAbort: (fn: (() => void) | null) => void,
+  context: ModelTaskContext
 ): Promise<{ ok: boolean; text: string; error?: string }> {
   return new Promise((resolve) => {
     let acc = ''
@@ -603,7 +833,7 @@ function runModel(
       resolve(r)
     }
     try {
-      const handle = window.api.sendChat(messages, {
+      const handle = window.api.sendChat(messages, context, {
         onChunk: (d) => {
           acc += d
           if (publishTimer === null) {
@@ -632,9 +862,11 @@ async function runModelRetry(
   onAcc: (acc: string) => void,
   setAbort: (fn: (() => void) | null) => void,
   onRetry?: (n: number) => void,
-  retries = 2
+  retries = 2,
+  taskContext?: Omit<ModelTaskContext, 'attempt'>
 ): Promise<{ ok: boolean; text: string; error?: string }> {
-  let res = await runModel(messages, onAcc, setAbort)
+  if (!taskContext) throw new Error('模型任务缺少必要标识。')
+  let res = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: 1 })
   let n = 0
   while (
     !res.ok &&
@@ -659,7 +891,7 @@ async function runModelRetry(
       setAbort(null)
       if (stopped) return { ok: false, text: '', error: '已停止' }
     }
-    res = await runModel(messages, onAcc, setAbort)
+    res = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: n + 1 })
   }
   return res
 }
@@ -678,6 +910,7 @@ interface StoreState {
   previousProjectAvailable: boolean
   settings: AppSettings | null
   settingsOpen: boolean
+  reportReuseOffer: ReportResultCacheLookupResult | null
   sopRules: string
   sources: Source[]
   phase: Phase
@@ -707,6 +940,8 @@ interface StoreState {
   setSourcePurpose: (id: string, purpose: string) => void
   setSourceNote: (id: string, note: string) => void
   startGeneration: () => Promise<void>
+  acceptReportReuse: () => Promise<void>
+  regenerateReport: () => Promise<void>
   confirmCheckpoint: () => Promise<void>
   sendMessage: (text: string) => Promise<boolean>
   abort: () => void
@@ -717,20 +952,22 @@ interface StoreState {
   // 内部
   _post: (role: ChatMsg['role'], text: string, kind?: ChatMsg['kind']) => string
   _update: (id: string, text: string) => void
+  _startPaidGeneration: () => Promise<void>
   _runCleaning: (isRerun: boolean) => Promise<void>
   _runAnalysis: () => Promise<void>
-  _rerunReport: () => Promise<void>
+  _rerunReport: (latestFeedback?: string) => Promise<void>
 }
 
 const invalidatedAnalysis = (): Pick<
   StoreState,
-  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress'
+  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress' | 'reportReuseOffer'
 > => ({
   cleanedData: '',
   phase: 'idle',
   abortFn: null,
   exportStatus: '',
-  cleaningProgress: emptyCleaningProgress()
+  cleaningProgress: emptyCleaningProgress(),
+  reportReuseOffer: null
 })
 
 const preserveCommittedReport = (
@@ -752,6 +989,7 @@ export const useStore = create<StoreState>((set, get) => ({
   previousProjectAvailable: false,
   settings: null,
   settingsOpen: false,
+  reportReuseOffer: null,
   sopRules: '',
   sources: [],
   phase: 'idle',
@@ -812,6 +1050,7 @@ export const useStore = create<StoreState>((set, get) => ({
       settings,
       sopRules,
       settingsOpen: settings.managedModel?.enabled ? !settings.managedModel.configured : !settings.profiles.length,
+      reportReuseOffer: null,
       sources: lastProject
         ? lastProject.sources.map((source) => ({
             ...source,
@@ -865,6 +1104,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleaningProgress: current.cleaningProgress,
       projectRevision: current.projectRevision,
       analysisSessionId: current.analysisSessionId,
+      reportReuseOffer: null,
       previousProjectAvailable: true,
       persistencePaused: false
     }
@@ -886,6 +1126,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleaningProgress: emptyCleaningProgress(),
       projectRevision: nextRevision,
       analysisSessionId: crypto.randomUUID(),
+      reportReuseOffer: null,
       previousProjectAvailable: true,
       persistencePaused: true
     }
@@ -976,6 +1217,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleaningProgress: emptyCleaningProgress(),
       projectRevision: current.projectRevision + 1,
       analysisSessionId: crypto.randomUUID(),
+      reportReuseOffer: null,
       previousProjectAvailable: false,
       persistencePaused: true
     }
@@ -1328,17 +1570,96 @@ export const useStore = create<StoreState>((set, get) => ({
     ),
 
   startGeneration: async () => {
-    const { settings, sources, phase } = get()
+    const { sources, phase } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
-    const licenseApi = window.api as typeof window.api & {
-      canStartLicensedAnalysis?: typeof window.api.canStartLicensedAnalysis
+    if (sources.some((s) => s.parsing)) {
+      get()._post('assistant', '还有文件正在本地解析，请等解析完成后再开始生成。', 'narration')
+      return
     }
-    if (typeof licenseApi.canStartLicensedAnalysis === 'function') {
-      const license = await licenseApi.canStartLicensedAnalysis()
-      if (!license.ok) {
-        get()._post('assistant', license.message, 'error')
+    const unconfirmed = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution)
+    if (unconfirmed.length) {
+      get()._post('assistant', `还有 ${unconfirmed.length} 份资料没有确认归属。请在文件下方点“自有数据”或“竞品数据”。`, 'narration')
+      return
+    }
+    if (!sources.some((s) => s.dataUrl || s.text)) {
+      get()._post('assistant', '还没有可用的资料。请先上传截图/表格/文档/zip/文件夹，再点「开始生成」。', 'narration')
+      return
+    }
+    try {
+      const cached = await window.api.lookupReportResultCache(reportResultCacheInput(sources, get().steering))
+      if (cached.hit && validReportCacheSnapshot(cached.snapshot)) {
+        set({ reportReuseOffer: cached })
         return
       }
+    } catch {
+      // 缓存不可读、版本不匹配或已损坏时自动正常生成。
+    }
+    await get()._startPaidGeneration()
+  },
+
+  acceptReportReuse: async () => {
+    const offer = get().reportReuseOffer
+    if (!offer || !validReportCacheSnapshot(offer.snapshot)) {
+      set({ reportReuseOffer: null })
+      get()._post('assistant', '上次报告缓存已失效，将按正常流程重新生成。', 'narration')
+      await get()._startPaidGeneration()
+      return
+    }
+    const usable = get().sources.filter((source) => source.dataUrl || source.text)
+    if (
+      usable.length !== offer.snapshot.cleanDetails.length ||
+      usable.some((source, index) => source.name !== offer.snapshot!.cleanDetails[index]?.name)
+    ) {
+      set({ reportReuseOffer: null })
+      get()._post('assistant', '资料已发生变化，无法复用旧报告，将按正常流程重新生成。', 'narration')
+      await get()._startPaidGeneration()
+      return
+    }
+    const sessionId = get().analysisSessionId
+    set({
+      reportReuseOffer: null,
+      cleanedData: offer.snapshot.cleanedData,
+      cleanDetails: usable.map((source, index) => ({
+        id: source.id,
+        name: source.name,
+        text: offer.snapshot!.cleanDetails[index].text
+      })),
+      artifacts: { ...offer.snapshot.artifacts },
+      reportMarkdown: offer.snapshot.reportMarkdown,
+      reportStale: false,
+      phase: 'checkpoint2',
+      abortFn: null,
+      cleaningProgress: emptyCleaningProgress()
+    })
+    get()._post('assistant', '✅ 已恢复上次的完整报告。请核对后点击「确认定稿」。', 'checkpoint')
+    void recordOptimizationEvent(
+      optimizationEvent(`report-reuse:${sessionId}:${offer.cacheKey}`, sessionId, 'report_cache_reuse', {
+        // 汇总 1 次 + 分析 8 次 + 四段成稿 4 次；文件清洗可能本来也会走本地缓存，因此不计入。
+        skippedModelRequests: 13,
+        reusedReports: 1
+      })
+    )
+  },
+
+  regenerateReport: async () => {
+    set({ reportReuseOffer: null })
+    await get()._startPaidGeneration()
+  },
+
+  _startPaidGeneration: async () => {
+    const { settings, sources, phase } = get()
+    if (phase === 'cleaning' || phase === 'analyzing') return
+    let startingPoints: number | undefined
+    const pointsApi = window.api as typeof window.api & {
+      canStartPointsReport?: typeof window.api.canStartPointsReport
+    }
+    if (typeof pointsApi.canStartPointsReport === 'function') {
+      const access = await pointsApi.canStartPointsReport()
+      if (!access.ok) {
+        get()._post('assistant', access.message, 'error')
+        return
+      }
+      startingPoints = access.wallet.balancePoints
     }
     const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
     const profile =
@@ -1362,20 +1683,14 @@ export const useStore = create<StoreState>((set, get) => ({
       get()._post('assistant', '开始前请先确认资料将发送到当前模型服务。完成隐私确认后再点“开始生成报告”。', 'error')
       return
     }
-    if (sources.some((s) => s.parsing)) {
-      get()._post('assistant', '还有文件正在本地解析，请等解析完成后再开始生成。', 'narration')
-      return
+    if (startingPoints !== undefined) {
+      get()._post(
+        'assistant',
+        `当前剩余 ${startingPoints.toLocaleString('zh-CN', { maximumFractionDigits: 3 })} 积分，正在准备生成报告。`,
+        'narration'
+      )
     }
-    const unconfirmed = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution)
-    if (unconfirmed.length) {
-      get()._post('assistant', `还有 ${unconfirmed.length} 份资料没有确认归属。请在文件下方点“自有数据”或“竞品数据”。`, 'narration')
-      return
-    }
-    if (!sources.some((s) => s.dataUrl || s.text)) {
-      get()._post('assistant', '还没有可用的资料。请先上传截图/表格/文档/zip/文件夹，再点「开始生成」。', 'narration')
-      return
-    }
-    set((state) => preserveCommittedReport(state))
+    set((state) => ({ ...preserveCommittedReport(state), reportReuseOffer: null }))
     try {
       await get()._runCleaning(false)
     } catch (error) {
@@ -1390,6 +1705,8 @@ export const useStore = create<StoreState>((set, get) => ({
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'cleaning', cleanedData: '' })
     const usable = get().sources.filter((s) => s.dataUrl || s.text)
+    const sourceCount = usable.length
+    const imageCount = usable.filter((s) => s.kind === 'image').length
     const usableIds = new Set(usable.map((s) => s.id))
     // 丢掉已删除文件的旧明细；只抽取还没处理过的文件（支持中断续跑 / 补传后只洗新文件）
     set((st) => ({ cleanDetails: st.cleanDetails.filter((d) => usableIds.has(d.id)) }))
@@ -1430,11 +1747,75 @@ export const useStore = create<StoreState>((set, get) => ({
             }
           }))
           get()._post('assistant', `⏳ 清洗：${s.name}`, 'narration')
+          const cacheInput = toSourceCleanCacheInput(s)
+          try {
+            const cached = await window.api.lookupSourceCleanCache(cacheInput)
+            if (!isCurrentSession()) return
+            if (cached.hit && cached.text) {
+              set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cached.text! }] }))
+              set((st) => ({
+                cleaningProgress: {
+                  ...st.cleaningProgress,
+                  done: st.cleaningProgress.done + 1,
+                  running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                }
+              }))
+              get()._post('assistant', `♻️ 已复用本机清洗结果：${s.name}`, 'narration')
+              await recordOptimizationEvent(
+                optimizationEvent(`source-cache:${sessionId}:${s.id}`, sessionId, 'source_cache_hit', {
+                  sourceCacheHits: 1,
+                  skippedModelRequests: 1
+                })
+              )
+              continue
+            }
+          } catch {
+            // 缓存异常不应影响报告生成，继续走原模型清洗流程。
+          }
+          if (s.kind === 'table' && cacheInput.text) {
+            const localResult = preprocessTableForModel(cacheInput.text)
+            const localDetail = buildLocalTableCleanDetail(cacheInput, localResult)
+            if (localDetail) {
+              set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: localDetail }] }))
+              try {
+                await window.api.storeSourceCleanCache(cacheInput, localDetail)
+              } catch {
+                // 本次本地清洗已经完成，缓存写入失败只影响下次复用。
+              }
+              set((st) => ({
+                cleaningProgress: {
+                  ...st.cleaningProgress,
+                  done: st.cleaningProgress.done + 1,
+                  running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                }
+              }))
+              get()._post('assistant', `✅ 本机已整理结构化表格：${s.name}`, 'narration')
+              await recordOptimizationEvent(
+                optimizationEvent(`local-clean:${sessionId}:${s.id}`, sessionId, 'local_source_clean', {
+                  localCompletedFiles: 1,
+                  skippedModelRequests: 1
+                })
+              )
+              continue
+            }
+          }
+          const modelSource = sourceForModel(cacheInput)
           const res = await runModelRetry(
-            buildExtractMessages(toSourceLike(s)),
+            buildExtractMessages(modelSource),
             () => {},
             (fn) => {
               if (fn) aborts.add(fn)
+            },
+            undefined,
+            2,
+            {
+              reportSessionId: sessionId,
+              taskType: 'source_clean',
+              taskKey: `${sessionId}:source_clean:${s.id}`,
+              isVision: s.kind === 'image',
+              sourceCount,
+              imageCount,
+              sourceId: s.id
             }
           )
           if (!isCurrentSession()) return
@@ -1450,6 +1831,11 @@ export const useStore = create<StoreState>((set, get) => ({
             return
           }
           set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: res.text }] }))
+          try {
+            await window.api.storeSourceCleanCache(cacheInput, res.text)
+          } catch {
+            // 写缓存失败只影响下次复用，不影响本次分析结果。
+          }
           set((st) => ({
             cleaningProgress: {
               ...st.cleaningProgress,
@@ -1494,6 +1880,15 @@ export const useStore = create<StoreState>((set, get) => ({
       },
       (n) => {
         if (isCurrentSession()) get()._post('assistant', `汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
+      },
+      2,
+      {
+        reportSessionId: sessionId,
+        taskType: 'summary',
+        taskKey: `${sessionId}:summary`,
+        isVision: false,
+        sourceCount,
+        imageCount
       }
     )
     if (!isCurrentSession()) return
@@ -1532,11 +1927,13 @@ export const useStore = create<StoreState>((set, get) => ({
       // 已完成的非成稿步骤直接跳过（支持中断后续跑）
       if (!isReportStep && get().artifacts[step.id]) continue
 
-      const priorOutputs = SOP_STEPS.filter((s) => s.id < step.id && get().artifacts[s.id]).map((s) => ({
-        id: s.id,
-        title: `第${s.id}步 ${s.title}`,
-        output: isReportStep ? compactForFinalReport(get().artifacts[s.id]) : get().artifacts[s.id]
-      }))
+      const priorOutputs = isReportStep
+        ? SOP_STEPS.filter((s) => s.id < step.id && get().artifacts[s.id]).map((s) => ({
+            id: s.id,
+            title: `第${s.id}步 ${s.title}`,
+            output: compactForFinalReport(get().artifacts[s.id])
+          }))
+        : priorOutputsForStep(step.id, get().artifacts)
       if (isReportStep) {
         const previousReport = get().reportMarkdown
         const reportFeedback = get().steering
@@ -1553,6 +1950,13 @@ export const useStore = create<StoreState>((set, get) => ({
           },
           onRetry: (partLabel, n) => {
             if (isCurrentSession()) get()._post('assistant', `成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+          },
+          taskContext: {
+            reportSessionId: sessionId,
+            taskType: 'final_part',
+            taskKeyPrefix: `${sessionId}:final_part`,
+            sourceCount: get().sources.length,
+            imageCount: get().sources.filter((source) => source.kind === 'image').length
           }
         })
         if (!isCurrentSession()) return
@@ -1592,7 +1996,17 @@ export const useStore = create<StoreState>((set, get) => ({
           messages,
           () => {},
           (fn) => set({ abortFn: fn }),
-          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration')
+          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
+          2,
+          {
+            reportSessionId: sessionId,
+            taskType: 'analysis_step',
+            taskKey: `${sessionId}:analysis_step:${step.id}`,
+            isVision: false,
+            sourceCount: get().sources.length,
+            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            stepId: String(step.id)
+          }
         )
         if (!isCurrentSession()) return
         if (!res.ok) {
@@ -1611,18 +2025,24 @@ export const useStore = create<StoreState>((set, get) => ({
       }
     }
     if (!isCurrentSession()) return
-    const licenseApi = window.api as typeof window.api & {
-      consumeAnalysisCredit?: typeof window.api.consumeAnalysisCredit
-    }
-    if (typeof licenseApi.consumeAnalysisCredit === 'function') {
-      try {
-        const usage = await licenseApi.consumeAnalysisCredit(sessionId)
-        if (!usage.ok) get()._post('assistant', `报告已生成，但积分记录失败：${usage.message}`, 'error')
-      } catch {
-        get()._post('assistant', '报告已生成，但暂时无法更新积分显示；重新打开软件后会自动恢复。', 'error')
-      }
-    }
     set({ phase: 'checkpoint2' })
+    try {
+      await storeCompleteReportResult(get())
+    } catch {
+      // 完整报告已生成；缓存失败不能影响本次结果和积分结算。
+    }
+    try {
+      await window.api.getReportPointsCharge(sessionId)
+      if (!isCurrentSession()) return
+      get()._post(
+        'assistant',
+        '报告已完成，剩余积分可在页面顶部查看。',
+        'narration'
+      )
+    } catch {
+      if (!isCurrentSession()) return
+      get()._post('assistant', '报告已完成，剩余积分可在页面顶部查看。', 'narration')
+    }
     get()._post(
       'assistant',
       '✅ 报告初稿已生成（右侧）。需要改哪里直接说（如：经营建议再具体、第 9 步选题加几条），或点「确认定稿」。',
@@ -1630,13 +2050,24 @@ export const useStore = create<StoreState>((set, get) => ({
     )
   },
 
-  _rerunReport: async () => {
+  _rerunReport: async (latestFeedback) => {
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     const { sopRules, cleanedData, steering, artifacts } = get()
-    const reportFeedback = steering
+    const steeringAtStart = steering
+    const reportFeedback = latestFeedback?.trim() || steering
     const previousReport = get().reportMarkdown
+    const selectedParts = previousReport.trim() ? selectRevisionParts(reportFeedback) : FINAL_REPORT_PARTS
+    const partialRevision = selectedParts.length < FINAL_REPORT_PARTS.length
+    const revisionRunId = crypto.randomUUID()
     set({ phase: 'analyzing' })
+    if (partialRevision) {
+      get()._post(
+        'assistant',
+        `本次只重写：${selectedParts.map((part) => part.label).join('、')}；其他章节保持不变。`,
+        'narration'
+      )
+    }
     const priorOutputs = SOP_STEPS.filter((s) => s.id < REPORT_STEP_ID && artifacts[s.id]).map((s) => ({
       id: s.id,
       title: `第${s.id}步 ${s.title}`,
@@ -1650,11 +2081,19 @@ export const useStore = create<StoreState>((set, get) => ({
         if (isCurrentSession()) set({ abortFn: fn })
       },
       onProgress: (text) => {
-        if (isCurrentSession()) set({ reportMarkdown: text })
+        if (isCurrentSession() && !partialRevision) set({ reportMarkdown: text })
       },
       onRetry: (partLabel, n) => {
         if (isCurrentSession()) get()._post('assistant', `修订成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
-      }
+      },
+      taskContext: {
+        reportSessionId: sessionId,
+        taskType: 'revision_part',
+        taskKeyPrefix: `${sessionId}:revision:${revisionRunId}`,
+        sourceCount: get().sources.length,
+        imageCount: get().sources.filter((source) => source.kind === 'image').length
+      },
+      parts: selectedParts
     })
     if (!isCurrentSession()) return
     if (!res.ok) {
@@ -1666,19 +2105,43 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
       return
     }
-    if (get().steering !== reportFeedback) {
+    if (get().steering !== steeringAtStart) {
       set({ reportMarkdown: previousReport })
       get()._post('assistant', '检测到修订期间又有新要求，正在继续按最新要求修订。', 'narration')
       await get()._rerunReport()
       return
     }
+    const nextReport = partialRevision
+      ? mergeRevisionParts(previousReport, res.text, selectedParts)
+      : res.text
+    if (!nextReport) {
+      get()._post('assistant', '局部修订返回的章节不完整，已保留上一份完整报告，请重试。', 'error')
+      set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
+      return
+    }
     set((s) => ({
-      artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
-      reportMarkdown: res.text,
+      artifacts: { ...s.artifacts, [REPORT_STEP_ID]: nextReport },
+      reportMarkdown: nextReport,
       reportStale: false,
       phase: 'checkpoint2'
     }))
-    get()._post('assistant', '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。', 'checkpoint')
+    try {
+      await storeCompleteReportResult(get())
+    } catch {
+      // 修订结果已保存到项目；复用缓存失败不影响本次报告。
+    }
+    try {
+      await window.api.getReportPointsCharge(sessionId)
+      if (!isCurrentSession()) return
+      get()._post(
+        'assistant',
+        '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。剩余积分可在页面顶部查看。',
+        'checkpoint'
+      )
+    } catch {
+      if (!isCurrentSession()) return
+      get()._post('assistant', '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。剩余积分可在页面顶部查看。', 'checkpoint')
+    }
   },
 
   confirmCheckpoint: async () => {
@@ -1733,7 +2196,7 @@ export const useStore = create<StoreState>((set, get) => ({
       if (phase === 'checkpoint2' || phase === 'done') {
         set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
         get()._post('assistant', '好的，按你的要求修订报告……', 'narration')
-        await get()._rerunReport()
+        await get()._rerunReport(t)
         return true
       }
       set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))

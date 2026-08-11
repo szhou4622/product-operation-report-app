@@ -1,0 +1,5 @@
+export const MODEL_RUNTIME_RULES_VERSION = 'runtime-rules-v1'
+export const REPORT_PROMPT_VERSION = 'report-prompt-v0.3.2'
+export const REPORT_TEMPLATE_VERSION = 'report-template-v0.3.2'
+export const SOURCE_CLEAN_PROMPT_VERSION = 'source-clean-v3'
+export const TABLE_DIGEST_VERSION = 'table-digest-v2'

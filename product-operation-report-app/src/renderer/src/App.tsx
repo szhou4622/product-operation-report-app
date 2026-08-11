@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import type { ActivationStatus, UpdateDownloadProgress, UpdateInfo } from '../../shared/types'
+import type { ActivationStatus, PointsWalletStatus, UpdateDownloadProgress, UpdateInfo } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
 import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
+import ReportReuseModal from './components/ReportReuseModal'
 
 const SOP_GUIDE_URL =
   'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
@@ -29,6 +30,10 @@ function openExternalLink(url: string): void {
     return
   }
   window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function formatPoints(value: number): string {
+  return Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
 }
 
 function ProductLogo(): JSX.Element {
@@ -76,6 +81,7 @@ export default function App(): JSX.Element {
   const restorePreviousAnalysis = useStore((s) => s.restorePreviousAnalysis)
   const previousProjectAvailable = useStore((s) => s.previousProjectAvailable)
   const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null)
+  const [pointsWallet, setPointsWallet] = useState<PointsWalletStatus | null>(null)
   const [activationCode, setActivationCode] = useState('')
   const [activationError, setActivationError] = useState('')
   const [activationBusy, setActivationBusy] = useState(false)
@@ -133,6 +139,7 @@ export default function App(): JSX.Element {
   }, [])
 
   useEffect(() => window.api.onActivationStatusChanged(setActivationStatus), [])
+  useEffect(() => window.api.onPointsWalletChanged(setPointsWallet), [])
 
   useEffect(() => {
     if ((!activationStatus?.activated && activationStatus?.source !== 'server') || activationRefreshAttempted.current) return
@@ -158,6 +165,11 @@ export default function App(): JSX.Element {
       setInitError(friendlyUiError(error, '初始化软件失败，请重试。'))
     })
   }, [activationStatus?.activated, init, initialized])
+
+  useEffect(() => {
+    if (!activationStatus?.activated) return
+    void window.api.getPointsWallet().then(setPointsWallet).catch(() => undefined)
+  }, [activationStatus?.activated, activationStatus?.licenseId])
 
   useEffect(() => {
     if (!initialized || !settings || persistencePaused) return
@@ -237,11 +249,11 @@ export default function App(): JSX.Element {
     settings && modelConfigured && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
   )
   const updateVisible = Boolean(updateInfo?.available && !updateDismissed)
-  const licenseLabel = activationStatus?.unlimited
-    ? '无限授权'
-    : activationStatus?.licenseType === 'credits'
-      ? `剩余 ${activationStatus?.creditsRemaining ?? 0} 积分`
-      : '已授权'
+  const licenseLabel = pointsWallet
+    ? pointsWallet.balancePoints < 0
+      ? `欠费 ${formatPoints(Math.abs(pointsWallet.balancePoints))} 积分`
+      : `剩余 ${formatPoints(pointsWallet.balancePoints)} 积分`
+    : '积分加载中'
 
   useEffect(() => {
     if (
@@ -377,8 +389,9 @@ export default function App(): JSX.Element {
     setReplacementBusy(true)
     setReplacementError('')
     try {
-      const result = await window.api.activate(replacementCode)
-      setActivationStatus(result.status)
+      const result = await window.api.redeemPointsCode(replacementCode)
+      setActivationStatus(result.activation)
+      setPointsWallet(result.wallet)
       if (result.ok) {
         setReplacementCode('')
         setLicenseEntryOpen(false)
@@ -386,7 +399,7 @@ export default function App(): JSX.Element {
         setReplacementError(result.message)
       }
     } catch (error) {
-      setReplacementError(friendlyUiError(error, '激活失败，请检查网络后重试。'))
+      setReplacementError(friendlyUiError(error, '充值失败，请检查网络后重试。'))
     } finally {
       setReplacementBusy(false)
     }
@@ -517,6 +530,9 @@ export default function App(): JSX.Element {
             <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
           </div>
           <div className="activation-note">如果激活遇到问题，把设备码发给管理员即可。</div>
+          {activationStatus.message?.includes('解除绑定') && (
+            <div className="activation-notice" role="status">{activationStatus.message}</div>
+          )}
           {activationError && <div className="activation-error">{activationError}</div>}
           <button className="btn primary activation-submit" disabled={activationBusy}>
             {activationBusy ? '正在激活...' : '激活并进入软件'}
@@ -639,9 +655,9 @@ export default function App(): JSX.Element {
             </button>
           )}
           <button
-            className={`license-pill${activationStatus.offline ? ' offline' : ''}${activationStatus.creditsRemaining === 0 ? ' empty' : ''}`}
+            className={`license-pill${activationStatus.offline ? ' offline' : ''}${(pointsWallet?.balancePoints ?? 0) <= 0 ? ' empty' : ''}`}
             type="button"
-            title={activationStatus.message || '查看授权状态或输入新的激活码'}
+            title={activationStatus.message || '查看积分余额或输入充值码'}
             onClick={() => {
               setReplacementError('')
               setLicenseEntryOpen(true)
@@ -723,27 +739,24 @@ export default function App(): JSX.Element {
       </div>
 
       <SettingsModal />
+      <ReportReuseModal />
 
       {licenseEntryOpen && (
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="license-entry-title">
           <form className="privacy-card license-entry-card" onSubmit={(event) => void submitReplacementActivation(event)}>
-            <div className="privacy-kicker">授权管理</div>
-            <h2 id="license-entry-title">输入新的激活码</h2>
-            <p>新激活码校验成功后会替换当前授权；校验失败不会影响现在的授权。</p>
+            <div className="privacy-kicker">积分余额</div>
+            <h2 id="license-entry-title">剩余 {formatPoints(pointsWallet?.balancePoints ?? 0)} 积分</h2>
+            <p>如需充值，请输入管理员发放的积分码。</p>
             <label className="activation-field">
-              <span>激活码</span>
+              <span>积分充值码</span>
               <input
                 autoFocus
                 value={replacementCode}
                 onChange={(event) => setReplacementCode(event.target.value.toUpperCase())}
-                placeholder="请输入管理员发放的激活码"
+                placeholder="请输入管理员发放的积分码"
                 spellCheck={false}
               />
             </label>
-            <div className="activation-device">
-              <span>当前设备码</span>
-              <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
-            </div>
             {replacementError && <div className="privacy-error">{replacementError}</div>}
             <div className="privacy-actions">
               <button
@@ -758,7 +771,7 @@ export default function App(): JSX.Element {
                 取消
               </button>
               <button className="btn primary" disabled={replacementBusy || !replacementCode.trim()}>
-                {replacementBusy ? '正在校验…' : '校验并启用'}
+                {replacementBusy ? '正在充值…' : '充值积分'}
               </button>
             </div>
           </form>

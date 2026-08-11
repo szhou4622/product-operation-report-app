@@ -1,8 +1,21 @@
 import { app, shell, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
 import { randomUUID } from 'crypto'
-import { isAbsolute, join } from 'path'
+import { isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
-import type { AppSettings, ChatMessage, SavedProject, TestModelOptions } from '../shared/types'
+import type {
+  AppSettings,
+  CostOptimizationEvent,
+  ChatMessage,
+  ChatStreamEvent,
+  ModelTaskContext,
+  ModelTokenUsage,
+  SavedProject,
+  ReportResultCacheInput,
+  ReportResultCacheSnapshot,
+  SourceCleanCacheInput,
+  TestModelOptions,
+  TokenUsageRecord
+} from '../shared/types'
 import { getActiveProfile, loadRendererSettings, saveRendererSettings } from './settings'
 import { getManagedModelState } from './managedModel'
 import { chatStream, listModels, testModel } from './model'
@@ -24,11 +37,50 @@ import {
   activateWithCode,
   canStartLicensedAnalysis,
   consumeAnalysisCredit,
+  deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck
 } from './activation'
 import { readBundledSopRules } from './sopRules'
 import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
+import {
+  appendTokenUsageRecord,
+  classifyModelFailure,
+  estimateRequestTokens,
+  getTokenUsageDashboard,
+  readTokenUsageRecords,
+  sanitizeModelTaskContext,
+  tokenUsageLogPath
+} from './tokenUsage'
+import {
+  applyActivationPoints,
+  canStartPointsReport,
+  getReportChargedPoints,
+  getPointsWalletStatus,
+  grantDevelopmentPoints,
+  reconcileTokenUsage,
+  settleTokenUsage,
+  transferOutPoints
+} from './pointsWallet'
+import {
+  clearSourceCleanCache,
+  getSourceCleanCacheStats,
+  lookupSourceCleanCache,
+  storeSourceCleanCache
+} from './sourceCleanCache'
+import {
+  clearReportResultCache,
+  getReportResultCacheStats,
+  lookupReportResultCache,
+  storeReportResultCache
+} from './reportResultCache'
+import { appendCostOptimizationEvent } from './costOptimization'
+
+const developmentUserDataDir =
+  process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+    ? process.env.PRODUCT_REPORT_DEV_USER_DATA_DIR?.trim()
+    : ''
+if (developmentUserDataDir) app.setPath('userData', resolve(developmentUserDataDir))
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
@@ -238,20 +290,94 @@ ipcMain.handle('shell:showItemInFolder', (_e, path: string) => {
   ensureActivated()
   shell.showItemInFolder(validateLocalPath(path))
 })
+ipcMain.handle('token-usage:summary', () => {
+  ensureActivated()
+  return getTokenUsageDashboard()
+})
+ipcMain.handle('token-usage:open-location', () => {
+  ensureActivated()
+  shell.showItemInFolder(tokenUsageLogPath())
+})
+
+ipcMain.handle('source-clean-cache:stats', () => getSourceCleanCacheStats())
+ipcMain.handle('source-clean-cache:clear', () => clearSourceCleanCache())
+ipcMain.handle('source-clean-cache:lookup', (_event, input: SourceCleanCacheInput) => {
+  ensureActivated()
+  const profile = getActiveProfile()
+  if (!profile) return { hit: false, cacheKey: '', stats: getSourceCleanCacheStats() }
+  return lookupSourceCleanCache(input, profile.model)
+})
+ipcMain.handle(
+  'source-clean-cache:store',
+  (_event, payload: { input: SourceCleanCacheInput; text: string }) => {
+    ensureActivated()
+    const profile = getActiveProfile()
+    if (!profile) return { stored: false, cacheKey: '', stats: getSourceCleanCacheStats() }
+    return storeSourceCleanCache(payload.input, profile.model, payload.text)
+  }
+)
+ipcMain.handle('report-result-cache:stats', () => getReportResultCacheStats())
+ipcMain.handle('report-result-cache:clear', () => clearReportResultCache())
+ipcMain.handle('report-result-cache:lookup', (_event, input: ReportResultCacheInput) => {
+  ensureActivated()
+  const profile = getActiveProfile()
+  if (!profile) return { hit: false, cacheKey: '', stats: getReportResultCacheStats() }
+  return lookupReportResultCache(input, profile.model)
+})
+ipcMain.handle(
+  'report-result-cache:store',
+  (_event, payload: { input: ReportResultCacheInput; snapshot: ReportResultCacheSnapshot }) => {
+    ensureActivated()
+    const profile = getActiveProfile()
+    if (!profile) return { stored: false, cacheKey: '', stats: getReportResultCacheStats() }
+    return storeReportResultCache(payload.input, profile.model, payload.snapshot)
+  }
+)
+ipcMain.handle('cost-optimization:record', (_event, event: CostOptimizationEvent) => {
+  ensureActivated()
+  return appendCostOptimizationEvent(event)
+})
 ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:refresh', async () => {
   const status = await getActivationStatusWithServerCheck()
+  const wallet = applyActivationPoints(status).wallet
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send('activation:changed', status)
+    if (!window.isDestroyed()) {
+      window.webContents.send('activation:changed', status)
+      window.webContents.send('points:changed', wallet)
+    }
   }
   return status
 })
 ipcMain.handle('activation:activate', async (_e, code: string) => {
   const result = await activateWithCode(code)
   if (result.ok) {
+    const wallet = applyActivationPoints(result.status).wallet
     for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) window.webContents.send('activation:changed', result.status)
+      if (!window.isDestroyed()) {
+        window.webContents.send('activation:changed', result.status)
+        window.webContents.send('points:changed', wallet)
+      }
+    }
+  }
+  return result
+})
+ipcMain.handle('activation:deactivate', async () => {
+  const before = getPointsWalletStatus()
+  const result = await deactivateCurrentDevice(before.balancePoints)
+  let wallet = before
+  if (result.ok && result.transferId) {
+    try {
+      wallet = transferOutPoints(result.transferId)
+    } catch {
+      result.message += ' 本机积分记录清理失败，但授权已解除；请不要在旧电脑继续使用，并联系管理员。'
+    }
+  }
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send('activation:changed', result.status)
+      window.webContents.send('points:changed', wallet)
     }
   }
   return result
@@ -263,6 +389,54 @@ ipcMain.handle('license:consumeAnalysisCredit', (_e, operationId: string) => {
     if (!window.isDestroyed()) window.webContents.send('activation:changed', result.status)
   }
   return result
+})
+ipcMain.handle('points:get', async () => {
+  ensureActivated()
+  applyActivationPoints(getActivationStatus())
+  return reconcileTokenUsage(await readTokenUsageRecords())
+})
+ipcMain.handle('points:canStartReport', () => canStartPointsReport(getActivationStatus()))
+ipcMain.handle('points:reportCharge', (_e, reportSessionId: string) => ({
+  chargedPoints: getReportChargedPoints(reportSessionId)
+}))
+ipcMain.handle('points:grantDevelopment', () => {
+  ensureActivated()
+  const wallet = grantDevelopmentPoints(10_000, randomUUID())
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('points:changed', wallet)
+  }
+  return wallet
+})
+ipcMain.handle('points:redeem', async (_e, code: string) => {
+  const before = getPointsWalletStatus()
+  const activation = await activateWithCode(code)
+  if (!activation.ok) {
+    return {
+      ok: false,
+      message: activation.message,
+      activation: activation.status,
+      addedPoints: 0,
+      wallet: before
+    }
+  }
+  const applied = applyActivationPoints(activation.status)
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send('activation:changed', activation.status)
+      window.webContents.send('points:changed', applied.wallet)
+    }
+  }
+  return {
+    ok: applied.addedPoints > 0,
+    message: applied.addedPoints > 0
+      ? `充值成功，已增加 ${applied.addedPoints} 积分。`
+      : activation.status.licenseType !== 'credits' || (activation.status.creditsRemaining || 0) <= 0
+        ? '这个激活码不包含可充值积分，请使用管理员发放的积分码。'
+        : '这个充值码已经入账过，积分没有重复增加。',
+    activation: activation.status,
+    addedPoints: applied.addedPoints,
+    wallet: applied.wallet
+  }
 })
 
 // ---- IPC：自动更新 ----
@@ -369,11 +543,25 @@ const inflight = new Map<string, AbortController>()
 
 ipcMain.on(
   'chat:start',
-  async (event, payload: { id: string; messages: ChatMessage[] }) => {
+  async (event, payload: { id: string; messages: ChatMessage[]; context: ModelTaskContext }) => {
     const { id, messages } = payload
     const channel = `chat:event:${id}`
+    const emptyUsage = (model = ''): ModelTokenUsage => ({
+      source: 'missing',
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 0,
+      model
+    })
     if (!getActivationStatus().activated) {
-      event.sender.send(channel, { type: 'error', message: '软件未激活，请先输入激活码。' })
+      event.sender.send(channel, {
+        type: 'error',
+        message: '软件未激活，请先输入激活码。',
+        usage: emptyUsage()
+      })
       return
     }
     const profile = getActiveProfile()
@@ -383,21 +571,118 @@ ipcMain.on(
         type: 'error',
         message: managed.enabled
           ? managed.info?.error || '内置模型服务暂不可用，请联系软件管理员。'
-          : '未配置模型，请先在设置里添加模型配置。'
+          : '未配置模型，请先在设置里添加模型配置。',
+        usage: emptyUsage()
+      })
+      return
+    }
+    const context = sanitizeModelTaskContext(payload.context)
+    if (!context) {
+      event.sender.send(channel, {
+        type: 'error',
+        message: '模型任务标识无效，请重新开始本次分析。',
+        usage: emptyUsage(profile.model)
       })
       return
     }
     const controller = new AbortController()
     inflight.set(id, controller)
-    await chatStream(
-      profile,
-      messages,
-      (ev) => {
-        if (!event.sender.isDestroyed()) event.sender.send(channel, ev)
-      },
-      controller.signal
-    )
-    inflight.delete(id)
+    const startedAt = new Date().toISOString()
+    const initialEstimate = estimateRequestTokens(messages)
+    const startedRecord: TokenUsageRecord = {
+      schemaVersion: 1,
+      eventType: 'started',
+      requestId: id,
+      ...context,
+      model: profile.model.slice(0, 200),
+      status: 'started',
+      startedAt,
+      endedAt: startedAt,
+      durationMs: 0,
+      outputChars: 0,
+      usageSource: 'missing',
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 0,
+      estimatedInputTokens: initialEstimate.inputTokens,
+      estimatedOutputTokens: 0,
+      estimatedTotalTokens: initialEstimate.totalTokens
+    }
+    await appendTokenUsageRecord(startedRecord).catch((error) => {
+      console.error('Unable to append token usage start record:', error)
+    })
+    let terminal: Extract<ChatStreamEvent, { type: 'done' | 'error' }> | undefined
+    let usage = emptyUsage(profile.model)
+    let outputChars = 0
+    try {
+      await chatStream(
+        profile,
+        messages,
+        (ev) => {
+          if (ev.type === 'chunk') outputChars += ev.delta.length
+          else if (ev.type === 'usage') usage = ev.usage
+          else {
+            terminal = ev
+            usage = ev.usage
+            if (ev.type === 'done') outputChars = ev.full.length
+          }
+          if (ev.type !== 'done' && ev.type !== 'error' && !event.sender.isDestroyed()) {
+            event.sender.send(channel, ev)
+          }
+        },
+        controller.signal,
+        context.taskType === 'source_clean' || context.taskType === 'summary'
+          ? { reasoningEffort: 'low' }
+          : undefined
+      )
+    } finally {
+      inflight.delete(id)
+      const endedAt = new Date().toISOString()
+      const status = controller.signal.aborted
+        ? 'aborted'
+        : terminal?.type === 'done'
+          ? 'success'
+          : 'error'
+      const estimate = estimateRequestTokens(messages, outputChars)
+      const finalRecord: TokenUsageRecord = {
+        schemaVersion: 1,
+        eventType: 'final',
+        requestId: id,
+        ...context,
+        model: usage.model || profile.model.slice(0, 200),
+        status,
+        failureKind: classifyModelFailure(terminal?.type === 'error' ? terminal.message : '', status),
+        startedAt,
+        endedAt,
+        durationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)),
+        outputChars,
+        usageSource: usage.source,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        reasoningTokens: usage.reasoningTokens,
+        cachedInputTokens: usage.cachedInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        totalTokens: usage.totalTokens,
+        ...(usage.source === 'missing'
+          ? {
+              estimatedInputTokens: estimate.inputTokens,
+              estimatedOutputTokens: estimate.outputTokens,
+              estimatedTotalTokens: estimate.totalTokens
+            }
+          : {})
+      }
+      await appendTokenUsageRecord(finalRecord).catch((error) => {
+        console.error('Unable to append token usage final record:', error)
+      })
+      const wallet = settleTokenUsage(finalRecord)
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) window.webContents.send('points:changed', wallet)
+      }
+      if (terminal && !event.sender.isDestroyed()) event.sender.send(channel, terminal)
+    }
   }
 )
 

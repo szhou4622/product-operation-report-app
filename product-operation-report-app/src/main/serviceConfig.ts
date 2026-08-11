@@ -1,6 +1,13 @@
 export const LICENSE_APP_NAME = 'ProductOperationReport'
-export const LICENSE_BASE_URL = 'https://license.dadaozixun.com/api/license'
+const allowDevelopmentOverrides = process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+const developmentLicenseBaseUrl =
+  allowDevelopmentOverrides
+    ? process.env.PRODUCT_REPORT_DEV_LICENSE_BASE_URL?.trim().replace(/\/+$/, '')
+    : ''
+export const LICENSE_BASE_URL = developmentLicenseBaseUrl || 'https://license.dadaozixun.com/api/license'
 export const LICENSE_ACTIVATE_URL = `${LICENSE_BASE_URL}/activate`
+export const LICENSE_DEACTIVATE_URL = `${LICENSE_BASE_URL}/deactivate`
+export const LICENSE_TRANSFER_CLAIM_URL = `${LICENSE_BASE_URL}/transfer/claim`
 
 export const UPDATE_BASE_URL = 'https://update.dadaozixun.com'
 export const UPDATE_LATEST_URL = `${UPDATE_BASE_URL}/api/update/latest`

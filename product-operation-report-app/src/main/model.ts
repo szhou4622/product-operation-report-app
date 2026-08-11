@@ -4,6 +4,7 @@ import type {
   ContentPart,
   ModelListResult,
   ModelProfile,
+  ModelTokenUsage,
   TestModelOptions,
   TestModelResult
 } from '../shared/types'
@@ -15,6 +16,70 @@ const MAX_ERROR_RESPONSE_BYTES = 16 * 1024
 const MAX_MODEL_OUTPUT_CHARS = 2_000_000
 const MAX_MODEL_LIST_ITEMS = 500
 const MAX_SSE_EVENT_CHARS = 2_000_000
+
+type ProviderUsage = Record<string, unknown>
+
+function tokenNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value))
+    : 0
+}
+
+function nestedTokenNumber(value: unknown, key: string): number {
+  return value && typeof value === 'object'
+    ? tokenNumber((value as Record<string, unknown>)[key])
+    : 0
+}
+
+/** 兼容 OpenAI/CCG 常见 usage 字段，只接受服务端真实返回的非负整数。 */
+export function normalizeProviderUsage(raw: unknown, fallbackModel: string): ModelTokenUsage | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const usage = raw as ProviderUsage
+  const inputTokens = tokenNumber(usage.prompt_tokens ?? usage.input_tokens)
+  const outputTokens = tokenNumber(usage.completion_tokens ?? usage.output_tokens)
+  const reasoningTokens = Math.min(
+    outputTokens,
+    Math.max(
+      nestedTokenNumber(usage.completion_tokens_details, 'reasoning_tokens'),
+      nestedTokenNumber(usage.output_tokens_details, 'reasoning_tokens'),
+      tokenNumber(usage.reasoning_tokens)
+    )
+  )
+  const cachedInputTokens = Math.max(
+    nestedTokenNumber(usage.prompt_tokens_details, 'cached_tokens'),
+    nestedTokenNumber(usage.input_tokens_details, 'cached_tokens'),
+    tokenNumber(usage.cache_read_input_tokens)
+  )
+  const cacheCreationInputTokens = Math.max(
+    tokenNumber(usage.cache_creation_input_tokens),
+    nestedTokenNumber(usage.prompt_tokens_details, 'cache_creation_tokens'),
+    nestedTokenNumber(usage.input_tokens_details, 'cache_creation_input_tokens')
+  )
+  const declaredTotal = tokenNumber(usage.total_tokens)
+  return {
+    source: 'provider',
+    inputTokens,
+    outputTokens,
+    reasoningTokens,
+    cachedInputTokens,
+    cacheCreationInputTokens,
+    totalTokens: declaredTotal || inputTokens + outputTokens,
+    model: fallbackModel.slice(0, 200)
+  }
+}
+
+function missingUsage(model: string): ModelTokenUsage {
+  return {
+    source: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens: 0,
+    model: model.slice(0, 200)
+  }
+}
 
 async function readLimitedText(response: Response, maxBytes: number): Promise<string> {
   const declared = Number(response.headers.get('content-length') || 0)
@@ -203,13 +268,25 @@ export async function chatStream(
   profile: ModelProfile,
   messages: ChatMessage[],
   onEvent: (ev: ChatStreamEvent) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  policy?: { reasoningEffort?: 'low' }
 ): Promise<void> {
   let full = ''
+  let latestUsage: ModelTokenUsage | undefined
+  const finalUsage = (): ModelTokenUsage => latestUsage || missingUsage(profile.model)
+  const emitUsage = (raw: unknown, responseModel?: unknown): void => {
+    const model = typeof responseModel === 'string' && responseModel ? responseModel : profile.model
+    const normalized = normalizeProviderUsage(raw, model)
+    if (!normalized) return
+    latestUsage = normalized
+    onEvent({ type: 'usage', usage: normalized })
+  }
+  const emitError = (message: string): void => onEvent({ type: 'error', message, usage: finalUsage() })
+  const emitDone = (): void => onEvent({ type: 'done', full, usage: finalUsage() })
   try {
     const timeoutSignal = AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS)
     const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-    const res = await fetch(endpoint(profile.baseURL), {
+    const request = (withReasoningEffort: boolean): Promise<Response> => fetch(endpoint(profile.baseURL), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -219,32 +296,35 @@ export async function chatStream(
         model: profile.model,
         messages: toOpenAIMessages(messages, profile.supportsVision),
         temperature: profile.temperature ?? 0.3,
-        stream: true
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(withReasoningEffort && policy?.reasoningEffort
+          ? { reasoning_effort: policy.reasoningEffort }
+          : {})
       }),
       signal: requestSignal
     })
+    let res = await request(Boolean(policy?.reasoningEffort))
+    if (!res.ok && policy?.reasoningEffort && (res.status === 400 || res.status === 422)) {
+      await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
+      res = await request(false)
+    }
 
     if (!res.ok) {
       const errText = await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
       const wait = res.status === 429 ? retryAfterSeconds(res) : undefined
-      onEvent({
-        type: 'error',
-        message: `HTTP ${res.status} ${res.statusText} ${errText.slice(0, 300)}${wait ? `；建议等待 ${wait} 秒后重试` : ''}`
-      })
+      emitError(`HTTP ${res.status} ${res.statusText} ${errText.slice(0, 300)}${wait ? `；建议等待 ${wait} 秒后重试` : ''}`)
       return
     }
     if (!res.body) {
-      onEvent({ type: 'error', message: '模型服务没有返回可读取的内容。' })
+      emitError('模型服务没有返回可读取的内容。')
       return
     }
 
     const contentType = res.headers.get('content-type') || ''
     if (contentType.includes('text/html')) {
       const html = await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
-      onEvent({
-        type: 'error',
-        message: `端点返回的是网页(HTML)而非流式数据，通常是 Base URL 路径不对——试试在末尾加 /v1。${html.slice(0, 120)}`
-      })
+      emitError(`端点返回的是网页(HTML)而非流式数据，通常是 Base URL 路径不对——试试在末尾加 /v1。${html.slice(0, 120)}`)
       return
     }
 
@@ -254,32 +334,36 @@ export async function chatStream(
         const json = JSON.parse(raw) as {
           error?: { message?: string } | string
           choices?: { message?: { content?: string }; finish_reason?: string | null }[]
+          usage?: unknown
+          model?: unknown
         }
+        emitUsage(json.usage, json.model)
         if (json.error) {
           const message = typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误'
-          onEvent({ type: 'error', message })
+          emitError(message)
           return
         }
         const choice = json.choices?.[0]
         const finishError = finishReasonError(choice?.finish_reason)
         if (finishError) {
-          onEvent({ type: 'error', message: finishError })
+          emitError(finishError)
           return
         }
         const content = choice?.message?.content?.trim() || ''
         if (!content) {
-          onEvent({ type: 'error', message: '模型返回了空内容，请检查模型兼容性或稍后重试。' })
+          emitError('模型返回了空内容，请检查模型兼容性或稍后重试。')
           return
         }
         if (content.length > MAX_MODEL_OUTPUT_CHARS) {
-          onEvent({ type: 'error', message: '模型返回内容异常过长，本次结果未保存。请缩小资料范围后重试。' })
+          emitError('模型返回内容异常过长，本次结果未保存。请缩小资料范围后重试。')
           return
         }
+        full = content
         onEvent({ type: 'chunk', delta: content })
-        onEvent({ type: 'done', full: content })
+        emitDone()
         return
       } catch {
-        onEvent({ type: 'error', message: `模型返回了无法解析的 JSON：${raw.slice(0, 200)}` })
+        emitError(`模型返回了无法解析的 JSON：${raw.slice(0, 200)}`)
         return
       }
     }
@@ -295,14 +379,14 @@ export async function chatStream(
       if (payload === '[DONE]') {
         const finishError = finishReasonError(finishReason)
         if (finishError) {
-          onEvent({ type: 'error', message: finishError })
+          emitError(finishError)
           return 'error'
         }
         if (!full.trim()) {
-          onEvent({ type: 'error', message: '模型流已结束，但没有返回任何内容。' })
+          emitError('模型流已结束，但没有返回任何内容。')
           return 'error'
         }
-        onEvent({ type: 'done', full })
+        emitDone()
         return 'done'
       }
       try {
@@ -313,30 +397,33 @@ export async function chatStream(
             message?: { content?: string }
             finish_reason?: string | null
           }[]
+          usage?: unknown
+          model?: unknown
         }
+        emitUsage(json.usage, json.model)
         if (json.error) {
           const message = typeof json.error === 'string' ? json.error : json.error.message || '模型返回错误'
-          onEvent({ type: 'error', message })
+          emitError(message)
           return 'error'
         }
         const choice = json.choices?.[0]
         if (choice && choice.finish_reason !== undefined) finishReason = choice.finish_reason
         const finishError = finishReasonError(finishReason)
         if (finishError) {
-          onEvent({ type: 'error', message: finishError })
+          emitError(finishError)
           return 'error'
         }
         const delta = choice?.delta?.content ?? choice?.message?.content
         if (delta) {
           if (full.length + delta.length > MAX_MODEL_OUTPUT_CHARS) {
-            onEvent({ type: 'error', message: '模型返回内容异常过长，本次结果未保存。请缩小资料范围后重试。' })
+            emitError('模型返回内容异常过长，本次结果未保存。请缩小资料范围后重试。')
             return 'error'
           }
           full += delta
           onEvent({ type: 'chunk', delta })
         }
       } catch {
-        onEvent({ type: 'error', message: '模型返回了损坏的流式数据，本次结果未保存。请重试。' })
+        emitError('模型返回了损坏的流式数据，本次结果未保存。请重试。')
         return 'error'
       }
       return 'continue'
@@ -345,7 +432,7 @@ export async function chatStream(
     for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
       buffer += decoder.decode(chunk, { stream: true })
       if (buffer.length > MAX_SSE_EVENT_CHARS) {
-        onEvent({ type: 'error', message: '模型返回的单段数据异常过长，本次结果未保存。请重试。' })
+        emitError('模型返回的单段数据异常过长，本次结果未保存。请重试。')
         return
       }
       const lines = buffer.split('\n')
@@ -360,25 +447,24 @@ export async function chatStream(
       const result = processLine(buffer)
       if (result !== 'continue') return
     }
-    onEvent({
-      type: 'error',
-      message: full.trim()
+    emitError(
+      full.trim()
         ? '模型连接提前结束，本次内容可能不完整，已保留上一份完整结果。请重试。'
         : '模型连接已结束，但没有收到有效的流式内容。'
-    })
+    )
   } catch (e) {
     if (signal?.aborted) {
-      onEvent({ type: 'done', full })
+      emitDone()
       return
     }
     const msg = e instanceof Error ? e.message : String(e)
     if (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
-      onEvent({ type: 'error', message: '模型长时间没有响应，已自动停止。请检查网络后重试。' })
+      emitError('模型长时间没有响应，已自动停止。请检查网络后重试。')
       return
     }
     const hint = /fetch failed|ECONNRESET|socket|terminated|network/i.test(msg)
       ? '（连接中断，常见原因是请求过大——截图太多/太大。截图已自动压缩，可减少截图数量或重试；也可能是中转端点不稳定。）'
       : ''
-    onEvent({ type: 'error', message: msg + hint })
+    emitError(msg + hint)
   }
 }

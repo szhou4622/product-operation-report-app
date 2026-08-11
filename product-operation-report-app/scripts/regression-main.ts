@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,13 +9,16 @@ import Papa from 'papaparse'
 import iconv from 'iconv-lite'
 import type { SavedProject } from '../src/shared/types'
 import { parseArchive, parseFile } from '../src/main/ingest'
-import { chatStream, listModels, testModel } from '../src/main/model'
+import { chatStream, listModels, normalizeProviderUsage, testModel } from '../src/main/model'
 import { loadLastProject, saveLastProject } from '../src/main/project'
 import {
   activateWithCode,
   consumeAnalysisCredit,
+  deactivateCurrentDevice,
   getActivationStatus,
-  getActivationStatusWithServerCheck
+  getActivationStatusWithServerCheck,
+  LEGACY_ACTIVATION_POINTS,
+  shouldAllowLegacyFallback
 } from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
@@ -29,6 +32,47 @@ import { managedModelInternals } from '../src/main/managedModel'
 import { readBundledSopRules } from '../src/main/sopRules'
 import { checkForUpdates, compareVersions, downloadUpdate } from '../src/main/updater'
 import {
+  appendTokenUsageRecord,
+  buildTokenUsageDashboard,
+  estimateRequestTokens,
+  readTokenUsageRecords,
+  sanitizeModelTaskContext,
+  tokenUsageInternals,
+  tokenUsageLogPath
+} from '../src/main/tokenUsage'
+import {
+  applyActivationPoints,
+  calculateUsagePoints,
+  canStartPointsReport,
+  getPointsWalletStatus,
+  grantDevelopmentPoints,
+  pointsWalletInternals,
+  settleTokenUsage,
+  transferOutPoints
+} from '../src/main/pointsWallet'
+import {
+  clearSourceCleanCache,
+  getSourceCleanCacheStats,
+  lookupSourceCleanCache,
+  sourceCleanCacheInternals,
+  sourceCleanCacheKey,
+  storeSourceCleanCache
+} from '../src/main/sourceCleanCache'
+import {
+  clearReportResultCache,
+  getReportResultCacheStats,
+  lookupReportResultCache,
+  reportResultCacheInternals,
+  reportResultCacheKey,
+  storeReportResultCache
+} from '../src/main/reportResultCache'
+import {
+  appendCostOptimizationEvent,
+  costOptimizationInternals,
+  costOptimizationLogPath,
+  getTokenOptimizationMetrics
+} from '../src/main/costOptimization'
+import {
   buildHtmlReportPresentation,
   markdownToHtmlDocument,
   parseHtmlReportModel,
@@ -40,9 +84,15 @@ import {
   friendlyError,
   inspectImageHeader,
   MAX_CLEANING_CONCURRENCY,
+  mergeRevisionParts,
+  priorOutputsForStep,
+  selectRevisionParts,
   useStore
 } from '../src/renderer/src/store'
-import type { ChatStreamEvent, ModelProfile } from '../src/shared/types'
+import { buildFinalReportPartMessages, buildStepMessages, COMPACT_RUNTIME_RULES } from '../src/renderer/src/sop'
+import { FINAL_REPORT_PARTS } from '../src/renderer/src/reportTemplate'
+import { buildLocalTableCleanDetail, preprocessTableForModel } from '../src/renderer/src/tablePreprocess'
+import type { ChatStreamEvent, ModelProfile, TokenUsageRecord } from '../src/shared/types'
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
 app.setPath('userData', tempUserData)
@@ -85,6 +135,7 @@ async function testProjectRevisionAndBackup(): Promise<void> {
 }
 
 async function testActivationAndSettingsBackup(): Promise<void> {
+  pointsWalletInternals.resetForTests()
   const deviceId = getActivationStatus().deviceId
   const activationRecord = {
     version: 1,
@@ -98,8 +149,50 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   assert.equal(activationStatus.activated, true)
   assert.equal(activationStatus.appName, 'ProductOperationReport')
   assert.equal(activationStatus.source, 'legacy')
-  assert.equal(activationStatus.unlimited, true)
+  assert.equal(activationStatus.licenseType, 'credits')
+  assert.equal(activationStatus.unlimited, false)
+  assert.equal(activationStatus.creditsRemaining, LEGACY_ACTIVATION_POINTS)
   assert.equal(activationStatus.offline, false)
+  assert.equal(applyActivationPoints(activationStatus).addedPoints, 2_000)
+  assert.equal(applyActivationPoints(activationStatus).addedPoints, 0, 'the same legacy code only grants its default points once')
+  assert.equal(getPointsWalletStatus().balancePoints, 2_000)
+  const refreshedLegacyStatus = await getActivationStatusWithServerCheck()
+  assert.equal(refreshedLegacyStatus.activated, true, 'existing legacy activation remains usable after upgrade')
+  assert.equal(refreshedLegacyStatus.source, 'legacy')
+  assert.equal(refreshedLegacyStatus.unlimited, false)
+  assert.equal(refreshedLegacyStatus.creditsRemaining, 2_000)
+
+  const previouslyStoredUnlimited = {
+    version: 2,
+    appName: 'ProductOperationReport',
+    source: 'server',
+    codeHash: ACTIVATION_CODE_HASHES[0],
+    encryptedCode: '',
+    deviceId,
+    activatedAt: new Date().toISOString(),
+    licenseId: 'old-server-unlimited-id',
+    licenseType: 'unlimited',
+    unlimited: true,
+    usedOperationIds: [],
+    lastValidatedAt: new Date().toISOString(),
+    offlineUntil: new Date(Date.now() + 72 * 60 * 60 * 1_000).toISOString()
+  }
+  writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(previouslyStoredUnlimited), 'utf8')
+  const migratedUnlimited = getActivationStatus()
+  assert.equal(migratedUnlimited.licenseType, 'credits')
+  assert.equal(migratedUnlimited.unlimited, false)
+  assert.equal(migratedUnlimited.creditsRemaining, 2_000)
+  assert.equal(migratedUnlimited.licenseId, activationStatus.licenseId, 'legacy code keeps one stable top-up identity')
+  assert.equal(applyActivationPoints(migratedUnlimited).addedPoints, 0, 'upgrading an old unlimited record cannot grant twice')
+  writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(activationRecord), 'utf8')
+  assert.equal(
+    shouldAllowLegacyFallback('兑换码不存在、尚未导入服务器或不属于当前软件。', false, false),
+    true,
+    'a bundled legacy code can still activate when the server has not imported it'
+  )
+  assert.equal(shouldAllowLegacyFallback('激活码已禁用', false, false), false)
+  assert.equal(shouldAllowLegacyFallback('机器码不匹配', false, false), false)
+  assert.equal(shouldAllowLegacyFallback('授权已过期', false, false), false)
 
   const firstSettings = {
     profiles: [{ ...profile, name: '第一配置', apiKey: ' key-one ' }],
@@ -126,6 +219,7 @@ async function testActivationAndSettingsBackup(): Promise<void> {
       }),
     /https/
   )
+  pointsWalletInternals.resetForTests()
 }
 
 async function testServerActivationAndCredits(): Promise<void> {
@@ -214,6 +308,122 @@ async function testServerActivationAndCredits(): Promise<void> {
       deviceId,
       activatedAt: new Date().toISOString()
     }), 'utf8')
+  }
+}
+
+async function testDeviceDeactivationAndPointsTransfer(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'SERVER-DEVICE-TRANSFER-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  let mode: 'initial' | 'server-error' | 'wrong-machine' | 'deactivate' | 'claim-transfer' = 'initial'
+  let deactivationBody: Record<string, unknown> = {}
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/transfer/claim')) {
+        if (mode === 'claim-transfer') {
+          return new Response(JSON.stringify({
+            ok: true,
+            transfer_available: true,
+            transfer_id: 'transfer-test-001',
+            points_balance: 1_234.5,
+            message: '换机积分已恢复'
+          }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          transfer_available: false,
+          message: '没有待领取的换机积分'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/deactivate')) {
+        deactivationBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+        if (mode === 'server-error') {
+          return new Response(JSON.stringify({ ok: false, error: '服务暂时不可用' }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        if (mode === 'wrong-machine') {
+          return new Response(JSON.stringify({ ok: false, error: '机器码不匹配，未解除绑定' }), {
+            status: 409,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          deactivated: true,
+          transfer_id: 'transfer-test-001',
+          points_balance: 2_000,
+          message: '本机已解除绑定'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        license: {
+          license_id: 'license-device-transfer',
+          license_type: 'credits',
+          credits: 2_000,
+          unlimited: false,
+          status: 'active'
+        },
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(applyActivationPoints(activated.status).addedPoints, 2_000)
+    assert.equal(getPointsWalletStatus().balancePoints, 2_000)
+
+    mode = 'server-error'
+    const unavailable = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
+    assert.equal(unavailable.ok, false)
+    assert.equal(existsSync(activationFile), true, 'server failure must keep the local activation')
+
+    mode = 'wrong-machine'
+    const mismatch = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
+    assert.equal(mismatch.ok, false)
+    assert.match(mismatch.message, /机器码不匹配/)
+    assert.equal(existsSync(activationFile), true, 'machine mismatch must keep the local activation')
+
+    mode = 'deactivate'
+    const deactivated = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
+    assert.equal(deactivated.ok, true)
+    assert.equal(deactivated.transferId, 'transfer-test-001')
+    assert.equal(deactivationBody.app_name, 'ProductOperationReport')
+    assert.equal(deactivationBody.activation_code, code)
+    assert.equal(deactivationBody.machine_code, activated.status.deviceId)
+    assert.equal(deactivationBody.points_balance, 2_000)
+    assert.equal(existsSync(activationFile), false)
+    assert.equal(existsSync(activationBackup), false)
+    assert.equal(getActivationStatus().activated, false)
+
+    transferOutPoints(deactivated.transferId || '')
+    assert.equal(getPointsWalletStatus().balancePoints, 0)
+    transferOutPoints(deactivated.transferId || '')
+    assert.equal(getPointsWalletStatus().balancePoints, 0, 'repeated local cleanup is idempotent')
+    assert.equal((await deactivateCurrentDevice(0)).ok, false, 'repeated deactivation is rejected safely')
+
+    mode = 'claim-transfer'
+    const reactivated = await activateWithCode(code)
+    assert.equal(reactivated.ok, true)
+    assert.equal(reactivated.status.pointsGrantKind, 'device_transfer')
+    assert.equal(reactivated.status.pointsGrantId, 'transfer-test-001')
+    assert.equal(reactivated.status.pointsGrantPoints, 1_234.5)
+    applyActivationPoints(reactivated.status)
+    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5)
+    applyActivationPoints(reactivated.status)
+    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5, 'the same transfer cannot be claimed twice locally')
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
   }
 }
 
@@ -541,6 +751,7 @@ async function testIdleGoalAndLateSessionIsolation(): Promise<void> {
     api: {
       sendChat: (
         _messages: unknown,
+        _context: unknown,
         handlers: { onError?: (message: string) => void }
       ) => ({
         abort: () => {
@@ -579,7 +790,7 @@ async function testReportRollbackAndExportGuard(): Promise<void> {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     api: {
-      sendChat: (_messages: unknown, handlers: { onChunk?: (value: string) => void; onError?: (value: string) => void }) => {
+      sendChat: (_messages: unknown, _context: unknown, handlers: { onChunk?: (value: string) => void; onError?: (value: string) => void }) => {
         queueMicrotask(() => {
           handlers.onChunk?.('不完整的新报告')
           handlers.onError?.('模拟中断')
@@ -659,14 +870,17 @@ async function testDoubleExportGuard(): Promise<void> {
 
 async function testFeedbackArrivingDuringRevision(): Promise<void> {
   let calls = 0
+  const taskContexts: Array<Record<string, unknown>> = []
   ;(globalThis as typeof globalThis & { window: unknown }).window = {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     api: {
       sendChat: (
         _messages: unknown,
+        context: Record<string, unknown>,
         handlers: { onChunk?: (value: string) => void; onDone?: (value: string) => void }
       ) => {
+        taskContexts.push(context)
         const call = ++calls
         queueMicrotask(() => {
           handlers.onChunk?.(`第${call}段`)
@@ -690,6 +904,20 @@ async function testFeedbackArrivingDuringRevision(): Promise<void> {
   })
   await useStore.getState()._rerunReport()
   assert.equal(calls, 8)
+  assert.equal(taskContexts.every((context) => context.taskType === 'revision_part'), true)
+  assert.deepEqual([...new Set(taskContexts.slice(0, 4).map((context) => context.partId))].sort(), [
+    'part-0-4',
+    'part-10-11',
+    'part-5-8',
+    'part-9'
+  ])
+  assert.equal(taskContexts.every((context) => context.attempt === 1), true)
+  assert.equal(new Set(taskContexts.slice(0, 4).map((context) => String(context.taskKey).split(':').slice(0, -1).join(':'))).size, 1)
+  assert.equal(new Set(taskContexts.slice(4).map((context) => String(context.taskKey).split(':').slice(0, -1).join(':'))).size, 1)
+  assert.notEqual(
+    String(taskContexts[0].taskKey).split(':').slice(0, -1).join(':'),
+    String(taskContexts[4].taskKey).split(':').slice(0, -1).join(':')
+  )
   assert.equal(useStore.getState().phase, 'checkpoint2')
   assert.match(useStore.getState().reportMarkdown, /第5段/)
   assert.equal(useStore.getState().artifacts[9], useStore.getState().reportMarkdown)
@@ -737,15 +965,37 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.match(truncated.message, /不完整/)
 
     const normalEvents: ChatStreamEvent[] = []
-    globalThis.fetch = (async () =>
-      responseStream([
+    let streamingRequestBody: Record<string, unknown> | undefined
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      streamingRequestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      return responseStream([
         'data: {"choices":[{"delta":{"content":"完"}}]}\n',
         '\ndata: {"choices":[{"delta":{"content":"整"},"finish_reason":"stop"}]}\n\n',
+        'data: {"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":40,"cache_creation_tokens":10},"completion_tokens_details":{"reasoning_tokens":12}}}\n\n',
         'data: [DONE]\n\n'
-      ])) as typeof fetch
+      ])
+    }) as typeof fetch
     await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => normalEvents.push(event))
+    assert.deepEqual(streamingRequestBody?.stream_options, { include_usage: true })
+    const usageEvent = normalEvents.find((event) => event.type === 'usage')
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.inputTokens : 0, 120)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.cachedInputTokens : 0, 40)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.cacheCreationInputTokens : 0, 10)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.reasoningTokens : 0, 12)
     assert.equal(normalEvents.at(-1)?.type, 'done')
     assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.full : '', '完整')
+    assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.usage.totalTokens : 0, 150)
+
+    const jsonEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        model: 'gpt-5.5-json',
+        choices: [{ message: { content: '普通响应' }, finish_reason: 'stop' }],
+        usage: { input_tokens: 90, output_tokens: 15, total_tokens: 105, input_tokens_details: { cached_tokens: 20 } }
+      }), { headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => jsonEvents.push(event))
+    assert.equal(jsonEvents.at(-1)?.type === 'done' ? jsonEvents.at(-1)?.usage.totalTokens : 0, 105)
+    assert.equal(jsonEvents.at(-1)?.type === 'done' ? jsonEvents.at(-1)?.usage.model : '', 'gpt-5.5-json')
 
     const earlyEofEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
@@ -753,6 +1003,39 @@ async function testStrictModelCompletion(): Promise<void> {
     await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => earlyEofEvents.push(event))
     assert.equal(earlyEofEvents.at(-1)?.type, 'error')
     assert.match(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.message || '' : '', /提前结束/)
+    assert.equal(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.usage.source : '', 'missing')
+
+    const normalized = normalizeProviderUsage(
+      { prompt_tokens: 12.9, completion_tokens: 3, cache_read_input_tokens: 5, cache_creation_input_tokens: 7 },
+      'fallback'
+    )
+    assert.deepEqual(normalized, {
+      source: 'provider',
+      inputTokens: 12,
+      outputTokens: 3,
+      reasoningTokens: 0,
+      cachedInputTokens: 5,
+      cacheCreationInputTokens: 7,
+      totalTokens: 15,
+      model: 'fallback'
+    })
+
+    const reasoningFallbackBodies: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      reasoningFallbackBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>)
+      if (reasoningFallbackBodies.length === 1) return new Response('{"error":"unsupported reasoning_effort"}', { status: 400 })
+      return responseStream([
+        'data: {"choices":[{"delta":{"content":"兼容"},"finish_reason":"stop"}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    }) as typeof fetch
+    const fallbackEvents: ChatStreamEvent[] = []
+    await chatStream(profile, [{ role: 'user', content: '测试低推理兼容' }], (event) => fallbackEvents.push(event), undefined, { reasoningEffort: 'low' })
+    assert.equal(reasoningFallbackBodies.length, 2)
+    assert.equal(reasoningFallbackBodies[0].reasoning_effort, 'low')
+    assert.equal(reasoningFallbackBodies[1].reasoning_effort, undefined)
+    assert.equal(fallbackEvents.at(-1)?.type, 'done')
 
     const lengthEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
@@ -798,6 +1081,608 @@ async function testStrictModelCompletion(): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch
   }
+}
+
+function makeTokenRecord(overrides: Partial<TokenUsageRecord> = {}): TokenUsageRecord {
+  const totalTokens = overrides.totalTokens ?? 100
+  const inputTokens = overrides.inputTokens ?? Math.max(0, totalTokens - 20)
+  const outputTokens = overrides.outputTokens ?? Math.max(0, totalTokens - inputTokens)
+  return {
+    schemaVersion: 1,
+    eventType: 'final',
+    requestId: crypto.randomUUID(),
+    reportSessionId: 'report-default',
+    taskType: 'analysis_step',
+    taskKey: 'report-default:analysis_step:1',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 7,
+    imageCount: 1,
+    stepId: '1',
+    model: 'gpt-5.5',
+    status: 'success',
+    startedAt: '2026-08-09T01:00:00.000Z',
+    endedAt: '2026-08-09T01:00:01.000Z',
+    durationMs: 1_000,
+    outputChars: 60,
+    usageSource: 'provider',
+    inputTokens,
+    outputTokens,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens,
+    ...overrides
+  }
+}
+
+async function testTokenUsageMeasurement(): Promise<void> {
+  const estimate = estimateRequestTokens([
+    { role: 'system', content: '短提示' },
+    { role: 'user', content: [{ type: 'text', text: '文本资料' }, { type: 'image', dataUrl: 'data:image/png;base64,SECRET_IMAGE' }] }
+  ], 30)
+  assert.equal(estimate.inputTokens >= 2_000, true)
+  assert.equal(estimate.outputTokens, 10)
+  assert.equal(sanitizeModelTaskContext({
+    reportSessionId: 'report-1',
+    taskType: 'source_clean',
+    taskKey: 'report-1:source_clean:file-1',
+    attempt: 1,
+    isVision: true,
+    sourceCount: 3,
+    imageCount: 1,
+    sourceId: 'file-1'
+  })?.isVision, true)
+  assert.equal(sanitizeModelTaskContext({
+    reportSessionId: 'bad id with spaces',
+    taskType: 'summary',
+    taskKey: 'bad',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 1,
+    imageCount: 0
+  }), undefined)
+
+  const records: TokenUsageRecord[] = []
+  const reportTotals = [1_000, 2_000, 3_000, 4_000]
+  const sourceCounts = [3, 7, 15, 25]
+  const parts = ['part-0-4', 'part-5-8', 'part-9', 'part-10-11']
+  reportTotals.forEach((reportTotal, reportIndex) => {
+    parts.forEach((partId, partIndex) => {
+      const partTotal = reportTotal / parts.length
+      records.push(makeTokenRecord({
+        requestId: `report-${reportIndex + 1}-part-${partIndex + 1}`,
+        reportSessionId: `report-${reportIndex + 1}`,
+        taskType: 'final_part',
+        taskKey: `report-${reportIndex + 1}:final_part:${partId}`,
+        partId,
+        sourceCount: sourceCounts[reportIndex],
+        imageCount: reportIndex,
+        totalTokens: partTotal,
+        inputTokens: partTotal - 50,
+        outputTokens: 50
+      }))
+    })
+  })
+  records.push(makeTokenRecord({
+    requestId: 'missing-retry',
+    reportSessionId: 'report-missing',
+    taskType: 'source_clean',
+    taskKey: 'report-missing:source_clean:file-1',
+    sourceId: 'file-1',
+    attempt: 2,
+    status: 'error',
+    failureKind: 'network',
+    usageSource: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedInputTokens: 500,
+    estimatedOutputTokens: 0,
+    estimatedTotalTokens: 500
+  }))
+  const dashboard = buildTokenUsageDashboard(records, true, 'test-token-usage.jsonl')
+  assert.deepEqual(dashboard.percentiles, { sampleSize: 4, p50: 2_000, p75: 3_000, p95: 4_000 })
+  assert.equal(dashboard.buckets.every((bucket) => bucket.exactCompletedCount === 1), true)
+  assert.equal(dashboard.missingUsageRecordCount, 1)
+  for (const report of dashboard.reports.filter((item) => item.completed)) {
+    assert.equal(report.totalTokens, report.stages.reduce((sum, stage) => sum + stage.totalTokens, 0))
+    assert.equal(report.totalTokens, report.successfulTokens + report.failedTokens + report.abortedTokens)
+  }
+
+  const path = tokenUsageLogPath()
+  rmSync(path, { force: true })
+  tokenUsageInternals.resetForTests()
+  const started = makeTokenRecord({
+    eventType: 'started',
+    requestId: 'local-request-1',
+    reportSessionId: 'local-report',
+    taskKey: 'local-report:summary',
+    taskType: 'summary',
+    status: 'started',
+    usageSource: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedInputTokens: 123,
+    estimatedOutputTokens: 0,
+    estimatedTotalTokens: 123
+  })
+  const final = makeTokenRecord({
+    requestId: 'local-request-1',
+    reportSessionId: 'local-report',
+    taskKey: 'local-report:summary',
+    taskType: 'summary',
+    totalTokens: 222,
+    inputTokens: 200,
+    outputTokens: 22
+  })
+  assert.equal(await appendTokenUsageRecord(started), true)
+  assert.equal(await appendTokenUsageRecord(final), true)
+  assert.equal(await appendTokenUsageRecord(final), false)
+  const crashStart = makeTokenRecord({
+    eventType: 'started',
+    requestId: 'crashed-request',
+    reportSessionId: 'crashed-report',
+    taskKey: 'crashed-report:source_clean:file-1',
+    taskType: 'source_clean',
+    sourceId: 'file-1',
+    status: 'started',
+    usageSource: 'missing',
+    totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedTotalTokens: 321
+  })
+  await appendTokenUsageRecord(crashStart)
+  appendFileSync(path, '{"truncated":', 'utf8')
+  const reloaded = await readTokenUsageRecords(path)
+  assert.equal(reloaded.length, 3)
+  const recovered = buildTokenUsageDashboard(reloaded)
+  const crashed = recovered.reports.find((report) => report.reportSessionId === 'crashed-report')
+  assert.equal(crashed?.abortedAttempts, 1)
+  assert.equal(crashed?.missingUsageAttempts, 1)
+  const rawLog = readFileSync(path, 'utf8')
+  assert.doesNotMatch(rawLog, /SECRET_IMAGE|prompt|activation_code|apiKey|sk-/i)
+}
+
+function liveBillingRecord(overrides: Partial<TokenUsageRecord> = {}): TokenUsageRecord {
+  const now = new Date(Date.now() + 2_000).toISOString()
+  return makeTokenRecord({
+    requestId: crypto.randomUUID(),
+    reportSessionId: 'billing-report',
+    taskKey: 'billing-report:analysis_step:1',
+    model: 'gpt-5.5',
+    startedAt: now,
+    endedAt: now,
+    ...overrides
+  })
+}
+
+async function testRealTokenPointsBilling(): Promise<void> {
+  pointsWalletInternals.resetForTests()
+  grantDevelopmentPoints(10_000, 'billing-test')
+
+  const inputOnly = liveBillingRecord({
+    inputTokens: 1_000_000,
+    outputTokens: 0,
+    totalTokens: 1_000_000
+  })
+  const inputCharge = calculateUsagePoints(inputOnly)
+  assert.equal(inputCharge?.costPoints, 900)
+  assert.equal(inputCharge?.chargedPoints, 1_800)
+  const afterInput = settleTokenUsage(inputOnly)
+  assert.equal(afterInput.balancePoints, 8_200)
+  assert.equal(afterInput.totalCostPoints, 900)
+  assert.equal(afterInput.totalChargedPoints, 1_800)
+  assert.equal(afterInput.pricing.pointsPerCny, 100)
+  assert.equal(afterInput.pricing.costRate, 0.5)
+  assert.equal(afterInput.pricing.chargeMultiplier, 2)
+  assert.equal(settleTokenUsage(inputOnly).balancePoints, 8_200)
+
+  const failedOutput = liveBillingRecord({
+    taskType: 'final_part',
+    taskKey: 'billing-report:final_part:part-9',
+    partId: 'part-9',
+    status: 'error',
+    failureKind: 'network',
+    inputTokens: 0,
+    outputTokens: 100_000,
+    totalTokens: 100_000
+  })
+  assert.equal(calculateUsagePoints(failedOutput)?.chargedPoints, 1_080)
+  assert.equal(settleTokenUsage(failedOutput).balancePoints, 7_120)
+
+  const cached = liveBillingRecord({
+    inputTokens: 1_000_000,
+    cachedInputTokens: 1_000_000,
+    outputTokens: 0,
+    totalTokens: 1_000_000
+  })
+  assert.equal(calculateUsagePoints(cached)?.costPoints, 90)
+  assert.equal(calculateUsagePoints(cached)?.chargedPoints, 180)
+  assert.equal(settleTokenUsage(cached).balancePoints, 6_940)
+
+  const missing = liveBillingRecord({
+    usageSource: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedTotalTokens: 20_000
+  })
+  const afterMissing = settleTokenUsage(missing)
+  assert.equal(afterMissing.balancePoints, 6_940)
+  assert.equal(afterMissing.unbilledUsageCount, 1)
+
+  const stoppedRetry = liveBillingRecord({
+    attempt: 2,
+    status: 'aborted',
+    failureKind: 'user_aborted',
+    inputTokens: 100_000,
+    outputTokens: 0,
+    totalTokens: 100_000
+  })
+  assert.equal(calculateUsagePoints(stoppedRetry)?.chargedPoints, 180)
+  assert.equal(settleTokenUsage(stoppedRetry).balancePoints, 6_760)
+
+  const activation = {
+    activated: true,
+    deviceId: 'device',
+    licenseId: 'topup-100',
+    codeCount: 100,
+    appName: 'ProductOperationReport',
+    source: 'server' as const,
+    licenseType: 'credits' as const,
+    unlimited: false,
+    creditsRemaining: 100,
+    offline: false
+  }
+  assert.equal(applyActivationPoints(activation).addedPoints, 100)
+  assert.equal(applyActivationPoints(activation).addedPoints, 0)
+  assert.equal(getPointsWalletStatus().balancePoints, 6_860)
+
+  const debt = liveBillingRecord({
+    inputTokens: 5_000_000,
+    outputTokens: 0,
+    totalTokens: 5_000_000
+  })
+  assert.equal(settleTokenUsage(debt).balancePoints, -2_140)
+  const denied = canStartPointsReport(activation)
+  assert.equal(denied.ok, false)
+  assert.match(denied.message, /欠费/)
+
+  const nextBackendCode = {
+    ...activation,
+    licenseId: 'topup-300',
+    creditsRemaining: 300
+  }
+  assert.equal(applyActivationPoints(nextBackendCode).addedPoints, 300, 'a newly generated backend code can top up once')
+  assert.equal(applyActivationPoints(nextBackendCode).addedPoints, 0, 'reusing the same backend code cannot top up twice')
+  const wrongAppCode = {
+    ...activation,
+    appName: 'AnotherDesktopApp',
+    licenseId: 'wrong-app-999',
+    creditsRemaining: 999
+  }
+  assert.equal(applyActivationPoints(wrongAppCode).addedPoints, 0, 'another app code cannot credit this wallet')
+  assert.equal(getPointsWalletStatus().ledger.some((entry) => entry.description.includes('Token')), false)
+  pointsWalletInternals.resetForTests()
+}
+
+async function testCostOptimizationPrimitives(): Promise<void> {
+  clearSourceCleanCache()
+  sourceCleanCacheInternals.resetForTests()
+  const source = {
+    name: '画像.csv',
+    kind: 'table' as const,
+    text: '标签类型,标签,占比\n年龄,30-39,45%',
+    attribution: '自有数据',
+    platform: '视频号',
+    purpose: '人群画像数据',
+    note: '近30天'
+  }
+  const key = sourceCleanCacheKey(source, 'gpt-5.5')
+  assert.equal(key.length, 64)
+  assert.notEqual(sourceCleanCacheKey({ ...source, note: '近7天' }, 'gpt-5.5'), key)
+  assert.notEqual(sourceCleanCacheKey({ ...source, text: `${source.text}\n年龄,40-49,20%` }, 'gpt-5.5'), key)
+  const stored = storeSourceCleanCache(source, 'gpt-5.5', '清洗结果')
+  assert.equal(stored.stored, true, 'cache store')
+  const hit = lookupSourceCleanCache(source, 'gpt-5.5')
+  assert.equal(hit.hit, true, 'cache hit')
+  assert.equal(hit.text, '清洗结果')
+  assert.equal(hit.stats.totalHits, 1)
+  assert.equal(lookupSourceCleanCache({ ...source, platform: '抖音' }, 'gpt-5.5').hit, false)
+  assert.notEqual(sourceCleanCacheKey(source, 'gpt-5.4'), key)
+  const warmSources = Array.from({ length: 7 }, (_, index) => ({
+    ...source,
+    name: `复用资料-${index + 1}.csv`,
+    text: `${source.text}\n序号,${index + 1},${index + 1}%`
+  }))
+  warmSources.forEach((item, index) => {
+    assert.equal(storeSourceCleanCache(item, 'gpt-5.5', `清洗结果-${index + 1}`).stored, true)
+  })
+  assert.equal(warmSources.filter((item) => lookupSourceCleanCache(item, 'gpt-5.5').hit).length, 7)
+
+  const now = new Date('2026-08-09T00:00:00.000Z')
+  const entries = Array.from({ length: 205 }, (_, index) => ({
+    key: index.toString(16).padStart(64, '0'),
+    createdAt: '2026-08-01T00:00:00.000Z',
+    lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+    expiresAt: index === 204 ? '2026-08-08T00:00:00.000Z' : '2026-09-01T00:00:00.000Z',
+    model: 'gpt-5.5',
+    text: '结果'
+  }))
+  const pruned = sourceCleanCacheInternals.pruneCache({ version: 1, totalHits: 3, entries }, now)
+  assert.equal(pruned.entries.length, 200)
+  assert.equal(pruned.entries.some((entry) => entry.expiresAt < now.toISOString()), false)
+
+  const largeText = 'x'.repeat(2_000_000)
+  const oversized = sourceCleanCacheInternals.pruneCache({
+    version: 1,
+    totalHits: 0,
+    entries: Array.from({ length: 30 }, (_, index) => ({
+      key: (index + 1).toString(16).padStart(64, '0'),
+      createdAt: '2026-08-09T00:00:00.000Z',
+      lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+      expiresAt: '2026-09-01T00:00:00.000Z',
+      model: 'gpt-5.5',
+      text: largeText
+    }))
+  }, now)
+  assert.ok(oversized.entries.length < 30, 'cache byte-cap evicts LRU entries')
+  assert.ok(Buffer.byteLength(JSON.stringify(oversized), 'utf8') <= sourceCleanCacheInternals.MAX_CACHE_BYTES)
+
+  const profileText = [
+    '标签类型,标签,占比',
+    ...Array.from({ length: 80 }, (_, index) => `${index < 40 ? '年龄' : '地区'},标签${index}${'说明'.repeat(100)},${80 - index}%`)
+  ].join('\n')
+  const profile = preprocessTableForModel(profileText)
+  assert.equal(
+    profile.applied,
+    true,
+    `profile preprocessing: applied=${profile.applied} mode=${profile.mode} rows=${profile.originalRows}`
+  )
+  assert.equal(profile.mode, 'profile')
+  assert.equal(profile.retainedRows, 60)
+  assert.equal(profile.canSkipModel, false, 'row-reducing digest still requires model cleaning')
+  assert.match(profile.text, /原始有效记录 80 行/u)
+
+  const materialText = [
+    '发布时间,文案,3秒文案,消耗金额,成交,豆包.思考过程,标签分析.输出结果',
+    ...Array.from({ length: 200 }, (_, index) => `2026-08-${String((index % 28) + 1).padStart(2, '0')},${`内容${index}`.repeat(20)},开头${index},${index},${index},秘密推理${index},冗余${index}`)
+  ].join('\n')
+  const material = preprocessTableForModel(materialText)
+  assert.equal(material.applied, true, `material preprocessing: ${JSON.stringify(material)}`)
+  assert.equal(material.mode, 'material')
+  assert.doesNotMatch(material.text, /秘密推理|思考过程|输出结果/u)
+  assert.match(material.text, /开头199/u)
+
+  const unknownText = ['甲列,乙列', ...Array.from({ length: 800 }, (_, index) => `${index},${'未知'.repeat(20)}`)].join('\n')
+  const unknown = preprocessTableForModel(unknownText)
+  assert.equal(unknown.applied, false)
+  assert.equal(unknown.text, unknownText)
+
+  const productText = [
+    '统计周期,商品名称,商品编码,成交金额,成交订单数,投放消耗（店铺被投）,完全无关字段',
+    ...Array.from({ length: 160 }, (_, index) => `2026-08,商品${index},SKU-${index},${index * 10},${index},${index * 2},${'冗余'.repeat(60)}`)
+  ].join('\n')
+  const product = preprocessTableForModel(productText)
+  assert.equal(product.applied, true)
+  assert.equal(product.mode, 'product')
+  assert.match(product.text, /商品名称|成交金额|成交订单数/u)
+  assert.doesNotMatch(product.text, /完全无关字段/u)
+  const unrankableProductText = [
+    '商品名称,商品编码,完全未知字段',
+    ...Array.from({ length: 200 }, (_, index) => `商品${index},SKU-${index},${'未知'.repeat(80)}`)
+  ].join('\n')
+  const unrankableProduct = preprocessTableForModel(unrankableProductText)
+  assert.equal(unrankableProduct.applied, false, 'product table without a reliable metric falls back')
+  assert.equal(unrankableProduct.text, unrankableProductText)
+
+  const localTableSource = {
+    name: '可靠成交数据.csv',
+    kind: 'table' as const,
+    text: '商品名称,成交金额,成交订单数\n产品A,1200,12\n产品B,800,8\n产品B,800,8\n,,',
+    attribution: '自有数据',
+    platform: '视频号',
+    purpose: '商品成交数据',
+    note: '近30天'
+  }
+  const localTable = preprocessTableForModel(localTableSource.text)
+  assert.equal(localTable.confidence, 'high')
+  assert.equal(localTable.canSkipModel, true)
+  assert.equal(localTable.retainedRows, 2, 'blank and duplicate rows are removed locally')
+  const localDetail = buildLocalTableCleanDetail(localTableSource, localTable)
+  assert.ok(localDetail)
+  assert.match(localDetail!, /未调用模型|以下内容只来自原表格|产品A/u)
+  assert.ok(localDetail!.length <= 12_000)
+  const semanticTable = preprocessTableForModel('标题,脚本文案,成交金额\n测试,这是一段内容,100')
+  assert.equal(semanticTable.canSkipModel, false, 'semantic narrative columns require model cleaning')
+  assert.equal(buildLocalTableCleanDetail({ ...localTableSource, text: '标题,脚本文案,成交金额\n测试,内容,100' }, semanticTable), null)
+  assert.equal(preprocessTableForModel('not a reliable table').canSkipModel, false)
+
+  const sharedData = '固定资料'.repeat(1_000)
+  const step1 = buildStepMessages({ stepId: 1, stepTitle: '确定产品', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
+  const step2 = buildStepMessages({ stepId: 2, stepTitle: '卖点拆解', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
+  assert.deepEqual(step1[0], step2[0])
+  assert.equal(String(step1[1].content).indexOf(sharedData) < String(step1[1].content).indexOf('当前任务'), true, 'step prompt prefix')
+  const fullSkillSentinel = 'THIS_FULL_SKILL_MUST_NOT_BE_SENT'
+  const compactStep = buildStepMessages({ stepId: 8, stepTitle: '执行选题', sopRules: fullSkillSentinel.repeat(1_000), cleanedData: sharedData, priorOutputs: [] })
+  assert.doesNotMatch(String(compactStep[0].content), /THIS_FULL_SKILL_MUST_NOT_BE_SENT/u)
+  assert.ok(COMPACT_RUNTIME_RULES.length < 5_000, 'compact runtime rules stay materially smaller than the full skill')
+  assert.match(COMPACT_RUNTIME_RULES, /12维|3\.1=|0—11章|不同平台/u)
+  const allArtifacts = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [index + 1, `产出${index + 1}`]))
+  assert.deepEqual(priorOutputsForStep(2, allArtifacts).map((item) => item.id), [1])
+  assert.deepEqual(priorOutputsForStep(5, allArtifacts).map((item) => item.id), [1, 4])
+  assert.deepEqual(priorOutputsForStep(8, allArtifacts).map((item) => item.id), [5, 6, 7])
+  const finalA = buildFinalReportPartMessages({ part: FINAL_REPORT_PARTS[0], cleanedData: sharedData, priorOutputs: [] })
+  const finalB = buildFinalReportPartMessages({ part: FINAL_REPORT_PARTS[1], cleanedData: sharedData, priorOutputs: [] })
+  assert.deepEqual(finalA[0], finalB[0])
+  assert.equal(String(finalA[1].content).indexOf(sharedData) < String(finalA[1].content).indexOf('本次只生成'), true, 'final prompt prefix')
+
+  const previous = [
+    '# 测试产品经营报告',
+    '生成日期：2026-08-09',
+    ...Array.from({ length: 12 }, (_, index) => `## ${index}. 章节${index}\n旧内容${index}`),
+    '> (注：内容由 AI 生成，请谨慎参考）'
+  ].join('\n\n')
+  const selectedNine = selectRevisionParts('请修改第9章脚本选题')
+  assert.deepEqual(selectedNine.map((part) => part.id), ['part-9'])
+  const merged = mergeRevisionParts(previous, '## 9. 章节9\n新内容9', selectedNine)
+  assert.ok(merged)
+  assert.match(merged!, /## 9\. 章节9\n新内容9/u)
+  assert.match(merged!, /## 8\. 章节8\n旧内容8/u)
+  assert.match(merged!, /## 10\. 章节10\n旧内容10/u)
+  assert.equal(mergeRevisionParts(previous, '缺少章节标题', selectedNine), null)
+  assert.deepEqual(selectRevisionParts('把人群和风险建议一起调整').map((part) => part.id), ['part-5-8', 'part-10-11'])
+  assert.equal(selectRevisionParts('整体再专业一点').length, FINAL_REPORT_PARTS.length)
+
+  clearReportResultCache()
+  reportResultCacheInternals.resetForTests()
+  const reportInput = {
+    sources: [localTableSource, { ...source, name: '画像.csv' }],
+    userRequirements: '经营建议更具体'
+  }
+  const completeReport = [
+    '# 测试产品经营报告',
+    ...Array.from({ length: 12 }, (_, index) => `## ${index}. 章节${index}\n内容${index}`)
+  ].join('\n\n')
+  const reportSnapshot = {
+    cleanedData: '归一数据',
+    cleanDetails: reportInput.sources.map((item) => ({ name: item.name, text: `清洗：${item.name}` })),
+    artifacts: Object.fromEntries(Array.from({ length: 9 }, (_, index) => [index + 1, index === 8 ? completeReport : `步骤${index + 1}`])),
+    reportMarkdown: completeReport
+  }
+  const reportKey = reportResultCacheKey(reportInput, 'gpt-5.5')
+  assert.equal(reportKey.length, 64)
+  assert.notEqual(reportResultCacheKey({ ...reportInput, sources: [...reportInput.sources].reverse() }, 'gpt-5.5'), reportKey)
+  assert.notEqual(reportResultCacheKey({ ...reportInput, userRequirements: '换一个要求' }, 'gpt-5.5'), reportKey)
+  assert.equal(storeReportResultCache(reportInput, 'gpt-5.5', reportSnapshot).stored, true)
+  const reportHit = lookupReportResultCache(reportInput, 'gpt-5.5')
+  assert.equal(reportHit.hit, true)
+  assert.equal(reportHit.snapshot?.reportMarkdown, completeReport)
+  assert.equal(reportHit.stats.totalHits, 1)
+  for (let index = 0; index < 24; index++) {
+    storeReportResultCache(
+      { ...reportInput, userRequirements: `要求-${index}` },
+      'gpt-5.5',
+      reportSnapshot
+    )
+  }
+  assert.equal(getReportResultCacheStats().entryCount, 20, 'report cache uses the 20-entry LRU cap')
+  const largeReportText = 'x'.repeat(6_000_000)
+  const oversizedReportCache = reportResultCacheInternals.pruneCache({
+    version: 1,
+    totalHits: 0,
+    entries: Array.from({ length: 4 }, (_, index) => ({
+      key: (index + 100).toString(16).padStart(64, '0'),
+      createdAt: '2026-08-09T00:00:00.000Z',
+      lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+      expiresAt: '2026-09-01T00:00:00.000Z',
+      model: 'gpt-5.5',
+      snapshot: {
+        cleanedData: '归一',
+        cleanDetails: [{ name: '资料.csv', text: '明细' }],
+        artifacts: { 1: '步骤' },
+        reportMarkdown: largeReportText
+      }
+    }))
+  }, now)
+  assert.ok(Buffer.byteLength(JSON.stringify(oversizedReportCache), 'utf8') <= reportResultCacheInternals.MAX_CACHE_BYTES)
+
+  await costOptimizationInternals.resetForTests()
+  await appendCostOptimizationEvent({
+    schemaVersion: 1,
+    id: 'local-clean:test-session:source-1',
+    reportSessionId: 'test-session',
+    type: 'local_source_clean',
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: 1,
+    sourceCacheHits: 0,
+    skippedModelRequests: 1,
+    reusedReports: 0
+  })
+  await appendCostOptimizationEvent({
+    schemaVersion: 1,
+    id: 'report-reuse:test-cache-key',
+    reportSessionId: 'test-session',
+    type: 'report_cache_reuse',
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: 0,
+    sourceCacheHits: 0,
+    skippedModelRequests: 15,
+    reusedReports: 1
+  })
+  const optimization = await getTokenOptimizationMetrics()
+  assert.deepEqual(optimization, {
+    localCompletedFiles: 1,
+    sourceCacheHits: 0,
+    skippedModelRequests: 16,
+    reusedReports: 1
+  })
+  assert.doesNotMatch(readFileSync(costOptimizationLogPath(), 'utf8'), /API Key|activation_code|提示词|产品A/u)
+
+  let modelOrBillingCalls = 0
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      lookupReportResultCache: async () => reportHit,
+      canStartPointsReport: async () => {
+        modelOrBillingCalls++
+        throw new Error('points check must not run for a cache offer')
+      },
+      recordCostOptimization: async () => true,
+      sendChat: () => {
+        modelOrBillingCalls++
+        return { abort: () => undefined }
+      },
+      getReportPointsCharge: async () => {
+        modelOrBillingCalls++
+        return { chargedPoints: 1 }
+      }
+    }
+  }
+  useStore.setState({
+    reportReuseOffer: null,
+    analysisSessionId: 'reuse-session',
+    sources: reportInput.sources.map((item, index) => ({ ...item, id: `source-${index}` })),
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    phase: 'idle'
+  })
+  await useStore.getState().startGeneration()
+  assert.equal(modelOrBillingCalls, 0, 'cache lookup happens before model and points checks')
+  assert.equal(useStore.getState().reportReuseOffer?.cacheKey, reportHit.cacheKey)
+  await useStore.getState().acceptReportReuse()
+  assert.equal(modelOrBillingCalls, 0, 'full report reuse does not call model or points billing')
+  assert.equal(useStore.getState().phase, 'checkpoint2')
+  assert.equal(useStore.getState().reportMarkdown, completeReport)
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /已恢复上次的完整报告/u)
+  assert.doesNotMatch(useStore.getState().messages.at(-1)?.text || '', /Token|扣除|计费|毛利/u)
+
+  const reuseModalSource = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'components', 'ReportReuseModal.tsx'), 'utf8')
+  assert.match(reuseModalSource, /直接使用上次报告/u)
+  assert.match(reuseModalSource, /重新生成一份/u)
+  assert.doesNotMatch(reuseModalSource, /Token|扣积分|毛利|每百万/u)
+
+  clearReportResultCache()
+  writeFileSync(join(tempUserData, 'report-result-cache.json'), '{broken', 'utf8')
+  writeFileSync(join(tempUserData, 'report-result-cache.json.bak'), 'also broken', 'utf8')
+  assert.equal(getReportResultCacheStats().entryCount, 0, 'corrupt report cache is ignored')
+
+  clearSourceCleanCache()
+  assert.equal(getSourceCleanCacheStats().entryCount, 0)
+  writeFileSync(join(tempUserData, 'source-clean-cache.json'), '{broken', 'utf8')
+  writeFileSync(join(tempUserData, 'source-clean-cache.json.bak'), 'also broken', 'utf8')
+  assert.equal(getSourceCleanCacheStats().entryCount, 0, 'corrupt cache is ignored')
+  clearSourceCleanCache()
+  clearReportResultCache()
+  await costOptimizationInternals.resetForTests()
 }
 
 async function testCsvAndArchiveGuards(): Promise<void> {
@@ -1223,6 +2108,21 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
   assert.ok(appComponent.includes(expectedGuideUrl))
   assert.equal(appComponent.includes('FU5FdRkHFoNH7JxUp6wciLksnEe'), false)
+  assert.equal(appComponent.includes('Token 统计'), false, 'Token statistics are not exposed in the customer UI')
+  assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
+  assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary|points-ledger-preview/u)
+  assert.equal(appComponent.includes('更换电脑'), false, 'device transfer is not placed in the points dialog')
+  const settingsComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'SettingsModal.tsx'),
+    'utf8'
+  )
+  assert.match(settingsComponent, /typeof cacheApi\.getReportResultCacheStats === 'function'/u)
+  assert.match(settingsComponent, /本机缓存管理（一般不用）/u)
+  assert.match(settingsComponent, /设备授权/u)
+  assert.match(settingsComponent, /更换电脑/u)
+  assert.match(settingsComponent, /deactivateCurrentDevice/u)
+  assert.doesNotMatch(settingsComponent, /毛利|每百万|真实成本|按真实 Token/u)
+  assert.equal(/if \(!open\) return null[\s\S]{0,500}getReportResultCacheStats\(/u.test(settingsComponent), false)
 
   const styles = readFileSync(
     join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
@@ -1253,6 +2153,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
             <span class="model-pill">模型：ai英雄会（gpt-5.5）</span>
             <button class="btn new-analysis-button"><span class="new-analysis-icon">＋</span><span>新建分析</span></button>
             <button class="btn restore-analysis-button">恢复上一份</button>
+            <button class="license-pill">剩余 8,999,699 积分</button>
             <span class="app-version">v0.2.3</span>
             <button class="btn">设置</button>
           </div>
@@ -1276,7 +2177,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   topbarAuditWindow = window
   try {
     await window.loadFile(htmlPath)
-    for (const width of [880, 960, 1005, 1120, 1280, 1536, 1600]) {
+    for (const width of [736, 760, 780, 800, 880, 960, 1005, 1120, 1280, 1536, 1600]) {
       window.setContentSize(width, 180)
       let layout: {
         innerWidth: number
@@ -1892,6 +2793,8 @@ async function run(): Promise<void> {
   await testActivationAndSettingsBackup()
   console.log('Regression: server activation, offline grace and idempotent credits')
   await testServerActivationAndCredits()
+  console.log('Regression: safe device deactivation and remaining-points transfer')
+  await testDeviceDeactivationAndPointsTransfer()
   console.log('Regression: update version comparison')
   testUpdateVersionComparison()
   console.log('Regression: update config and SHA256 guard')
@@ -1916,6 +2819,12 @@ async function run(): Promise<void> {
   await testFeedbackArrivingDuringRevision()
   console.log('Regression: strict model completion')
   await testStrictModelCompletion()
+  console.log('Regression: real token usage measurement and privacy')
+  await testTokenUsageMeasurement()
+  console.log('Regression: real token points billing and idempotent top-up')
+  await testRealTokenPointsBilling()
+  console.log('Regression: cost optimization cache, preprocessing, prompt prefix and targeted revision')
+  await testCostOptimizationPrimitives()
   console.log('Regression: CSV and ZIP guards')
   await testCsvAndArchiveGuards()
   console.log('Regression: file count guard')
@@ -1934,7 +2843,7 @@ async function run(): Promise<void> {
   await testWorkbenchTopbarContract()
   console.log('Regression: adaptive HTML report renderer')
   await testHtmlReportRenderer()
-  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
+  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, real token usage measurement and points billing, cost optimization cache/prompt/revision guards, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
 }
 
 void app.whenReady().then(async () => {

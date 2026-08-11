@@ -1,8 +1,8 @@
 {
   "version": 1,
   "enabled": true,
-  "name": "内置 AI 服务",
-  "baseURL": "https://example.com/v1",
+  "name": "CCG 内置 AI 服务",
+  "baseURL": "https://ccg-cli.online/v1",
   "apiKey": "replace-with-private-api-key",
   "model": "gpt-5.5",
   "supportsVision": true,

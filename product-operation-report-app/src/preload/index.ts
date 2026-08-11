@@ -3,24 +3,42 @@ import type {
   AppSettings,
   ArchiveItem,
   ActivationResult,
+  ActivationDeactivationResult,
   ActivationStatus,
   ChatMessage,
   ChatStreamEvent,
+  CostOptimizationEvent,
   ExportResult,
   ModelListResult,
   ModelProfile,
+  ModelTaskContext,
+  ModelTokenUsage,
   LicenseUsageResult,
   ParsedFile,
+  PointsAccessResult,
+  PointsRedeemResult,
+  PointsWalletStatus,
+  ReportResultCacheInput,
+  ReportResultCacheLookupResult,
+  ReportResultCacheSnapshot,
+  ReportResultCacheStats,
+  ReportResultCacheStoreResult,
   SavedProject,
+  SourceCleanCacheInput,
+  SourceCleanCacheLookupResult,
+  SourceCleanCacheStats,
+  SourceCleanCacheStoreResult,
   TestModelOptions,
   TestModelResult,
   UpdateActionResult,
   UpdateDownloadProgress,
-  UpdateInfo
+  UpdateInfo,
+  TokenUsageDashboard
 } from '../shared/types'
 
 export interface ChatHandlers {
   onChunk?: (delta: string) => void
+  onUsage?: (usage: ModelTokenUsage) => void
   onDone?: (full: string) => void
   onError?: (message: string) => void
 }
@@ -41,11 +59,33 @@ const api = {
   activate: (code: string): Promise<ActivationResult> =>
     ipcRenderer.invoke('activation:activate', code),
 
+  deactivateCurrentDevice: (): Promise<ActivationDeactivationResult> =>
+    ipcRenderer.invoke('activation:deactivate'),
+
   canStartLicensedAnalysis: (): Promise<LicenseUsageResult> =>
     ipcRenderer.invoke('license:canStartAnalysis'),
 
   consumeAnalysisCredit: (operationId: string): Promise<LicenseUsageResult> =>
     ipcRenderer.invoke('license:consumeAnalysisCredit', operationId),
+
+  getPointsWallet: (): Promise<PointsWalletStatus> => ipcRenderer.invoke('points:get'),
+
+  canStartPointsReport: (): Promise<PointsAccessResult> => ipcRenderer.invoke('points:canStartReport'),
+
+  getReportPointsCharge: (reportSessionId: string): Promise<{ chargedPoints: number }> =>
+    ipcRenderer.invoke('points:reportCharge', reportSessionId),
+
+  redeemPointsCode: (code: string): Promise<PointsRedeemResult> =>
+    ipcRenderer.invoke('points:redeem', code),
+
+  grantDevelopmentPoints: (): Promise<PointsWalletStatus> =>
+    ipcRenderer.invoke('points:grantDevelopment'),
+
+  onPointsWalletChanged: (handler: (status: PointsWalletStatus) => void): (() => void) => {
+    const listener = (_event: unknown, status: PointsWalletStatus): void => handler(status)
+    ipcRenderer.on('points:changed', listener)
+    return () => ipcRenderer.removeListener('points:changed', listener)
+  },
 
   checkForUpdates: (): Promise<UpdateInfo> => ipcRenderer.invoke('update:check'),
 
@@ -121,6 +161,44 @@ const api = {
   showItemInFolder: (path: string): Promise<void> =>
     ipcRenderer.invoke('shell:showItemInFolder', path),
 
+  getTokenUsageSummary: (): Promise<TokenUsageDashboard> =>
+    ipcRenderer.invoke('token-usage:summary'),
+
+  openTokenUsageLocation: (): Promise<void> => ipcRenderer.invoke('token-usage:open-location'),
+
+  getSourceCleanCacheStats: (): Promise<SourceCleanCacheStats> =>
+    ipcRenderer.invoke('source-clean-cache:stats'),
+
+  clearSourceCleanCache: (): Promise<SourceCleanCacheStats> =>
+    ipcRenderer.invoke('source-clean-cache:clear'),
+
+  lookupSourceCleanCache: (input: SourceCleanCacheInput): Promise<SourceCleanCacheLookupResult> =>
+    ipcRenderer.invoke('source-clean-cache:lookup', input),
+
+  storeSourceCleanCache: (
+    input: SourceCleanCacheInput,
+    text: string
+  ): Promise<SourceCleanCacheStoreResult> =>
+    ipcRenderer.invoke('source-clean-cache:store', { input, text }),
+
+  getReportResultCacheStats: (): Promise<ReportResultCacheStats> =>
+    ipcRenderer.invoke('report-result-cache:stats'),
+
+  clearReportResultCache: (): Promise<ReportResultCacheStats> =>
+    ipcRenderer.invoke('report-result-cache:clear'),
+
+  lookupReportResultCache: (input: ReportResultCacheInput): Promise<ReportResultCacheLookupResult> =>
+    ipcRenderer.invoke('report-result-cache:lookup', input),
+
+  storeReportResultCache: (
+    input: ReportResultCacheInput,
+    snapshot: ReportResultCacheSnapshot
+  ): Promise<ReportResultCacheStoreResult> =>
+    ipcRenderer.invoke('report-result-cache:store', { input, snapshot }),
+
+  recordCostOptimization: (event: CostOptimizationEvent): Promise<boolean> =>
+    ipcRenderer.invoke('cost-optimization:record', event),
+
   exportMarkdown: (content: string, name: string): Promise<ExportResult> =>
     ipcRenderer.invoke('export:markdown', { content, name }),
 
@@ -131,11 +209,16 @@ const api = {
     ipcRenderer.invoke('export:html', { content, name }),
 
   /** 发起一次流式对话，返回 { abort } 以便取消 */
-  sendChat: (messages: ChatMessage[], handlers: ChatHandlers): { abort: () => void } => {
+  sendChat: (
+    messages: ChatMessage[],
+    context: ModelTaskContext,
+    handlers: ChatHandlers
+  ): { abort: () => void } => {
     const id = crypto.randomUUID()
     const channel = `chat:event:${id}`
     const listener = (_e: unknown, ev: ChatStreamEvent): void => {
       if (ev.type === 'chunk') handlers.onChunk?.(ev.delta)
+      else if (ev.type === 'usage') handlers.onUsage?.(ev.usage)
       else if (ev.type === 'done') {
         cleanup()
         handlers.onDone?.(ev.full)
@@ -148,7 +231,7 @@ const api = {
       ipcRenderer.removeListener(channel, listener)
     }
     ipcRenderer.on(channel, listener)
-    ipcRenderer.send('chat:start', { id, messages })
+    ipcRenderer.send('chat:start', { id, messages, context })
     return {
       abort: () => {
         ipcRenderer.send('chat:abort', id)
