@@ -39,7 +39,8 @@ import {
   consumeAnalysisCredit,
   deactivateCurrentDevice,
   getActivationStatus,
-  getActivationStatusWithServerCheck
+  getActivationStatusWithServerCheck,
+  redeemPointsWithCode
 } from './activation'
 import { readBundledSopRules } from './sopRules'
 import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
@@ -54,13 +55,14 @@ import {
 } from './tokenUsage'
 import {
   applyActivationPoints,
+  applyRechargeCodePoints,
   canStartPointsReport,
   getReportChargedPoints,
   getPointsWalletStatus,
   grantDevelopmentPoints,
   reconcileTokenUsage,
   settleTokenUsage,
-  transferOutPoints
+  clearLocalPointsAfterUnbind
 } from './pointsWallet'
 import {
   clearSourceCleanCache,
@@ -365,13 +367,13 @@ ipcMain.handle('activation:activate', async (_e, code: string) => {
 })
 ipcMain.handle('activation:deactivate', async () => {
   const before = getPointsWalletStatus()
-  const result = await deactivateCurrentDevice(before.balancePoints)
+  const result = await deactivateCurrentDevice()
   let wallet = before
-  if (result.ok && result.transferId) {
+  if (result.ok && result.unbindId) {
     try {
-      wallet = transferOutPoints(result.transferId)
+      wallet = clearLocalPointsAfterUnbind(result.unbindId)
     } catch {
-      result.message += ' 本机积分记录清理失败，但授权已解除；请不要在旧电脑继续使用，并联系管理员。'
+      result.message += ' 本机积分显示未能清理，但云端授权已解除；请不要在旧电脑继续使用，并联系管理员。'
     }
   }
   for (const window of BrowserWindow.getAllWindows()) {
@@ -409,20 +411,20 @@ ipcMain.handle('points:grantDevelopment', () => {
 })
 ipcMain.handle('points:redeem', async (_e, code: string) => {
   const before = getPointsWalletStatus()
-  const activation = await activateWithCode(code)
-  if (!activation.ok) {
+  const currentActivation = getActivationStatus()
+  const grant = await redeemPointsWithCode(code)
+  if (!grant.ok || !grant.grantId || !grant.points) {
     return {
       ok: false,
-      message: activation.message,
-      activation: activation.status,
+      message: grant.message,
+      activation: currentActivation,
       addedPoints: 0,
       wallet: before
     }
   }
-  const applied = applyActivationPoints(activation.status)
+  const applied = applyRechargeCodePoints(grant.grantId, grant.points)
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) {
-      window.webContents.send('activation:changed', activation.status)
       window.webContents.send('points:changed', applied.wallet)
     }
   }
@@ -430,10 +432,8 @@ ipcMain.handle('points:redeem', async (_e, code: string) => {
     ok: applied.addedPoints > 0,
     message: applied.addedPoints > 0
       ? `充值成功，已增加 ${applied.addedPoints} 积分。`
-      : activation.status.licenseType !== 'credits' || (activation.status.creditsRemaining || 0) <= 0
-        ? '这个激活码不包含可充值积分，请使用管理员发放的积分码。'
-        : '这个充值码已经入账过，积分没有重复增加。',
-    activation: activation.status,
+      : '这个积分码已经入账过，积分没有重复增加。',
+    activation: currentActivation,
     addedPoints: applied.addedPoints,
     wallet: applied.wallet
   }

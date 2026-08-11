@@ -6,8 +6,8 @@ const developmentLicenseBaseUrl =
     : ''
 export const LICENSE_BASE_URL = developmentLicenseBaseUrl || 'https://license.dadaozixun.com/api/license'
 export const LICENSE_ACTIVATE_URL = `${LICENSE_BASE_URL}/activate`
-export const LICENSE_DEACTIVATE_URL = `${LICENSE_BASE_URL}/deactivate`
-export const LICENSE_TRANSFER_CLAIM_URL = `${LICENSE_BASE_URL}/transfer/claim`
+export const LICENSE_DEVICE_UNBIND_URL = `${LICENSE_BASE_URL}/device/unbind`
+export const LICENSE_DEVICE_STATUS_URL = `${LICENSE_BASE_URL}/device/status`
 
 export const UPDATE_BASE_URL = 'https://update.dadaozixun.com'
 export const UPDATE_LATEST_URL = `${UPDATE_BASE_URL}/api/update/latest`

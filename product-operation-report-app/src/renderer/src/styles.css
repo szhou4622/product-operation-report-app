@@ -4170,6 +4170,55 @@ body.resizing .pane-resizer {
   line-height: 1.5;
 }
 
+.service-license-code {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 11px 12px;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  background: #f8fbff;
+}
+
+.service-license-code > div:first-child {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.service-license-code span {
+  color: #475569;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.service-license-code code {
+  overflow-wrap: anywhere;
+  color: #0f172a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.service-license-code small {
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.service-license-code > em {
+  grid-column: 1 / -1;
+  color: #047857;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.service-license-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .service-transfer-confirm {
   padding: 13px 14px;
   border: 1px solid #fde68a;
@@ -4208,6 +4257,14 @@ body.resizing .pane-resizer {
 
   .service-device-heading {
     grid-template-columns: 1fr;
+  }
+
+  .service-license-code {
+    grid-template-columns: 1fr;
+  }
+
+  .service-license-actions .btn {
+    flex: 1;
   }
 }
 

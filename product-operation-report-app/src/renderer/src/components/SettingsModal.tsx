@@ -49,6 +49,12 @@ function formatPoints(value: number): string {
     : value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
 }
 
+function maskActivationCode(code: string): string {
+  const value = code.trim()
+  if (value.length <= 8) return '••••••••'
+  return `${value.slice(0, 4)}${'•'.repeat(Math.min(12, value.length - 8))}${value.slice(-4)}`
+}
+
 function normalizeSettings(settings: AppSettings): AppSettings {
   return {
     ...settings,
@@ -117,6 +123,8 @@ export default function SettingsModal(): JSX.Element | null {
   const [deactivationConfirmOpen, setDeactivationConfirmOpen] = useState(false)
   const [deactivationBusy, setDeactivationBusy] = useState(false)
   const [deactivationError, setDeactivationError] = useState('')
+  const [showActivationCode, setShowActivationCode] = useState(false)
+  const [activationCodeNotice, setActivationCodeNotice] = useState('')
   const imgRef = useRef<HTMLInputElement>(null)
   const testRequestSeq = useRef(0)
   const modelsRequestSeq = useRef(0)
@@ -163,6 +171,8 @@ export default function SettingsModal(): JSX.Element | null {
     let alive = true
     setDeactivationConfirmOpen(false)
     setDeactivationError('')
+    setShowActivationCode(false)
+    setActivationCodeNotice('')
     void Promise.all([window.api.getActivationStatus(), window.api.getPointsWallet()])
       .then(([activation, wallet]) => {
         if (!alive) return
@@ -278,6 +288,17 @@ export default function SettingsModal(): JSX.Element | null {
     }
   }
 
+  const copyCurrentActivationCode = async (): Promise<void> => {
+    const code = activationStatus?.activationCode
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+      setActivationCodeNotice('已复制')
+    } catch {
+      setActivationCodeNotice('复制失败，请点击“显示”后手动记录。')
+    }
+  }
+
   if (!open) return null
 
   const cachePanel = (
@@ -367,12 +388,41 @@ export default function SettingsModal(): JSX.Element | null {
                   更换电脑
                 </button>
               </div>
+              <div className="service-license-code">
+                <div>
+                  <span>当前软件激活码</span>
+                  <code>
+                    {activationStatus?.activationCode
+                      ? showActivationCode
+                        ? activationStatus.activationCode
+                        : maskActivationCode(activationStatus.activationCode)
+                      : '旧版本地授权未保存原码'}
+                  </code>
+                  <small>积分充值码只增加余额，不会替换这里的激活码。</small>
+                </div>
+                {activationStatus?.activationCode && (
+                  <div className="service-license-actions">
+                    <button className="btn" type="button" onClick={() => setShowActivationCode((value) => !value)}>
+                      {showActivationCode ? '隐藏' : '显示'}
+                    </button>
+                    <button className="btn" type="button" onClick={() => void copyCurrentActivationCode()}>
+                      复制
+                    </button>
+                  </div>
+                )}
+                {activationCodeNotice && <em>{activationCodeNotice}</em>}
+              </div>
               {deactivationConfirmOpen && (
                 <div className="service-transfer-confirm" role="group" aria-label="确认解除本机绑定">
                   <strong>确认解除这台电脑的绑定？</strong>
                   <p>
-                    解除后软件会回到激活页面。历史报告仍保留；在新电脑输入同一个激活码即可继续使用。
-                    {pointsWallet && ` 当前剩余 ${formatPoints(pointsWallet.balancePoints)} 积分会一并转移。`}
+                    {activationStatus?.source === 'legacy'
+                      ? '当前是旧版本地授权，没有建立云端设备绑定。解除后历史报告仍保留；新电脑通过服务器输入激活码后即可使用，积分以服务器记录为准。'
+                      : `解除后软件会回到激活页面。历史报告仍保留；在新电脑输入同一个激活码即可继续使用。${
+                          pointsWallet
+                            ? ` 当前剩余 ${formatPoints(pointsWallet.balancePoints)} 积分由服务器保留，重新绑定后自动恢复。`
+                            : ''
+                        }`}
                   </p>
                   {deactivationError && <div className="privacy-error">{deactivationError}</div>}
                   <div className="service-transfer-actions">

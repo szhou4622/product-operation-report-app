@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createCipheriv, createHash, randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { app, BrowserWindow } from 'electron'
@@ -18,7 +18,7 @@ import {
   getActivationStatus,
   getActivationStatusWithServerCheck,
   LEGACY_ACTIVATION_POINTS,
-  shouldAllowLegacyFallback
+  redeemPointsWithCode
 } from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
@@ -42,13 +42,14 @@ import {
 } from '../src/main/tokenUsage'
 import {
   applyActivationPoints,
+  applyRechargeCodePoints,
   calculateUsagePoints,
   canStartPointsReport,
   getPointsWalletStatus,
   grantDevelopmentPoints,
   pointsWalletInternals,
   settleTokenUsage,
-  transferOutPoints
+  clearLocalPointsAfterUnbind
 } from '../src/main/pointsWallet'
 import {
   clearSourceCleanCache,
@@ -79,6 +80,7 @@ import {
   sanitizeHtmlFragment,
   stripProductVisualBrief
 } from '../src/main/htmlReport'
+
 import {
   buildProjectSnapshot,
   friendlyError,
@@ -93,6 +95,16 @@ import { buildFinalReportPartMessages, buildStepMessages, COMPACT_RUNTIME_RULES 
 import { FINAL_REPORT_PARTS } from '../src/renderer/src/reportTemplate'
 import { buildLocalTableCleanDetail, preprocessTableForModel } from '../src/renderer/src/tablePreprocess'
 import type { ChatStreamEvent, ModelProfile, TokenUsageRecord } from '../src/shared/types'
+
+function encryptV032StoredCode(code: string, deviceId: string): string {
+  const key = createHash('sha256')
+    .update(`product-operation-report:server-code:v1:${deviceId}`, 'utf8')
+    .digest()
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(code, 'utf8'), cipher.final()])
+  return `v1:${iv.toString('base64url')}:${cipher.getAuthTag().toString('base64url')}:${encrypted.toString('base64url')}`
+}
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
 app.setPath('userData', tempUserData)
@@ -185,15 +197,6 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   assert.equal(migratedUnlimited.licenseId, activationStatus.licenseId, 'legacy code keeps one stable top-up identity')
   assert.equal(applyActivationPoints(migratedUnlimited).addedPoints, 0, 'upgrading an old unlimited record cannot grant twice')
   writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(activationRecord), 'utf8')
-  assert.equal(
-    shouldAllowLegacyFallback('兑换码不存在、尚未导入服务器或不属于当前软件。', false, false),
-    true,
-    'a bundled legacy code can still activate when the server has not imported it'
-  )
-  assert.equal(shouldAllowLegacyFallback('激活码已禁用', false, false), false)
-  assert.equal(shouldAllowLegacyFallback('机器码不匹配', false, false), false)
-  assert.equal(shouldAllowLegacyFallback('授权已过期', false, false), false)
-
   const firstSettings = {
     profiles: [{ ...profile, name: '第一配置', apiKey: ' key-one ' }],
     activeProfileId: profile.id,
@@ -236,7 +239,9 @@ async function testServerActivationAndCredits(): Promise<void> {
           license_type: 'credits',
           credits: 100,
           unlimited: false,
-          status: 'active'
+          status: 'active',
+          device_credential: 'points-device-credential',
+          session_token: 'points-device-session'
         },
         message: '激活成功'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -284,6 +289,8 @@ async function testServerActivationAndCredits(): Promise<void> {
       credits: 0,
       unlimited: true,
       status: 'active',
+      device_credential: 'unlimited-device-credential',
+      session_token: 'unlimited-device-session',
       message: '激活成功'
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
     const unlimited = await activateWithCode('SERVER-UNLIMITED-TEST-CODE')
@@ -311,37 +318,93 @@ async function testServerActivationAndCredits(): Promise<void> {
   }
 }
 
-async function testDeviceDeactivationAndPointsTransfer(): Promise<void> {
+async function testStandardCodeWithGrantedCreditsAndZeroServerBalance(): Promise<void> {
   const originalFetch = globalThis.fetch
-  const code = 'SERVER-DEVICE-TRANSFER-CODE'
   const activationFile = join(tempUserData, 'activation.json')
   const activationBackup = `${activationFile}.bak`
-  let mode: 'initial' | 'server-error' | 'wrong-machine' | 'deactivate' | 'claim-transfer' = 'initial'
-  let deactivationBody: Record<string, unknown> = {}
+  let activationCalls = 0
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
+    globalThis.fetch = (async () => {
+      activationCalls += 1
+      return new Response(JSON.stringify({
+        ok: true,
+        success: true,
+        license: {
+          code_id: 'standard-code-with-points',
+          license_type: 'standard',
+          credits: 100,
+          remaining_credits: 0,
+          unlimited: false,
+          binding_status: 'active',
+          ...(activationCalls === 1
+            ? {
+                device_credential: 'standard-points-credential',
+                session_token: 'standard-points-session'
+              }
+            : {})
+        },
+        message: activationCalls === 1 ? '激活成功' : '该激活码已绑定本机，授权仍然有效。'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.licenseType, 'credits')
+    assert.equal(activated.status.creditsRemaining, 100)
+    assert.equal(applyActivationPoints(activated.status).addedPoints, 100)
+    assert.equal(getPointsWalletStatus().balancePoints, 100)
+    assert.equal(applyActivationPoints(activated.status).addedPoints, 0)
+    assert.equal(getPointsWalletStatus().balancePoints, 100, 'the compatibility grant must remain idempotent')
+
+    const repeated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
+    assert.equal(repeated.ok, true, 'same-device activation may reuse locally encrypted device credentials')
+    assert.equal(repeated.status.creditsRemaining, 100)
+    assert.equal(applyActivationPoints(repeated.status).addedPoints, 0)
+    assert.equal(getPointsWalletStatus().balancePoints, 100)
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
+  }
+}
+
+async function testDeviceUnbindAndRebind(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'SERVER-DEVICE-REBIND-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  let mode: 'initial' | 'server-error' | 'wrong-machine' | 'cooldown' | 'limit' | 'unbind' | 'rebind' = 'initial'
+  let unbindBody: Record<string, unknown> = {}
+  let unbindHeaders = new Headers()
+  let activationCalls = 0
+  let statusMethod = ''
+  let statusHeaders = new Headers()
   try {
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
     pointsWalletInternals.resetForTests()
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
-      if (url.endsWith('/transfer/claim')) {
-        if (mode === 'claim-transfer') {
-          return new Response(JSON.stringify({
-            ok: true,
-            transfer_available: true,
-            transfer_id: 'transfer-test-001',
-            points_balance: 1_234.5,
-            message: '换机积分已恢复'
-          }), { status: 200, headers: { 'content-type': 'application/json' } })
-        }
+      if (url.includes('/device/status')) {
+        statusMethod = init?.method || 'GET'
+        statusHeaders = new Headers(init?.headers)
         return new Response(JSON.stringify({
           ok: true,
-          transfer_available: false,
-          message: '没有待领取的换机积分'
+          binding_status: 'active',
+          license_id: 'license-device-rebind',
+          license_type: 'credits',
+          remaining_points: 2_000,
+          transfer_count: 0,
+          message: '设备授权有效'
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
-      if (url.endsWith('/deactivate')) {
-        deactivationBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      if (url.endsWith('/device/unbind')) {
+        unbindBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+        unbindHeaders = new Headers(init?.headers)
         if (mode === 'server-error') {
           return new Response(JSON.stringify({ ok: false, error: '服务暂时不可用' }), {
             status: 503,
@@ -354,22 +417,38 @@ async function testDeviceDeactivationAndPointsTransfer(): Promise<void> {
             headers: { 'content-type': 'application/json' }
           })
         }
+        if (mode === 'cooldown') {
+          return new Response(JSON.stringify({ ok: false, error: '成功换机后24小时内不能再次解绑' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        if (mode === 'limit') {
+          return new Response(JSON.stringify({ ok: false, error: '每个激活码30天内最多自助换机3次' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
         return new Response(JSON.stringify({
           ok: true,
-          deactivated: true,
-          transfer_id: 'transfer-test-001',
-          points_balance: 2_000,
+          binding_status: 'unbound',
+          unbind_id: 'unbind-test-001',
           message: '本机已解除绑定'
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
+      activationCalls += 1
       return new Response(JSON.stringify({
         ok: true,
         license: {
-          license_id: 'license-device-transfer',
+          license_id: 'license-device-rebind',
           license_type: 'credits',
-          credits: 2_000,
+          remaining_points: mode === 'rebind' ? 1_234.5 : 2_000,
           unlimited: false,
-          status: 'active'
+          status: 'active',
+          binding_status: 'active',
+          transfer_count: mode === 'rebind' ? 1 : 0,
+          device_credential: 'fake-device-credential',
+          session_token: 'fake-device-session'
         },
         message: '激活成功'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -379,46 +458,164 @@ async function testDeviceDeactivationAndPointsTransfer(): Promise<void> {
     assert.equal(activated.ok, true)
     assert.equal(applyActivationPoints(activated.status).addedPoints, 2_000)
     assert.equal(getPointsWalletStatus().balancePoints, 2_000)
+    const storedText = readFileSync(activationFile, 'utf8')
+    assert.equal(storedText.includes('fake-device-credential'), false, 'device credential must be encrypted at rest')
+    assert.equal(storedText.includes('fake-device-session'), false, 'device session must be encrypted at rest')
+    assert.equal(
+      typeof (JSON.parse(storedText) as Record<string, unknown>).encryptedCode,
+      'string',
+      'the primary activation code is retained only as an encrypted local value for status display'
+    )
+    assert.equal((await getActivationStatusWithServerCheck()).activated, true)
+    assert.equal(statusMethod, 'GET')
+    assert.equal(statusHeaders.get('authorization'), 'Bearer fake-device-session')
+    assert.equal(activationCalls, 1, 'startup validation must use device/status instead of activating again')
+
+    const oldClientRecord = JSON.parse(readFileSync(activationFile, 'utf8')) as Record<string, unknown>
+    oldClientRecord.encryptedCode = encryptV032StoredCode(code, activated.status.deviceId)
+    delete oldClientRecord.encryptedDeviceCredential
+    delete oldClientRecord.encryptedDeviceSession
+    writeFileSync(activationFile, JSON.stringify(oldClientRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(oldClientRecord), 'utf8')
 
     mode = 'server-error'
-    const unavailable = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
+    const unavailable = await deactivateCurrentDevice()
     assert.equal(unavailable.ok, false)
+    assert.equal(activationCalls, 2, 'a v0.3.2 activation must refresh device credentials before unbinding')
     assert.equal(existsSync(activationFile), true, 'server failure must keep the local activation')
 
     mode = 'wrong-machine'
-    const mismatch = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
+    const mismatch = await deactivateCurrentDevice()
     assert.equal(mismatch.ok, false)
     assert.match(mismatch.message, /机器码不匹配/)
     assert.equal(existsSync(activationFile), true, 'machine mismatch must keep the local activation')
 
-    mode = 'deactivate'
-    const deactivated = await deactivateCurrentDevice(getPointsWalletStatus().balancePoints)
-    assert.equal(deactivated.ok, true)
-    assert.equal(deactivated.transferId, 'transfer-test-001')
-    assert.equal(deactivationBody.app_name, 'ProductOperationReport')
-    assert.equal(deactivationBody.activation_code, code)
-    assert.equal(deactivationBody.machine_code, activated.status.deviceId)
-    assert.equal(deactivationBody.points_balance, 2_000)
+    mode = 'cooldown'
+    const cooldown = await deactivateCurrentDevice()
+    assert.equal(cooldown.ok, false)
+    assert.match(cooldown.message, /24小时/)
+    assert.equal(existsSync(activationFile), true, 'cooldown rejection must keep the local activation')
+
+    mode = 'limit'
+    const limited = await deactivateCurrentDevice()
+    assert.equal(limited.ok, false)
+    assert.match(limited.message, /30天内最多自助换机3次/)
+    assert.equal(existsSync(activationFile), true, '30-day limit rejection must keep the local activation')
+
+    mode = 'unbind'
+    const unbound = await deactivateCurrentDevice()
+    assert.equal(unbound.ok, true)
+    assert.equal(unbound.unbindId, 'unbind-test-001')
+    assert.equal(unbindBody.app_name, 'ProductOperationReport')
+    assert.equal(unbindBody.machine_code, activated.status.deviceId)
+    assert.equal(unbindBody.device_credential, 'fake-device-credential')
+    assert.equal(unbindHeaders.get('authorization'), 'Bearer fake-device-session')
+    assert.equal(unbindBody.activation_code, undefined, 'unbind must not submit the activation code')
+    assert.equal(unbindBody.points_balance, undefined, 'server keeps the authoritative points balance')
+    assert.equal(unbindBody.transfer_code, undefined, 'unbind does not use a transfer code')
     assert.equal(existsSync(activationFile), false)
     assert.equal(existsSync(activationBackup), false)
     assert.equal(getActivationStatus().activated, false)
 
-    transferOutPoints(deactivated.transferId || '')
+    clearLocalPointsAfterUnbind(unbound.unbindId || '')
     assert.equal(getPointsWalletStatus().balancePoints, 0)
-    transferOutPoints(deactivated.transferId || '')
+    clearLocalPointsAfterUnbind(unbound.unbindId || '')
     assert.equal(getPointsWalletStatus().balancePoints, 0, 'repeated local cleanup is idempotent')
-    assert.equal((await deactivateCurrentDevice(0)).ok, false, 'repeated deactivation is rejected safely')
+    assert.equal((await deactivateCurrentDevice()).ok, false, 'repeated unbind is rejected safely')
 
-    mode = 'claim-transfer'
+    mode = 'rebind'
     const reactivated = await activateWithCode(code)
     assert.equal(reactivated.ok, true)
-    assert.equal(reactivated.status.pointsGrantKind, 'device_transfer')
-    assert.equal(reactivated.status.pointsGrantId, 'transfer-test-001')
-    assert.equal(reactivated.status.pointsGrantPoints, 1_234.5)
+    assert.equal(reactivated.status.bindingStatus, 'active')
+    assert.equal(reactivated.status.transferCount, 1)
+    assert.equal(reactivated.status.creditsRemaining, 1_234.5)
     applyActivationPoints(reactivated.status)
     assert.equal(getPointsWalletStatus().balancePoints, 1_234.5)
     applyActivationPoints(reactivated.status)
-    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5, 'the same transfer cannot be claimed twice locally')
+    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5, 'the same binding generation cannot restore points twice')
+
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    const deviceId = getActivationStatus().deviceId
+    const v1Record = {
+      version: 1,
+      codeHash: ACTIVATION_CODE_HASHES[0],
+      deviceId,
+      activatedAt: new Date().toISOString()
+    }
+    writeFileSync(activationFile, JSON.stringify(v1Record), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(v1Record), 'utf8')
+    const activationCallsBeforeLegacyUnbind = activationCalls
+    const legacyDirectUnbind = await deactivateCurrentDevice()
+    assert.equal(legacyDirectUnbind.ok, true, 'v1 local-only authorization can be removed without entering the code')
+    assert.equal(
+      activationCalls,
+      activationCallsBeforeLegacyUnbind,
+      'a v1 local-only record has no server binding and must not call activate during local removal'
+    )
+    assert.equal(existsSync(activationFile), false)
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
+  }
+}
+
+async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const primaryCode = 'PRIMARY-A-CODE'
+  const rechargeCode = 'RECHARGE-B-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    pointsWalletInternals.resetForTests()
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      const code = String(body.activation_code || '')
+      const isRecharge = code === rechargeCode
+      return new Response(JSON.stringify({
+        ok: true,
+        license: {
+          license_id: isRecharge ? 'license-b-recharge' : 'license-a-primary',
+          license_type: 'credits',
+          remaining_points: isRecharge ? 100 : 20,
+          binding_status: 'active',
+          transfer_count: 0,
+          device_credential: isRecharge ? 'credential-b' : 'credential-a',
+          session_token: isRecharge ? 'session-b' : 'session-a'
+        },
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const primary = await activateWithCode(primaryCode)
+    assert.equal(primary.ok, true)
+    assert.equal(primary.status.activationCode, primaryCode)
+    assert.equal(applyActivationPoints(primary.status).addedPoints, 20)
+    assert.equal(getPointsWalletStatus().balancePoints, 20)
+
+    const grant = await redeemPointsWithCode(rechargeCode)
+    assert.equal(grant.ok, true)
+    assert.equal(grant.grantId, 'license-b-recharge')
+    assert.equal(grant.points, 100)
+    assert.equal(applyRechargeCodePoints(grant.grantId || '', grant.points || 0).addedPoints, 100)
+    assert.equal(getPointsWalletStatus().balancePoints, 120)
+    assert.equal(getActivationStatus().licenseId, 'license-a-primary')
+    assert.equal(getActivationStatus().activationCode, primaryCode, 'B code must not replace the displayed A code')
+
+    const repeatedGrant = await redeemPointsWithCode(rechargeCode)
+    assert.equal(repeatedGrant.ok, true)
+    assert.equal(applyRechargeCodePoints(repeatedGrant.grantId || '', repeatedGrant.points || 0).addedPoints, 0)
+    assert.equal(getPointsWalletStatus().balancePoints, 120)
+    const primaryAsRecharge = await redeemPointsWithCode(primaryCode)
+    assert.equal(primaryAsRecharge.ok, false)
+    assert.match(primaryAsRecharge.message, /当前软件激活码不能作为积分码/)
+    const stored = readFileSync(activationFile, 'utf8')
+    assert.equal(stored.includes(primaryCode), false, 'primary code must be encrypted at rest')
+    assert.equal(stored.includes(rechargeCode), false, 'recharge code must never be stored in activation state')
   } finally {
     globalThis.fetch = originalFetch
     rmSync(activationFile, { force: true })
@@ -1351,13 +1548,8 @@ async function testRealTokenPointsBilling(): Promise<void> {
   assert.equal(denied.ok, false)
   assert.match(denied.message, /欠费/)
 
-  const nextBackendCode = {
-    ...activation,
-    licenseId: 'topup-300',
-    creditsRemaining: 300
-  }
-  assert.equal(applyActivationPoints(nextBackendCode).addedPoints, 300, 'a newly generated backend code can top up once')
-  assert.equal(applyActivationPoints(nextBackendCode).addedPoints, 0, 'reusing the same backend code cannot top up twice')
+  assert.equal(applyRechargeCodePoints('topup-300', 300).addedPoints, 300, 'a newly generated backend code can top up once')
+  assert.equal(applyRechargeCodePoints('topup-300', 300).addedPoints, 0, 'reusing the same backend code cannot top up twice')
   const wrongAppCode = {
     ...activation,
     appName: 'AnotherDesktopApp',
@@ -2793,8 +2985,12 @@ async function run(): Promise<void> {
   await testActivationAndSettingsBackup()
   console.log('Regression: server activation, offline grace and idempotent credits')
   await testServerActivationAndCredits()
-  console.log('Regression: safe device deactivation and remaining-points transfer')
-  await testDeviceDeactivationAndPointsTransfer()
+  console.log('Regression: standard activation codes with an explicit credit grant')
+  await testStandardCodeWithGrantedCreditsAndZeroServerBalance()
+  console.log('Regression: safe device unbind and original-code rebind')
+  await testDeviceUnbindAndRebind()
+  console.log('Regression: primary activation code remains unchanged after points recharge')
+  await testPrimaryActivationAndRechargeCodeSeparation()
   console.log('Regression: update version comparison')
   testUpdateVersionComparison()
   console.log('Regression: update config and SHA256 guard')

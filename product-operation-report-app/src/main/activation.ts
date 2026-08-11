@@ -19,9 +19,9 @@ import { ACTIVATION_CODE_COUNT, ACTIVATION_CODE_HASHES } from './activationCodes
 import {
   LICENSE_ACTIVATE_URL,
   LICENSE_APP_NAME,
-  LICENSE_DEACTIVATE_URL,
+  LICENSE_DEVICE_STATUS_URL,
+  LICENSE_DEVICE_UNBIND_URL,
   LICENSE_OFFLINE_GRACE_MS,
-  LICENSE_TRANSFER_CLAIM_URL,
   NETWORK_TIMEOUT_MS
 } from './serviceConfig'
 
@@ -63,10 +63,10 @@ interface ServerStoredActivation {
   lastValidatedAt?: string
   offlineUntil?: string
   offlineSince?: string
-  pointsGrantId?: string
-  pointsGrantPoints?: number
-  pointsGrantKind?: 'device_transfer'
-  pointsSyncPending?: boolean
+  encryptedDeviceCredential?: string
+  encryptedDeviceSession?: string
+  bindingStatus?: 'active' | 'unbound'
+  transferCount?: number
   revokedReason?: string
   serverMessage?: string
 }
@@ -77,29 +77,24 @@ interface ServerLicense {
   ok: boolean
   message: string
   unavailable: boolean
-  appNotProvisioned: boolean
+  hasLicenseDetails: boolean
   licenseId?: string
   licenseType: 'credits' | 'unlimited' | 'standard'
   unlimited: boolean
   creditsRemaining?: number
+  creditsGranted?: number
   expiresAt?: string
+  deviceCredential?: string
+  deviceSession?: string
+  bindingStatus?: 'active' | 'unbound'
+  transferCount?: number
 }
 
-interface DeviceTransferClaim {
-  ok: boolean
-  supported: boolean
-  unavailable: boolean
-  message: string
-  transferId?: string
-  points?: number
-}
-
-interface ServerDeactivation {
+interface ServerDeviceUnbind {
   ok: boolean
   unavailable: boolean
   message: string
-  transferId?: string
-  points?: number
+  unbindId?: string
 }
 
 function sha256(value: string): string {
@@ -198,7 +193,7 @@ function asFiniteNumber(value: unknown): number | undefined {
 
 function asFinitePoints(value: unknown): number | undefined {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
-  if (!Number.isFinite(number) || Math.abs(number) > 10_000_000) return undefined
+  if (!Number.isFinite(number) || number < 0 || number > 10_000_000) return undefined
   return Math.round(number * 1_000) / 1_000
 }
 
@@ -293,6 +288,14 @@ function decryptActivationCode(value: string | undefined, deviceId: string): str
   }
 }
 
+function encryptServerSecret(value: string | undefined, deviceId: string): string | undefined {
+  return value ? encryptActivationCode(value, deviceId) : undefined
+}
+
+function decryptServerSecret(value: string | undefined, deviceId: string): string | null {
+  return decryptActivationCode(value, deviceId)
+}
+
 function recordMatchesDevice(record: StoredActivation, deviceId: string): boolean {
   return record.deviceId === deviceId || record.deviceId === getLegacyDeviceId()
 }
@@ -332,7 +335,10 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
     }
   }
 
-  const bundledLegacy = allowedCodeHashes.has(record.codeHash)
+  const bundledLegacy = allowedCodeHashes.has(record.codeHash) && (
+    record.source === 'legacy' ||
+    (record.licenseType === 'unlimited' && !record.encryptedDeviceCredential)
+  )
   const remaining = bundledLegacy ? LEGACY_ACTIVATION_POINTS : record.creditsRemaining
   const licenseType = bundledLegacy ? 'credits' : record.licenseType
   const unlimited = bundledLegacy ? false : record.unlimited
@@ -340,13 +346,15 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
   const offlineExpired = record.source === 'server' && Boolean(record.offlineUntil) && Date.now() > Date.parse(record.offlineUntil || '')
   const valid =
     record.appName === LICENSE_APP_NAME &&
+    record.bindingStatus !== 'unbound' &&
     !record.revokedReason &&
     !isExpired(record.expiresAt) &&
     !offlineExpired &&
     (record.source === 'server' || allowedCodeHashes.has(record.codeHash))
 
   let message = record.serverMessage
-  if (record.revokedReason) message = record.revokedReason
+  if (record.bindingStatus === 'unbound') message = '本机已解除绑定，请在需要使用的电脑输入原激活码。'
+  else if (record.revokedReason) message = record.revokedReason
   else if (isExpired(record.expiresAt)) message = '授权已过期，请联系管理员。'
   else if (licenseType === 'credits' && remaining !== undefined && remaining <= 0) message = '积分已用完，请输入新的激活码后再开始分析。'
   else if (offlineExpired) message = '离线授权时间已超过 72 小时，请联网后重新检查。'
@@ -358,6 +366,7 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
     activated: valid,
     activatedAt: valid ? record.activatedAt : undefined,
     licenseId: valid ? (bundledLegacy ? legacyLicenseId(record.codeHash) : record.licenseId || record.codeHash.slice(0, 10).toUpperCase()) : undefined,
+    activationCode: valid ? decryptActivationCode(record.encryptedCode, deviceId) || undefined : undefined,
     source: record.source,
     licenseType,
     unlimited,
@@ -365,10 +374,8 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
     expiresAt: record.expiresAt,
     offline,
     offlineUntil: record.offlineUntil,
-    pointsGrantId: record.pointsGrantId,
-    pointsGrantPoints: record.pointsGrantPoints,
-    pointsGrantKind: record.pointsGrantKind,
-    pointsSyncPending: record.pointsSyncPending,
+    bindingStatus: record.bindingStatus,
+    transferCount: record.transferCount,
     message
   }
 }
@@ -398,42 +405,76 @@ function pickFirst(source: Record<string, unknown>, body: Record<string, unknown
   return undefined
 }
 
+function pickFirstDeep(body: Record<string, unknown>, keys: string[], depth = 0): unknown {
+  for (const key of keys) {
+    if (body[key] !== undefined) return body[key]
+  }
+  if (depth >= 4) return undefined
+  for (const value of Object.values(body)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const found = pickFirstDeep(value as Record<string, unknown>, keys, depth + 1)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+function normalizeBindingStatus(value: unknown): 'active' | 'unbound' | undefined {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'active' || status === 'bound') return 'active'
+  if (status === 'unbound' || status === 'unbind') return 'unbound'
+  return undefined
+}
+
 function normalizeServerMessage(value: unknown, fallback: string): string {
   const message = asString(value)?.replace(/\s+/g, ' ').slice(0, 240)
   return message || fallback
 }
 
-export function shouldAllowLegacyFallback(
-  message: string,
-  unavailable: boolean,
-  appNotProvisioned: boolean
-): boolean {
-  if (unavailable || appNotProvisioned) return true
-  return /不存在|尚未导入|未导入|找不到|not[ -]?found|not[ -]?imported|unknown[ _-]?code/i.test(message)
-}
-
 function parseServerLicense(body: Record<string, unknown>, httpOk: boolean): ServerLicense {
   const payload = pickPayload(body)
+  const bindingStatus = normalizeBindingStatus(pickFirstDeep(body, ['binding_status']))
   const message = normalizeServerMessage(
     pickFirst(payload, body, ['message', 'error', 'detail', 'msg']),
-    httpOk ? '激活成功。' : '激活码校验失败。'
+    bindingStatus === 'unbound'
+      ? '当前设备已经解除绑定。'
+      : httpOk
+        ? '授权验证成功。'
+        : '激活码校验失败。'
   )
   const explicitOk = pickFirst(payload, body, ['ok', 'success', 'activated', 'valid'])
   const status = String(pickFirst(payload, body, ['status', 'license_status']) || '').toLowerCase()
-  const rejectedStatus = ['disabled', 'expired', 'invalid', 'revoked', 'blocked', 'machine_mismatch'].some((item) => status.includes(item))
-  const appNotProvisioned = /客户端应用不匹配|app(?:lication)?[^\w]*(?:mismatch|unknown|invalid)/i.test(message)
+  const rejectedStatus =
+    bindingStatus === 'unbound' ||
+    ['disabled', 'expired', 'invalid', 'revoked', 'blocked', 'machine_mismatch'].some((item) => status.includes(item))
   const ok = httpOk && explicitOk !== false && explicitOk !== 0 && explicitOk !== 'false' && !rejectedStatus
 
   const typeText = String(pickFirst(payload, body, ['license_type', 'type', 'code_type']) || '').toLowerCase()
+  const unlimitedValue = pickFirst(payload, body, ['unlimited', 'is_unlimited', 'permanent'])
   const unlimited =
-    asBoolean(pickFirst(payload, body, ['unlimited', 'is_unlimited', 'permanent'])) === true ||
+    asBoolean(unlimitedValue) === true ||
     /unlimited|permanent|lifetime|无限|永久/.test(typeText)
-  const creditsRemaining = asFiniteNumber(
-    pickFirst(payload, body, ['remaining_credits', 'credits_remaining', 'credits', 'points', 'balance', 'quota'])
+  const creditsRemaining = asFinitePoints(
+    pickFirstDeep(body, [
+      'remaining_credits',
+      'credits_remaining',
+      'remaining_points',
+      'wallet_balance',
+      'points_balance',
+      'balance'
+    ])
+  )
+  const creditsGranted = asFinitePoints(
+    pickFirstDeep(body, [
+      'credits',
+      'points',
+      'quota',
+      'initial_credits',
+      'granted_credits'
+    ])
   )
   const licenseType: ServerLicense['licenseType'] = unlimited
     ? 'unlimited'
-    : creditsRemaining !== undefined || /credit|point|积分/.test(typeText)
+    : creditsRemaining !== undefined || creditsGranted !== undefined || /credit|point|积分/.test(typeText)
       ? 'credits'
       : 'standard'
 
@@ -441,12 +482,26 @@ function parseServerLicense(body: Record<string, unknown>, httpOk: boolean): Ser
     ok,
     message,
     unavailable: false,
-    appNotProvisioned,
+    hasLicenseDetails:
+      Boolean(typeText) || unlimitedValue !== undefined || creditsRemaining !== undefined || creditsGranted !== undefined,
     licenseId: asString(pickFirst(payload, body, ['license_id', 'code_id', 'id', 'activation_id'])),
     licenseType,
     unlimited,
     creditsRemaining,
-    expiresAt: asString(pickFirst(payload, body, ['expires_at', 'expiresAt', 'expiry', 'valid_until']))
+    creditsGranted,
+    expiresAt: asString(pickFirstDeep(body, ['expires_at', 'expiresAt', 'expiry', 'valid_until'])),
+    deviceCredential: asString(pickFirstDeep(body, ['device_credential', 'deviceCredential'])),
+    deviceSession: asString(pickFirstDeep(body, [
+      'device_session',
+      'device_session_token',
+      'session_token',
+      'session',
+      'access_token',
+      'accessToken',
+      'device_access_token'
+    ])),
+    bindingStatus,
+    transferCount: asFiniteNumber(pickFirstDeep(body, ['transfer_count']))
   }
 }
 
@@ -484,7 +539,7 @@ async function requestServerActivation(code: string, deviceId: string): Promise<
       ok: false,
       message: timeout ? '连接激活服务器超时。' : '暂时无法连接激活服务器。',
       unavailable: true,
-      appNotProvisioned: false,
+      hasLicenseDetails: false,
       licenseType: 'standard',
       unlimited: false
     }
@@ -493,27 +548,28 @@ async function requestServerActivation(code: string, deviceId: string): Promise<
   }
 }
 
-async function requestDeviceTransferClaim(
-  code: string,
+async function requestServerDeviceStatus(
   deviceId: string,
-  licenseId?: string
-): Promise<DeviceTransferClaim> {
+  licenseId: string | undefined,
+  deviceCredential: string,
+  deviceSession: string
+): Promise<ServerLicense> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS)
   try {
-    const response = await fetch(LICENSE_TRANSFER_CLAIM_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({
-        app_name: LICENSE_APP_NAME,
-        activation_code: code,
-        machine_code: deviceId,
-        license_id: licenseId,
-        software_version: app.getVersion(),
-        platform: `${process.platform}-${process.arch}`,
-        code,
-        machine_id: deviceId
-      }),
+    const url = new URL(LICENSE_DEVICE_STATUS_URL)
+    url.searchParams.set('app_name', LICENSE_APP_NAME)
+    url.searchParams.set('machine_code', deviceId)
+    if (licenseId) url.searchParams.set('license_id', licenseId)
+    url.searchParams.set('software_version', app.getVersion())
+    url.searchParams.set('platform', `${process.platform}-${process.arch}`)
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${deviceSession}`,
+        'x-device-credential': deviceCredential
+      },
       signal: controller.signal
     })
     const text = await response.text()
@@ -522,106 +578,48 @@ async function requestDeviceTransferClaim(
       const parsed = JSON.parse(text) as unknown
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
     } catch {
-      body = {}
+      body = { error: response.ok ? '服务器返回了无法识别的授权状态。' : `授权状态检查失败（${response.status}）。` }
     }
-    if (response.status === 404) {
-      return {
-        ok: true,
-        supported: false,
-        unavailable: false,
-        message: '当前授权服务尚未启用积分迁移接口。'
-      }
-    }
-    const payload = pickPayload(body)
-    const message = normalizeServerMessage(
-      pickFirst(payload, body, ['message', 'error', 'detail', 'msg']),
-      response.ok ? '积分迁移状态已确认。' : `积分迁移确认失败（${response.status}）。`
-    )
-    const explicitOk = pickFirst(payload, body, ['ok', 'success'])
-    const ok = response.ok && explicitOk !== false && explicitOk !== 0 && explicitOk !== 'false'
-    const available = asBoolean(
-      pickFirst(payload, body, ['transfer_available', 'available', 'has_transfer'])
-    ) === true
-    const transferId = available
-      ? asString(pickFirst(payload, body, ['transfer_id', 'id']))
-      : undefined
-    const points = available
-      ? asFinitePoints(pickFirst(payload, body, ['points_balance', 'points', 'balance']))
-      : undefined
-    return {
-      ok,
-      supported: true,
-      unavailable: response.status >= 500,
-      message,
-      transferId: ok && available ? transferId : undefined,
-      points: ok && available ? points : undefined
-    }
+    return parseServerLicense(body, response.ok)
   } catch (error) {
     const timeout = error instanceof Error && error.name === 'AbortError'
     return {
       ok: false,
-      supported: true,
+      message: timeout ? '检查设备授权状态超时。' : '暂时无法检查设备授权状态。',
       unavailable: true,
-      message: timeout ? '同步换机积分超时，请保持联网后重试。' : '暂时无法同步换机积分，请保持联网后重试。'
+      hasLicenseDetails: false,
+      licenseType: 'standard',
+      unlimited: false
     }
   } finally {
     clearTimeout(timer)
   }
 }
 
-function withTransferClaim(record: ServerStoredActivation, claim: DeviceTransferClaim): ServerStoredActivation {
-  if (!claim.supported) {
-    return {
-      ...record,
-      pointsSyncPending: false,
-      serverMessage: record.serverMessage
-    }
-  }
-  if (!claim.ok) {
-    return {
-      ...record,
-      pointsSyncPending: true,
-      serverMessage: claim.message
-    }
-  }
-  if (claim.transferId && claim.points !== undefined) {
-    return {
-      ...record,
-      pointsGrantId: claim.transferId,
-      pointsGrantPoints: claim.points,
-      pointsGrantKind: 'device_transfer',
-      pointsSyncPending: false,
-      serverMessage: `换机成功，已恢复 ${claim.points} 积分。`
-    }
-  }
-  return {
-    ...record,
-    pointsSyncPending: false
-  }
-}
-
-async function requestServerDeactivation(
-  code: string,
+async function requestServerDeviceUnbind(
   deviceId: string,
   licenseId: string | undefined,
-  pointsBalance: number
-): Promise<ServerDeactivation> {
+  deviceCredential: string,
+  deviceSession: string
+): Promise<ServerDeviceUnbind> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS)
   try {
-    const response = await fetch(LICENSE_DEACTIVATE_URL, {
+    const response = await fetch(LICENSE_DEVICE_UNBIND_URL, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+        authorization: `Bearer ${deviceSession}`,
+        'x-device-credential': deviceCredential
+      },
       body: JSON.stringify({
         app_name: LICENSE_APP_NAME,
-        activation_code: code,
         machine_code: deviceId,
         license_id: licenseId,
-        points_balance: asFinitePoints(pointsBalance) ?? 0,
+        device_credential: deviceCredential,
         software_version: app.getVersion(),
-        platform: `${process.platform}-${process.arch}`,
-        code,
-        machine_id: deviceId
+        platform: `${process.platform}-${process.arch}`
       }),
       signal: controller.signal
     })
@@ -636,7 +634,7 @@ async function requestServerDeactivation(
     const payload = pickPayload(body)
     const unavailable = response.status === 404 || response.status >= 500
     const fallback = response.status === 404
-      ? '服务器尚未开通换设备功能，请联系管理员更新授权服务。'
+      ? '服务器尚未开通新版设备解绑接口，请联系管理员更新授权服务。'
       : response.ok
         ? '本机已解除绑定。'
         : `解除绑定失败（${response.status}）。`
@@ -644,15 +642,19 @@ async function requestServerDeactivation(
       pickFirst(payload, body, ['message', 'error', 'detail', 'msg']),
       fallback
     )
-    const explicitOk = pickFirst(payload, body, ['ok', 'success', 'deactivated'])
-    const ok = response.ok && explicitOk !== false && explicitOk !== 0 && explicitOk !== 'false'
+    const explicitOk = pickFirst(payload, body, ['ok', 'success', 'unbound'])
+    const bindingStatus = normalizeBindingStatus(pickFirstDeep(body, ['binding_status']))
+    const ok = response.ok &&
+      explicitOk !== false &&
+      explicitOk !== 0 &&
+      explicitOk !== 'false' &&
+      bindingStatus !== 'active'
     return {
       ok,
       unavailable,
       message,
-      transferId: ok ? asString(pickFirst(payload, body, ['transfer_id', 'id'])) : undefined,
-      points: ok
-        ? asFinitePoints(pickFirst(payload, body, ['points_balance', 'points', 'balance']))
+      unbindId: ok
+        ? asString(pickFirstDeep(body, ['unbind_id', 'operation_id', 'event_id', 'id']))
         : undefined
     }
   } catch (error) {
@@ -696,22 +698,23 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
 
   const current = migrateLegacyDevice(record, deviceId) as ServerStoredActivation
   const code = decryptActivationCode(current.encryptedCode, deviceId)
-  if (!code) {
+  const deviceCredential = decryptServerSecret(current.encryptedDeviceCredential, deviceId)
+  const deviceSession = decryptServerSecret(current.encryptedDeviceSession, deviceId)
+  if (!code && (!deviceCredential || !deviceSession)) {
     const revoked = { ...current, revokedReason: '本地授权记录不完整，请重新输入激活码。' }
     writeStoredActivation(revoked)
     return toStatus(revoked, deviceId)
   }
 
-  const result = await requestServerActivation(code, deviceId)
+  const result = deviceCredential && deviceSession
+    ? await requestServerDeviceStatus(deviceId, current.licenseId, deviceCredential, deviceSession)
+    : await requestServerActivation(code || '', deviceId)
   if (result.ok) {
     const now = new Date()
-    const bundledLegacy = allowedCodeHashes.has(current.codeHash)
     const serverRemaining = result.creditsRemaining
     const currentRemaining = current.creditsRemaining
     const creditsRemaining =
-      bundledLegacy
-        ? LEGACY_ACTIVATION_POINTS
-        : serverRemaining === undefined
+      serverRemaining === undefined
         ? currentRemaining
         : currentRemaining === undefined
           ? serverRemaining
@@ -719,25 +722,29 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     const baseUpdated: ServerStoredActivation = {
       ...current,
       source: 'server',
-      licenseId: bundledLegacy ? legacyLicenseId(current.codeHash) : result.licenseId || current.licenseId,
-      licenseType: bundledLegacy ? 'credits' : result.licenseType,
-      unlimited: bundledLegacy ? false : result.unlimited,
+      licenseId: result.licenseId || current.licenseId,
+      licenseType: result.hasLicenseDetails
+          ? result.licenseType
+          : current.licenseType,
+      unlimited: result.hasLicenseDetails
+          ? result.unlimited
+          : current.unlimited,
       creditsRemaining,
-      expiresAt: result.expiresAt,
+      expiresAt: result.expiresAt ?? current.expiresAt,
       lastValidatedAt: now.toISOString(),
       offlineUntil: new Date(now.getTime() + LICENSE_OFFLINE_GRACE_MS).toISOString(),
       offlineSince: undefined,
+      encryptedDeviceCredential:
+        encryptServerSecret(result.deviceCredential, deviceId) || current.encryptedDeviceCredential,
+      encryptedDeviceSession:
+        encryptServerSecret(result.deviceSession, deviceId) || current.encryptedDeviceSession,
+      bindingStatus: result.bindingStatus || 'active',
+      transferCount: result.transferCount ?? current.transferCount,
       revokedReason: undefined,
       serverMessage: result.message
     }
-    const claim = await requestDeviceTransferClaim(
-      code,
-      deviceId,
-      baseUpdated.licenseId
-    )
-    const updated = withTransferClaim(baseUpdated, claim)
-    writeStoredActivation(updated)
-    return toStatus(updated, deviceId)
+    writeStoredActivation(baseUpdated)
+    return toStatus(baseUpdated, deviceId)
   }
 
   if (result.unavailable || (current.source === 'legacy' && !result.ok)) {
@@ -764,10 +771,33 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
 
   const deviceId = currentStatus.deviceId
   const codeHash = hashActivationCode(enteredCode)
-  const bundledLegacy = allowedCodeHashes.has(codeHash)
+  const currentRecord = readStoredActivation()
   const server = await requestServerActivation(enteredCode, deviceId)
   if (server.ok) {
+    const reusableRecord =
+      currentRecord?.version === 2 &&
+      currentRecord.codeHash === codeHash &&
+      recordMatchesDevice(currentRecord, deviceId)
+        ? currentRecord
+        : null
+    const deviceCredential =
+      server.deviceCredential ||
+      decryptServerSecret(reusableRecord?.encryptedDeviceCredential, deviceId)
+    const deviceSession =
+      server.deviceSession ||
+      decryptServerSecret(reusableRecord?.encryptedDeviceSession, deviceId)
+    if (!deviceCredential || !deviceSession) {
+      return {
+        ok: false,
+        message: '服务器已识别激活码，但没有返回设备会话和设备凭证，本机也没有可复用的旧凭证。为避免以后无法直接解绑，本次没有写入授权；请联系管理员检查服务器的重复激活配置。',
+        status: currentStatus
+      }
+    }
     const now = new Date()
+    const activationCredits =
+      server.creditsRemaining !== undefined && server.creditsRemaining > 0
+        ? server.creditsRemaining
+        : server.creditsGranted
     const baseRecord: ServerStoredActivation = {
       version: 2,
       appName: LICENSE_APP_NAME,
@@ -776,59 +806,70 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
       encryptedCode: encryptActivationCode(enteredCode, deviceId),
       deviceId,
       activatedAt: now.toISOString(),
-      licenseId: bundledLegacy ? legacyLicenseId(codeHash) : server.licenseId,
-      licenseType: bundledLegacy ? 'credits' : server.licenseType,
-      unlimited: bundledLegacy ? false : server.unlimited,
-      creditsRemaining: bundledLegacy ? LEGACY_ACTIVATION_POINTS : server.creditsRemaining,
+      licenseId: server.licenseId,
+      licenseType: server.licenseType,
+      unlimited: server.unlimited,
+      creditsRemaining: activationCredits ?? server.creditsRemaining,
       usedOperationIds: [],
       expiresAt: server.expiresAt,
       lastValidatedAt: now.toISOString(),
       offlineUntil: new Date(now.getTime() + LICENSE_OFFLINE_GRACE_MS).toISOString(),
       offlineSince: undefined,
+      encryptedDeviceCredential: encryptServerSecret(deviceCredential, deviceId),
+      encryptedDeviceSession: encryptServerSecret(deviceSession, deviceId),
+      bindingStatus: server.bindingStatus || 'active',
+      transferCount: server.transferCount,
       serverMessage: server.message
     }
-    const claim = await requestDeviceTransferClaim(
-      enteredCode,
-      deviceId,
-      baseRecord.licenseId
-    )
-    const record = withTransferClaim(baseRecord, claim)
-    writeStoredActivation(record)
-    const status = toStatus(record, deviceId)
+    writeStoredActivation(baseRecord)
+    const status = toStatus(baseRecord, deviceId)
     return {
       ok: status.activated,
-      message: status.activated ? record.serverMessage || server.message : status.message || server.message,
+      message: status.activated ? baseRecord.serverMessage || server.message : status.message || server.message,
       status
     }
   }
 
-  if (
-    bundledLegacy &&
-    shouldAllowLegacyFallback(server.message, server.unavailable, server.appNotProvisioned)
-  ) {
-    const record: ServerStoredActivation = {
-      version: 2,
-      appName: LICENSE_APP_NAME,
-      source: 'legacy',
-      codeHash,
-      encryptedCode: encryptActivationCode(enteredCode, deviceId),
-      deviceId,
-      activatedAt: new Date().toISOString(),
-      licenseId: legacyLicenseId(codeHash),
-      licenseType: 'credits',
-      unlimited: false,
-      creditsRemaining: LEGACY_ACTIVATION_POINTS,
-      serverMessage: server.appNotProvisioned
-        ? `旧版激活码已兼容启用并发放 ${LEGACY_ACTIVATION_POINTS} 积分；服务器开通后可重新输入该码完成绑定。`
-        : server.unavailable
-          ? `网络不可用，旧版激活码已启用并发放 ${LEGACY_ACTIVATION_POINTS} 积分。`
-          : `旧版激活码已兼容启用并发放 ${LEGACY_ACTIVATION_POINTS} 积分；即使服务器尚未导入该旧码，本机授权仍然可用。`
-    }
-    writeStoredActivation(record)
-    return { ok: true, message: record.serverMessage || '激活成功。', status: toStatus(record, deviceId) }
+  return { ok: false, message: server.message, status: currentStatus }
+}
+
+export async function redeemPointsWithCode(input: string): Promise<{
+  ok: boolean
+  message: string
+  grantId?: string
+  points?: number
+}> {
+  const currentStatus = getActivationStatus()
+  if (!currentStatus.activated) {
+    return { ok: false, message: '软件授权不可用，请先使用主激活码激活软件。' }
+  }
+  const enteredCode = input.trim()
+  if (!normalizeCode(enteredCode) || enteredCode.length > 512) {
+    return { ok: false, message: '请输入管理员发放的有效积分码。' }
+  }
+  const currentRecord = readStoredActivation()
+  if (currentRecord && hashActivationCode(enteredCode) === currentRecord.codeHash) {
+    return { ok: false, message: '当前软件激活码不能作为积分码重复充值，请输入管理员另外发放的积分码。' }
   }
 
-  return { ok: false, message: server.message, status: currentStatus }
+  const result = await requestServerActivation(enteredCode, currentStatus.deviceId)
+  if (!result.ok) return { ok: false, message: result.message }
+  const rechargePoints =
+    result.creditsRemaining !== undefined && result.creditsRemaining > 0
+      ? result.creditsRemaining
+      : result.creditsGranted
+  if (result.licenseType !== 'credits' || (rechargePoints || 0) <= 0) {
+    return { ok: false, message: '这个码不包含可充值积分，请使用管理员发放的积分码。' }
+  }
+  if (!result.licenseId) {
+    return { ok: false, message: '服务器没有返回积分码编号，为避免重复入账，本次没有增加积分。' }
+  }
+  return {
+    ok: true,
+    message: result.message,
+    grantId: result.licenseId,
+    points: rechargePoints
+  }
 }
 
 function clearStoredActivation(): void {
@@ -842,7 +883,7 @@ function clearStoredActivation(): void {
   }
 }
 
-export async function deactivateCurrentDevice(pointsBalance: number): Promise<ActivationDeactivationResult> {
+export async function deactivateCurrentDevice(): Promise<ActivationDeactivationResult> {
   const deviceId = getDeviceId()
   const currentStatus = getActivationStatus()
   const record = readStoredActivation()
@@ -854,23 +895,59 @@ export async function deactivateCurrentDevice(pointsBalance: number): Promise<Ac
     }
   }
   if (record.version !== 2) {
+    try {
+      clearStoredActivation()
+    } catch {
+      return {
+        ok: false,
+        message: '旧版本机授权未能清理，请关闭软件后重试。',
+        status: currentStatus
+      }
+    }
     return {
-      ok: false,
-      message: '这是旧版授权记录，请先在积分中心重新输入原激活码，再使用换设备功能。',
-      status: currentStatus
+      ok: true,
+      message: '旧版本机授权已解除。该记录没有建立服务器设备绑定；现在可以在新电脑通过服务器输入原激活码。',
+      status: {
+        ...toStatus(null, deviceId),
+        message: '本机旧授权已解除，可在新电脑输入原激活码。'
+      },
+      unbindId: `legacy-local:${record.codeHash.slice(0, 24)}`
     }
   }
-  const code = decryptActivationCode(record.encryptedCode, deviceId)
-  if (!code) {
+  if (record.source === 'legacy') {
+    try {
+      clearStoredActivation()
+    } catch {
+      return {
+        ok: false,
+        message: '旧版本机授权未能清理，请关闭软件后重试。',
+        status: currentStatus
+      }
+    }
     return {
-      ok: false,
-      message: '本地授权记录不完整，无法安全解除绑定，请联系管理员。',
-      status: currentStatus
+      ok: true,
+      message: '旧版本机授权已解除。该记录没有建立服务器设备绑定；现在可以在新电脑通过服务器输入原激活码。',
+      status: {
+        ...toStatus(null, deviceId),
+        message: '本机旧授权已解除，可在新电脑输入原激活码。'
+      },
+      unbindId: `legacy-local:${record.codeHash.slice(0, 24)}`
     }
   }
 
-  let licenseId = record.licenseId
-  if (record.source === 'legacy') {
+  let current = record
+  let licenseId = current.licenseId
+  let deviceCredential = decryptServerSecret(current.encryptedDeviceCredential, deviceId)
+  let deviceSession = decryptServerSecret(current.encryptedDeviceSession, deviceId)
+  if (!deviceCredential || !deviceSession) {
+    const code = decryptActivationCode(current.encryptedCode, deviceId)
+    if (!code) {
+      return {
+        ok: false,
+        message: '当前服务器授权缺少设备凭证，本机仍保持激活。请联网后重新打开软件；若仍无法恢复，请联系管理员。',
+        status: currentStatus
+      }
+    }
     const binding = await requestServerActivation(code, deviceId)
     if (!binding.ok) {
       return {
@@ -882,42 +959,81 @@ export async function deactivateCurrentDevice(pointsBalance: number): Promise<Ac
       }
     }
     licenseId = binding.licenseId || licenseId
+    deviceCredential = binding.deviceCredential || deviceCredential
+    deviceSession = binding.deviceSession || deviceSession
+    if (!deviceCredential || !deviceSession) {
+      return {
+        ok: false,
+        message: '服务器没有返回当前设备的安全凭证，本机仍保持激活。请联系管理员确认新版设备解绑服务已完整启用。',
+        status: currentStatus
+      }
+    }
+    const now = new Date()
+    current = {
+      ...current,
+      source: 'server',
+      licenseId,
+      licenseType: binding.licenseType,
+      unlimited: binding.unlimited,
+      creditsRemaining: binding.creditsRemaining ?? current.creditsRemaining,
+      expiresAt: binding.expiresAt,
+      lastValidatedAt: now.toISOString(),
+      offlineUntil: new Date(now.getTime() + LICENSE_OFFLINE_GRACE_MS).toISOString(),
+      offlineSince: undefined,
+      encryptedDeviceCredential: encryptServerSecret(deviceCredential, deviceId),
+      encryptedDeviceSession: encryptServerSecret(deviceSession, deviceId),
+      bindingStatus: binding.bindingStatus || 'active',
+      transferCount: binding.transferCount ?? current.transferCount,
+      revokedReason: undefined,
+      serverMessage: binding.message
+    }
+    writeStoredActivation(current)
   }
 
-  const safeBalance = asFinitePoints(pointsBalance) ?? 0
-  const result = await requestServerDeactivation(code, deviceId, licenseId, safeBalance)
-  if (!result.ok) {
-    return { ok: false, message: result.message, status: currentStatus }
-  }
-  if (!result.transferId) {
+  if (!deviceCredential || !deviceSession) {
     return {
       ok: false,
-      message: '服务器没有返回积分转移凭证，为避免积分丢失，本机仍保持激活，请联系管理员。',
+      message: '当前设备缺少安全解绑凭证，本机仍保持激活。请联网后重新打开软件再试。',
       status: currentStatus
     }
   }
 
+  const result = await requestServerDeviceUnbind(
+    deviceId,
+    licenseId,
+    deviceCredential,
+    deviceSession
+  )
+  if (!result.ok) {
+    return { ok: false, message: result.message, status: currentStatus }
+  }
+
+  let localCleanupWarning = ''
   try {
     clearStoredActivation()
   } catch {
-    return {
-      ok: false,
-      message: '服务器已解除绑定，但本机授权文件未能清理。请重启软件后重试；不要立即在新电脑激活。',
-      status: currentStatus,
-      transferId: result.transferId,
-      transferredPoints: result.points ?? safeBalance
+    localCleanupWarning = ' 本机授权文件未能完全删除，软件已将它标记为失效；若重启后仍显示已激活，请联系管理员。'
+    try {
+      writeStoredActivation({
+        ...current,
+        encryptedDeviceCredential: undefined,
+        encryptedDeviceSession: undefined,
+        bindingStatus: 'unbound',
+        revokedReason: '本机已解除绑定，请在新电脑输入原激活码。',
+        serverMessage: '本机已解除绑定。'
+      })
+    } catch {
+      // 云端凭证已立即撤销；即使本地文件异常，也不能再调用在线服务。
     }
   }
-  const transferredPoints = result.points ?? safeBalance
   return {
     ok: true,
-    message: `本机已解除绑定，${transferredPoints} 积分已准备转移。现在可以在新电脑输入同一个激活码。`,
+    message: `本机已解除绑定。剩余积分由服务器保留，现在可以在新电脑输入同一个激活码重新绑定。${localCleanupWarning}`,
     status: {
       ...toStatus(null, deviceId),
       message: '本机已解除绑定，可在新电脑使用同一个激活码。'
     },
-    transferId: result.transferId,
-    transferredPoints
+    unbindId: result.unbindId || licenseId
   }
 }
 

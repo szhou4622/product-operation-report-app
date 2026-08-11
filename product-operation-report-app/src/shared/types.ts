@@ -38,6 +38,8 @@ export interface ActivationStatus {
   deviceId: string
   activatedAt?: string
   licenseId?: string
+  /** 当前用于软件授权和设备绑定的主激活码；不包含后来输入的积分充值码。 */
+  activationCode?: string
   codeCount: number
   appName: string
   source?: 'server' | 'legacy'
@@ -47,13 +49,8 @@ export interface ActivationStatus {
   expiresAt?: string
   offline: boolean
   offlineUntil?: string
-  /** 设备迁移时由服务器返回的唯一积分转移记录。 */
-  pointsGrantId?: string
-  /** 新设备应恢复的余额；存在 pointsGrantId 时不得再发放激活码初始积分。 */
-  pointsGrantPoints?: number
-  pointsGrantKind?: 'device_transfer'
-  /** 激活成功但迁移状态尚未从服务器确认时，暂缓发放积分。 */
-  pointsSyncPending?: boolean
+  bindingStatus?: 'active' | 'unbound'
+  transferCount?: number
   message?: string
 }
 
@@ -67,8 +64,7 @@ export interface ActivationDeactivationResult {
   ok: boolean
   message: string
   status: ActivationStatus
-  transferId?: string
-  transferredPoints?: number
+  unbindId?: string
 }
 
 export interface LicenseUsageResult {

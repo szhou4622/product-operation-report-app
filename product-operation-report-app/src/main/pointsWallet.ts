@@ -189,51 +189,75 @@ export function getReportChargedPoints(reportSessionId: string): number {
 }
 
 export function applyActivationPoints(status: ActivationStatus): { addedPoints: number; wallet: PointsWalletStatus } {
-  const isDeviceTransfer = status.pointsGrantKind === 'device_transfer' && Boolean(status.pointsGrantId)
-  const points = isDeviceTransfer
-    ? Math.round((status.pointsGrantPoints || 0) * MILLI_POINTS) / MILLI_POINTS
-    : status.licenseType === 'credits'
-      ? Math.floor(status.creditsRemaining || 0)
-      : 0
-  const topupId = isDeviceTransfer
-    ? `device-transfer:${status.pointsGrantId}`
-    : status.licenseId
-      ? `activation:${status.licenseId}`
-      : ''
+  const points = status.licenseType === 'credits'
+    ? Math.round((status.creditsRemaining || 0) * MILLI_POINTS) / MILLI_POINTS
+    : 0
+  const bindingSuffix = (status.transferCount || 0) > 0 ? `:binding:${status.transferCount}` : ''
+  const topupId = status.licenseId ? `activation:${status.licenseId}${bindingSuffix}` : ''
   const wallet = readWallet()
   if (
     !status.activated ||
     status.appName !== LICENSE_APP_NAME ||
-    status.pointsSyncPending ||
     !topupId ||
-    (!isDeviceTransfer && points <= 0) ||
+    points <= 0 ||
     wallet.appliedTopupIds.includes(topupId)
   ) {
     return { addedPoints: 0, wallet: toStatus(wallet) }
   }
-  const delta = isDeviceTransfer
+  const isRebinding = (status.transferCount || 0) > 0
+  const delta = isRebinding
     ? Math.round(points * MILLI_POINTS) - wallet.balanceMilli
     : Math.round(points * MILLI_POINTS)
   wallet.balanceMilli += delta
-  if (!isDeviceTransfer) wallet.totalTopupMilli += delta
+  if (!isRebinding) wallet.totalTopupMilli += delta
   wallet.appliedTopupIds = [...wallet.appliedTopupIds, topupId].slice(-MAX_IDS)
   appendLedger(wallet, {
     id: topupId,
     createdAt: new Date().toISOString(),
-    kind: isDeviceTransfer ? 'adjustment' : 'topup',
-    description: isDeviceTransfer ? `换设备恢复 ${points} 积分` : `激活码充值 ${points} 积分`,
+    kind: isRebinding ? 'adjustment' : 'topup',
+    description: isRebinding ? `换设备恢复 ${points} 积分` : `激活码充值 ${points} 积分`,
     pointsDeltaMilli: delta,
     balanceAfterMilli: wallet.balanceMilli
   })
   writeWallet(wallet)
-  return { addedPoints: isDeviceTransfer ? Math.max(0, roundPoints(delta)) : points, wallet: toStatus(wallet) }
+  return { addedPoints: isRebinding ? Math.max(0, roundPoints(delta)) : points, wallet: toStatus(wallet) }
 }
 
-export function transferOutPoints(transferId: string): PointsWalletStatus {
-  const safeId = transferId.trim().slice(0, 160)
-  if (!safeId) throw new Error('缺少积分转移凭证。')
+export function applyRechargeCodePoints(
+  grantId: string,
+  points: number
+): { addedPoints: number; wallet: PointsWalletStatus } {
+  const safeGrantId = grantId.trim().slice(0, 160)
+  const safePoints = Math.round(points * MILLI_POINTS) / MILLI_POINTS
   const wallet = readWallet()
-  const operationId = `device-transfer-out:${safeId}`
+  if (!safeGrantId || !Number.isFinite(safePoints) || safePoints <= 0) {
+    return { addedPoints: 0, wallet: toStatus(wallet) }
+  }
+  const topupId = `recharge:${safeGrantId}`
+  if (wallet.appliedTopupIds.includes(topupId)) {
+    return { addedPoints: 0, wallet: toStatus(wallet) }
+  }
+  const delta = Math.round(safePoints * MILLI_POINTS)
+  wallet.balanceMilli += delta
+  wallet.totalTopupMilli += delta
+  wallet.appliedTopupIds = [...wallet.appliedTopupIds, topupId].slice(-MAX_IDS)
+  appendLedger(wallet, {
+    id: topupId,
+    createdAt: new Date().toISOString(),
+    kind: 'topup',
+    description: `积分码充值 ${safePoints} 积分`,
+    pointsDeltaMilli: delta,
+    balanceAfterMilli: wallet.balanceMilli
+  })
+  writeWallet(wallet)
+  return { addedPoints: safePoints, wallet: toStatus(wallet) }
+}
+
+export function clearLocalPointsAfterUnbind(unbindId: string): PointsWalletStatus {
+  const safeId = unbindId.trim().slice(0, 160)
+  if (!safeId) throw new Error('缺少设备解绑记录。')
+  const wallet = readWallet()
+  const operationId = `device-unbind:${safeId}`
   if (wallet.appliedTopupIds.includes(operationId)) return toStatus(wallet)
   const delta = -wallet.balanceMilli
   wallet.balanceMilli = 0
@@ -242,7 +266,7 @@ export function transferOutPoints(transferId: string): PointsWalletStatus {
     id: operationId,
     createdAt: new Date().toISOString(),
     kind: 'adjustment',
-    description: '换设备转出剩余积分',
+    description: '本机解除绑定，剩余积分由服务器保留',
     pointsDeltaMilli: delta,
     balanceAfterMilli: 0
   })
