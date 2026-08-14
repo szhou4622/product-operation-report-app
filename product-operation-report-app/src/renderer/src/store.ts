@@ -16,6 +16,7 @@ import { SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
 import { buildExtractMessages, buildFinalReportPartMessages, buildStepMessages, buildSummaryMessages, type PriorOutput } from './sop'
 import { buildLocalTableCleanDetail, preprocessTableForModel, sourceForModel } from './tablePreprocess'
+import { validateReportStructure } from './validate'
 
 export interface Source {
   id: string
@@ -41,7 +42,7 @@ const FINAL_PRIOR_OUTPUT_LIMIT = 7000
 const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
-const MAX_SOURCE_FILES = 200
+const MAX_SOURCE_FILES = 50
 
 export const STEP_DEPENDENCY_MAP: StepDependencyMap = Object.freeze({
   1: Object.freeze([]),
@@ -269,14 +270,14 @@ function classify(name: string): Source['kind'] {
   const ext = name.toLowerCase().split('.').pop() || ''
   if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return 'image'
   if (['xlsx', 'xls', 'csv'].includes(ext)) return 'table'
-  if (['pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt'].includes(ext)) return 'doc'
+  if (['pdf', 'docx', 'pptx', 'md', 'markdown', 'txt'].includes(ext)) return 'doc'
   return 'other'
 }
 
 const SUPPORTED_EXTS = new Set([
   'png', 'jpg', 'jpeg', 'webp', 'gif',
   'xlsx', 'xls', 'csv',
-  'pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt',
+  'pdf', 'docx', 'pptx', 'md', 'markdown', 'txt',
   'zip'
 ])
 const extOf = (n: string): string => n.toLowerCase().split('.').pop() || ''
@@ -692,7 +693,7 @@ async function runFinalReportInParts(params: {
       },
       params.setAbort,
       (n) => params.onRetry(part.label, n),
-      2,
+      1,
       {
         reportSessionId: params.taskContext.reportSessionId,
         taskType: params.taskContext.taskType,
@@ -862,7 +863,7 @@ async function runModelRetry(
   onAcc: (acc: string) => void,
   setAbort: (fn: (() => void) | null) => void,
   onRetry?: (n: number) => void,
-  retries = 2,
+  retries = 1,
   taskContext?: Omit<ModelTaskContext, 'attempt'>
 ): Promise<{ ok: boolean; text: string; error?: string }> {
   if (!taskContext) throw new Error('模型任务缺少必要标识。')
@@ -1385,7 +1386,8 @@ export const useStore = create<StoreState>((set, get) => ({
               )
               const availableSlots = Math.max(0, MAX_SOURCE_FILES - retainedSources.length)
               const overflowCount = Math.max(0, items.length - availableSlots)
-              const itemSlots = overflowCount ? Math.max(0, availableSlots - 1) : availableSlots
+              const hasCountNotice = retainedSources.some((source) => source.name.includes('数量提示'))
+              const itemSlots = overflowCount && !hasCountNotice ? Math.max(0, availableSlots - 1) : availableSlots
               const retainedItems = items.slice(0, itemSlots)
               const expandedBytes = retainedItems.reduce((sum, item) => sum + (item.size || 0), 0)
               if (retainedBytes + expandedBytes > MAX_TOTAL_UPLOAD_BYTES) {
@@ -1424,7 +1426,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     purpose: inferPurpose(`${job.name}/${it.name}`),
                     note: `来自压缩包：${job.name}`
                   })),
-                  ...(overflowCount && availableSlots
+                  ...(overflowCount && availableSlots && !hasCountNotice
                     ? [
                         {
                           id: crypto.randomUUID(),
@@ -1807,7 +1809,7 @@ export const useStore = create<StoreState>((set, get) => ({
               if (fn) aborts.add(fn)
             },
             undefined,
-            2,
+            1,
             {
               reportSessionId: sessionId,
               taskType: 'source_clean',
@@ -1881,7 +1883,7 @@ export const useStore = create<StoreState>((set, get) => ({
       (n) => {
         if (isCurrentSession()) get()._post('assistant', `汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
       },
-      2,
+      1,
       {
         reportSessionId: sessionId,
         taskType: 'summary',
@@ -1997,7 +1999,7 @@ export const useStore = create<StoreState>((set, get) => ({
           () => {},
           (fn) => set({ abortFn: fn }),
           (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
-          2,
+          1,
           {
             reportSessionId: sessionId,
             taskType: 'analysis_step',
@@ -2240,6 +2242,11 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     if (phase !== 'done' && !reportStale) {
       set({ exportStatus: '这还是待确认的初稿，请先点击“确认定稿”再导出。' })
+      return
+    }
+    const structuralWarnings = validateReportStructure(md)
+    if (structuralWarnings.length > 0) {
+      set({ exportStatus: `成稿检查还有 ${structuralWarnings.length} 项，请先修正后再导出。` })
       return
     }
     set({ exportStatus: '导出中…', lastExportPath: '' })

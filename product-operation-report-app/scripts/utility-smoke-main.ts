@@ -40,6 +40,15 @@ async function run(): Promise<void> {
   assert.equal(secondResult.ok, true)
   assert.match(secondResult.text || '', /beta/)
 
+  const markdown = new TextEncoder().encode('# 产品手卡\n\n- 核心卖点：中文 Markdown 可解析')
+  const markdownResult = await parseFileInUtility(
+    1,
+    '产品手卡.MD',
+    markdown.buffer.slice(markdown.byteOffset, markdown.byteOffset + markdown.byteLength) as ArrayBuffer
+  )
+  assert.equal(markdownResult.ok, true, JSON.stringify(markdownResult))
+  assert.match(markdownResult.text || '', /中文 Markdown 可解析/)
+
   const invalidArchive = new TextEncoder().encode('not a zip')
   const archiveResult = await parseArchiveInUtility(1, 'broken.zip', invalidArchive.buffer.slice(0))
   assert.equal(archiveResult.length, 1)
@@ -63,7 +72,7 @@ async function run(): Promise<void> {
 void app.whenReady().then(async () => {
   try {
     await run()
-    console.log('Utility-process smoke checks passed: FIFO parsing, PDF, bad archive isolation, recovery.')
+    console.log('Utility-process smoke checks passed: FIFO parsing, Markdown, PDF, bad archive isolation, recovery.')
     disposeParseService()
     app.exit(0)
   } catch (error) {

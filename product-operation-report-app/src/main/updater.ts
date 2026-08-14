@@ -9,6 +9,7 @@ import {
   NETWORK_TIMEOUT_MS,
   UPDATE_LATEST_URL
 } from './serviceConfig'
+import { verifyUpdateManifestSignature } from './updateSignature'
 
 interface UpdateConfig {
   version: string
@@ -95,6 +96,9 @@ function selectPlatformValue(value: unknown, key: string): string | undefined {
 function validateArtifactUrl(value: string, key: 'windows_x64' | 'mac_arm64' | 'mac_x64'): URL {
   const parsed = new URL(value)
   if (parsed.protocol !== 'https:') throw new Error('更新下载地址必须使用 HTTPS。')
+  if (parsed.hostname !== 'update.dadaozixun.com' && !parsed.hostname.endsWith('.dadaozixun.com')) {
+    throw new Error('更新下载地址不属于官方服务器。')
+  }
   const expectedExtension = key === 'windows_x64' ? '.exe' : '.dmg'
   if (!decodeURIComponent(parsed.pathname).toLowerCase().endsWith(expectedExtension)) {
     throw new Error(`更新配置不是当前电脑需要的 ${expectedExtension} 安装包。`)
@@ -186,6 +190,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
     if (!response.ok) throw new Error(`更新服务暂时不可用（${response.status}）。`)
     const body = asRecord(await response.json())
     if (!body) throw new Error('更新服务返回了无法识别的配置。')
+    const allowUnsignedDevelopmentManifest = !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_UNSIGNED_DEV_UPDATE === '1'
+    if (!allowUnsignedDevelopmentManifest && !verifyUpdateManifestSignature(body)) {
+      throw new Error('更新配置签名无效，为保护电脑安全已停止更新。')
+    }
     const responseApp = asString(body.app_name)
     if (responseApp && responseApp !== LICENSE_APP_NAME) throw new Error('更新配置的软件标识不匹配。')
     const version = asString(body.version)
@@ -273,7 +281,10 @@ export async function downloadUpdate(
   try {
     const response = await fetch(cachedConfig.downloadUrl, { redirect: 'follow', signal: controller.signal })
     if (!response.ok) throw new Error(`下载失败（${response.status}）。`)
-    if (!response.url.startsWith('https://')) throw new Error('更新下载被重定向到不安全的地址。')
+    const finalUrl = new URL(response.url)
+    if (finalUrl.protocol !== 'https:' || (finalUrl.hostname !== 'update.dadaozixun.com' && !finalUrl.hostname.endsWith('.dadaozixun.com'))) {
+      throw new Error('更新下载被重定向到非官方地址。')
+    }
     const checksum = await writeResponseToFile(response, partial, onProgress)
     if (checksum.toLowerCase() !== cachedConfig.sha256.toLowerCase()) {
       throw new Error('更新包校验失败，文件可能不完整，已停止安装。')

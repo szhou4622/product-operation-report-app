@@ -1,6 +1,6 @@
-import { app, shell, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
+import { app, shell, BrowserWindow, dialog, ipcMain, Menu, session } from 'electron'
 import { randomUUID } from 'crypto'
-import { isAbsolute, join, resolve } from 'path'
+import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import type {
   AppSettings,
@@ -16,9 +16,10 @@ import type {
   TestModelOptions,
   TokenUsageRecord
 } from '../shared/types'
-import { getActiveProfile, loadRendererSettings, saveRendererSettings } from './settings'
+import { getActiveProfile, getActiveProfiles, loadRendererSettings, saveRendererSettings } from './settings'
 import { getManagedModelState } from './managedModel'
 import { chatStream, listModels, testModel } from './model'
+import { runModelFallbackSequence } from './modelFallback'
 import {
   cancelParsingForOwner,
   disposeParseService,
@@ -77,15 +78,26 @@ import {
   storeReportResultCache
 } from './reportResultCache'
 import { appendCostOptimizationEvent } from './costOptimization'
+import { ChatRequestRegistry, validateChatStartPayload } from './chatAdmission'
+import {
+  authorizeProxyProfiles,
+  canStartProxyReport,
+  clearAiProxySession,
+  getProxyReportCharge,
+  getProxyWallet,
+  redeemProxyPoints,
+  testProxyHealth
+} from './aiProxy'
 
 const developmentUserDataDir =
-  process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+  !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
     ? process.env.PRODUCT_REPORT_DEV_USER_DATA_DIR?.trim()
     : ''
 if (developmentUserDataDir) app.setPath('userData', resolve(developmentUserDataDir))
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
+const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) app.quit()
@@ -118,7 +130,20 @@ function validateLocalPath(value: unknown): string {
     throw new Error('文件路径无效，请重新导出。')
   }
   if (!existsSync(value)) throw new Error('文件已被移动或删除，请重新导出。')
-  return value
+  const safeExtensions = new Set(['.html', '.htm', '.md', '.docx', '.pdf', '.txt', '.csv', '.xlsx', '.png', '.jpg', '.jpeg', '.webp'])
+  if (!safeExtensions.has(extname(value).toLowerCase())) {
+    throw new Error('为保护电脑安全，只能打开报告、数据表或图片文件。')
+  }
+  const normalized = resolve(value)
+  if (!allowedLocalOpenPaths.has(normalized)) {
+    throw new Error('只能打开由本软件刚刚导出的文件或更新安装包。')
+  }
+  return normalized
+}
+
+function rememberExportPath<T extends { ok: boolean; path?: string }>(result: T): T {
+  if (result.ok && result.path && isAbsolute(result.path)) allowedLocalOpenPaths.add(resolve(result.path))
+  return result
 }
 
 function ensureActivated(): void {
@@ -126,19 +151,34 @@ function ensureActivated(): void {
 }
 
 function createWindow(): void {
+  if (app.isPackaged) {
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+          ]
+        }
+      })
+    })
+  }
   const window = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 880,
     minHeight: 640,
     show: false,
-    title: '产品经营报告',
+    title: '产品与内容经营报告系统',
     icon: resolveWindowIcon(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
-      contextIsolation: true
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      devTools: !app.isPackaged
     }
   })
   mainWindow = window
@@ -224,14 +264,14 @@ function createWindow(): void {
   window.webContents.on('render-process-gone', () => {
     closeGuardReady = false
     cancelParsingForOwner(ownerId, '界面已重新加载，旧文件解析已停止。')
-    for (const controller of inflight.values()) controller.abort()
-    inflight.clear()
+    chatRequests.abortOwner(ownerId)
   })
 
   window.on('ready-to-show', () => window.show())
   window.on('closed', () => {
     if (closeTimer) clearTimeout(closeTimer)
     cancelParsingForOwner(ownerId, '窗口已关闭，旧文件解析已停止。')
+    chatRequests.abortOwner(ownerId)
     ipcMain.removeListener('app:close-ready', onCloseReady)
     ipcMain.removeListener('app:close-guard-state', onCloseGuardState)
     if (mainWindow === window) mainWindow = null
@@ -266,7 +306,7 @@ function createWindow(): void {
     if (isSafeExternalUrl(url)) void openExternalUrl(url).catch(() => undefined)
   })
 
-  if (process.env['ELECTRON_RENDERER_URL']) {
+  if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
     window.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
     window.loadFile(join(__dirname, '../renderer/index.html'))
@@ -343,11 +383,13 @@ ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:refresh', async () => {
   const status = await getActivationStatusWithServerCheck()
-  const wallet = applyActivationPoints(status).wallet
+  const wallet = status.activated && getManagedModelState().mode === 'proxy'
+    ? await getProxyWallet().catch(() => null)
+    : applyActivationPoints(status).wallet
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) {
       window.webContents.send('activation:changed', status)
-      window.webContents.send('points:changed', wallet)
+      if (wallet) window.webContents.send('points:changed', wallet)
     }
   }
   return status
@@ -355,11 +397,14 @@ ipcMain.handle('activation:refresh', async () => {
 ipcMain.handle('activation:activate', async (_e, code: string) => {
   const result = await activateWithCode(code)
   if (result.ok) {
-    const wallet = applyActivationPoints(result.status).wallet
+    clearAiProxySession()
+    const wallet = getManagedModelState().mode === 'proxy'
+      ? await getProxyWallet().catch(() => null)
+      : applyActivationPoints(result.status).wallet
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) {
         window.webContents.send('activation:changed', result.status)
-        window.webContents.send('points:changed', wallet)
+        if (wallet) window.webContents.send('points:changed', wallet)
       }
     }
   }
@@ -370,6 +415,7 @@ ipcMain.handle('activation:deactivate', async () => {
   const result = await deactivateCurrentDevice()
   let wallet = before
   if (result.ok && result.unbindId) {
+    clearAiProxySession()
     try {
       wallet = clearLocalPointsAfterUnbind(result.unbindId)
     } catch {
@@ -394,12 +440,19 @@ ipcMain.handle('license:consumeAnalysisCredit', (_e, operationId: string) => {
 })
 ipcMain.handle('points:get', async () => {
   ensureActivated()
+  if (getManagedModelState().mode === 'proxy') return getProxyWallet()
   applyActivationPoints(getActivationStatus())
   return reconcileTokenUsage(await readTokenUsageRecords())
 })
-ipcMain.handle('points:canStartReport', () => canStartPointsReport(getActivationStatus()))
-ipcMain.handle('points:reportCharge', (_e, reportSessionId: string) => ({
-  chargedPoints: getReportChargedPoints(reportSessionId)
+ipcMain.handle('points:canStartReport', () => (
+  getManagedModelState().mode === 'proxy'
+    ? canStartProxyReport()
+    : canStartPointsReport(getActivationStatus())
+))
+ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => ({
+  chargedPoints: getManagedModelState().mode === 'proxy'
+    ? await getProxyReportCharge(reportSessionId)
+    : getReportChargedPoints(reportSessionId)
 }))
 ipcMain.handle('points:grantDevelopment', () => {
   ensureActivated()
@@ -410,6 +463,13 @@ ipcMain.handle('points:grantDevelopment', () => {
   return wallet
 })
 ipcMain.handle('points:redeem', async (_e, code: string) => {
+  if (getManagedModelState().mode === 'proxy') {
+    const result = await redeemProxyPoints(code)
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('points:changed', result.wallet)
+    }
+    return result
+  }
   const before = getPointsWalletStatus()
   const currentActivation = getActivationStatus()
   const grant = await redeemPointsWithCode(code)
@@ -483,6 +543,7 @@ ipcMain.handle('model:test', (_e, opts: TestModelOptions) => {
   const managed = getManagedModelState()
   if (managed.enabled) {
     if (!managed.profile) return { ok: false, message: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    if (managed.mode === 'proxy') return testProxyHealth()
     return testModel({ ...opts, profile: managed.profile })
   }
   return testModel(opts)
@@ -492,6 +553,7 @@ ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => 
   const managed = getManagedModelState()
   if (managed.enabled) {
     if (!managed.profile) return { ok: false, error: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    if (managed.mode === 'proxy') return { ok: true, models: managed.profiles.map((item) => item.model) }
     return listModels(managed.profile)
   }
   return listModels(profile)
@@ -525,26 +587,45 @@ ipcMain.handle('sop:rules', () => {
 })
 
 // ---- IPC：导出报告 ----
-ipcMain.handle('export:markdown', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:markdown', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportMarkdown(p.content, p.name)
+  return rememberExportPath(await exportMarkdown(p.content, p.name))
 })
-ipcMain.handle('export:docx', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:docx', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportDocx(p.content, p.name)
+  return rememberExportPath(await exportDocx(p.content, p.name))
 })
-ipcMain.handle('export:html', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:html', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportHtml(p.content, p.name)
+  return rememberExportPath(await exportHtml(p.content, p.name))
 })
 
 // ---- IPC：流式聊天 ----
-const inflight = new Map<string, AbortController>()
+const chatRequests = new ChatRequestRegistry(4)
 
 ipcMain.on(
   'chat:start',
-  async (event, payload: { id: string; messages: ChatMessage[]; context: ModelTaskContext }) => {
-    const { id, messages } = payload
+  async (event, payload: unknown) => {
+    const rawId = payload && typeof payload === 'object' && typeof (payload as { id?: unknown }).id === 'string'
+      ? (payload as { id: string }).id
+      : ''
+    let validated: ReturnType<typeof validateChatStartPayload>
+    try {
+      validated = validateChatStartPayload(payload)
+    } catch (error) {
+      if (/^[0-9a-f-]{36}$/i.test(rawId) && !event.sender.isDestroyed()) {
+        event.sender.send(`chat:event:${rawId}`, {
+          type: 'error',
+          message: error instanceof Error ? error.message : '模型请求格式无效，请重新开始本次分析。',
+          usage: {
+            source: 'missing', inputTokens: 0, outputTokens: 0, reasoningTokens: 0,
+            cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: ''
+          }
+        })
+      }
+      return
+    }
+    const { id, messages } = validated
     const channel = `chat:event:${id}`
     const emptyUsage = (model = ''): ModelTokenUsage => ({
       source: 'missing',
@@ -564,8 +645,10 @@ ipcMain.on(
       })
       return
     }
-    const profile = getActiveProfile()
-    if (!profile) {
+    let profiles = getActiveProfiles()
+    const managedState = getManagedModelState()
+    const primaryProfile = profiles[0]
+    if (!primaryProfile) {
       const managed = getManagedModelState()
       event.sender.send(channel, {
         type: 'error',
@@ -576,119 +659,201 @@ ipcMain.on(
       })
       return
     }
-    const context = sanitizeModelTaskContext(payload.context)
+    const context = sanitizeModelTaskContext(validated.context)
     if (!context) {
       event.sender.send(channel, {
         type: 'error',
         message: '模型任务标识无效，请重新开始本次分析。',
-        usage: emptyUsage(profile.model)
+        usage: emptyUsage(primaryProfile.model)
       })
       return
     }
     const controller = new AbortController()
-    inflight.set(id, controller)
-    const startedAt = new Date().toISOString()
-    const initialEstimate = estimateRequestTokens(messages)
-    const startedRecord: TokenUsageRecord = {
-      schemaVersion: 1,
-      eventType: 'started',
-      requestId: id,
-      ...context,
-      model: profile.model.slice(0, 200),
-      status: 'started',
-      startedAt,
-      endedAt: startedAt,
-      durationMs: 0,
-      outputChars: 0,
-      usageSource: 'missing',
-        inputTokens: 0,
-        outputTokens: 0,
-        reasoningTokens: 0,
-      cachedInputTokens: 0,
-      cacheCreationInputTokens: 0,
-      totalTokens: 0,
-      estimatedInputTokens: initialEstimate.inputTokens,
-      estimatedOutputTokens: 0,
-      estimatedTotalTokens: initialEstimate.totalTokens
-    }
-    await appendTokenUsageRecord(startedRecord).catch((error) => {
-      console.error('Unable to append token usage start record:', error)
-    })
-    let terminal: Extract<ChatStreamEvent, { type: 'done' | 'error' }> | undefined
-    let usage = emptyUsage(profile.model)
-    let outputChars = 0
     try {
-      await chatStream(
-        profile,
-        messages,
-        (ev) => {
-          if (ev.type === 'chunk') outputChars += ev.delta.length
-          else if (ev.type === 'usage') usage = ev.usage
-          else {
-            terminal = ev
-            usage = ev.usage
-            if (ev.type === 'done') outputChars = ev.full.length
-          }
-          if (ev.type !== 'done' && ev.type !== 'error' && !event.sender.isDestroyed()) {
-            event.sender.send(channel, ev)
-          }
-        },
-        controller.signal,
-        context.taskType === 'source_clean' || context.taskType === 'summary'
-          ? { reasoningEffort: 'low' }
-          : undefined
-      )
-    } finally {
-      inflight.delete(id)
-      const endedAt = new Date().toISOString()
-      const status = controller.signal.aborted
-        ? 'aborted'
-        : terminal?.type === 'done'
-          ? 'success'
-          : 'error'
-      const estimate = estimateRequestTokens(messages, outputChars)
-      const finalRecord: TokenUsageRecord = {
-        schemaVersion: 1,
-        eventType: 'final',
-        requestId: id,
-        ...context,
-        model: usage.model || profile.model.slice(0, 200),
-        status,
-        failureKind: classifyModelFailure(terminal?.type === 'error' ? terminal.message : '', status),
-        startedAt,
-        endedAt,
-        durationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)),
-        outputChars,
-        usageSource: usage.source,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        reasoningTokens: usage.reasoningTokens,
-        cachedInputTokens: usage.cachedInputTokens,
-        cacheCreationInputTokens: usage.cacheCreationInputTokens,
-        totalTokens: usage.totalTokens,
-        ...(usage.source === 'missing'
-          ? {
-              estimatedInputTokens: estimate.inputTokens,
-              estimatedOutputTokens: estimate.outputTokens,
-              estimatedTotalTokens: estimate.totalTokens
-            }
-          : {})
-      }
-      await appendTokenUsageRecord(finalRecord).catch((error) => {
-        console.error('Unable to append token usage final record:', error)
+      chatRequests.claim(id, event.sender.id, controller)
+    } catch (error) {
+      event.sender.send(channel, {
+        type: 'error',
+        message: error instanceof Error ? error.message : '模型任务暂时无法开始。',
+        usage: emptyUsage(primaryProfile.model)
       })
-      const wallet = settleTokenUsage(finalRecord)
-      for (const window of BrowserWindow.getAllWindows()) {
-        if (!window.isDestroyed()) window.webContents.send('points:changed', wallet)
+      return
+    }
+    const initialEstimate = estimateRequestTokens(messages)
+    const proxyEndpointFailure = (message: string): boolean => (
+      !/provider_route_unavailable|model[_ -]?(not[_ -]?found|unavailable)|unknown model|模型不存在|模型不可用/i.test(message) &&
+      /业务服务器|会话|积分|HTTP\s+(401|402|403|404|409|429|5\d\d)\b|fetch failed|ECONN|ENOTFOUND|network|网络|timeout|超时/i.test(message)
+    )
+    try {
+      if (managedState.mode === 'proxy') {
+        try {
+          const access = await canStartProxyReport()
+          if (!access.ok) {
+            event.sender.send(channel, { type: 'error', message: access.message, usage: emptyUsage() })
+            return
+          }
+          profiles = await authorizeProxyProfiles(profiles)
+        } catch (error) {
+          event.sender.send(channel, {
+            type: 'error',
+            message: error instanceof Error ? error.message : '业务服务器暂时不可用，请稍后重试。',
+            usage: emptyUsage()
+          })
+          return
+        }
       }
-      if (terminal && !event.sender.isDestroyed()) event.sender.send(channel, terminal)
+      const sequence = await runModelFallbackSequence(profiles, async (profile, profileIndex) => {
+        const attemptRequestId = profileIndex === 0 ? id : `${id}:fallback:${profileIndex}`
+        const startedAt = new Date().toISOString()
+        const startedRecord: TokenUsageRecord = {
+          schemaVersion: 1,
+          eventType: 'started',
+          requestId: attemptRequestId,
+          ...context,
+          attempt: Math.min(20, context.attempt + profileIndex),
+          model: profile.model.slice(0, 200),
+          status: 'started',
+          startedAt,
+          endedAt: startedAt,
+          durationMs: 0,
+          outputChars: 0,
+          usageSource: 'missing',
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          totalTokens: 0,
+          estimatedInputTokens: initialEstimate.inputTokens,
+          estimatedOutputTokens: 0,
+          estimatedTotalTokens: initialEstimate.totalTokens
+        }
+        await appendTokenUsageRecord(startedRecord).catch((error) => {
+          console.error('Unable to append token usage start record:', error)
+        })
+
+        let terminal: Extract<ChatStreamEvent, { type: 'done' | 'error' }> | undefined
+        let usage = emptyUsage(profile.model)
+        let outputChars = 0
+        let hasVisibleOutput = false
+        try {
+          await chatStream(
+            profile,
+            messages,
+            (ev) => {
+              if (ev.type === 'chunk') {
+                outputChars += ev.delta.length
+                if (ev.delta.trim()) hasVisibleOutput = true
+              }
+              else if (ev.type === 'usage') usage = ev.usage
+              else {
+                terminal = ev
+                usage = ev.usage
+                if (ev.type === 'done') outputChars = ev.full.length
+              }
+              if (ev.type !== 'done' && ev.type !== 'error' && !event.sender.isDestroyed()) {
+                event.sender.send(channel, ev)
+              }
+            },
+            controller.signal,
+            {
+              ...(profileIndex === 0 && (context.taskType === 'source_clean' || context.taskType === 'summary')
+                ? { reasoningEffort: 'low' as const }
+                : {}),
+              ...(managedState.mode === 'proxy'
+                ? {
+                    requestHeaders: {
+                      'x-request-id': attemptRequestId,
+                      'x-report-session-id': context.reportSessionId,
+                      'x-task-key': context.taskKey,
+                      'x-task-type': context.taskType,
+                      'x-task-attempt': String(Math.min(20, context.attempt + profileIndex))
+                    }
+                  }
+                : {})
+            }
+          )
+        } catch (error) {
+          terminal = {
+            type: 'error',
+            message: error instanceof Error ? error.message : '模型请求异常结束。',
+            usage
+          }
+        }
+        if (!terminal) {
+          terminal = {
+            type: 'error',
+            message: '模型请求已结束，但没有返回可用结果。',
+            usage
+          }
+        }
+
+        const endedAt = new Date().toISOString()
+        const status = controller.signal.aborted
+          ? 'aborted'
+          : terminal.type === 'done'
+            ? 'success'
+            : 'error'
+        const message = terminal.type === 'error' ? terminal.message : ''
+        const failureKind = managedState.mode === 'proxy' && proxyEndpointFailure(message)
+          ? 'proxy_unavailable'
+          : classifyModelFailure(message, status)
+        const estimate = estimateRequestTokens(messages, outputChars)
+        const finalRecord: TokenUsageRecord = {
+          schemaVersion: 1,
+          eventType: 'final',
+          requestId: attemptRequestId,
+          ...context,
+          attempt: Math.min(20, context.attempt + profileIndex),
+          model: usage.model || profile.model.slice(0, 200),
+          status,
+          failureKind,
+          startedAt,
+          endedAt,
+          durationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)),
+          outputChars,
+          usageSource: usage.source,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedInputTokens: usage.cachedInputTokens,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens,
+          totalTokens: usage.totalTokens,
+          ...(usage.source === 'missing'
+            ? {
+                estimatedInputTokens: estimate.inputTokens,
+                estimatedOutputTokens: estimate.outputTokens,
+                estimatedTotalTokens: estimate.totalTokens
+              }
+            : {})
+        }
+        await appendTokenUsageRecord(finalRecord).catch((error) => {
+          console.error('Unable to append token usage final record:', error)
+        })
+        const wallet = managedState.mode === 'proxy'
+          ? await getProxyWallet().catch(() => undefined)
+          : settleTokenUsage(finalRecord)
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed() && wallet) window.webContents.send('points:changed', wallet)
+        }
+
+        return {
+          terminal,
+          failureKind,
+          outputChars,
+          hasVisibleOutput,
+          aborted: controller.signal.aborted
+        }
+      })
+      if (!event.sender.isDestroyed()) event.sender.send(channel, sequence.outcome.terminal)
+    } finally {
+      chatRequests.release(id, event.sender.id, controller)
     }
   }
 )
 
-ipcMain.on('chat:abort', (_e, id: string) => {
-  inflight.get(id)?.abort()
-  inflight.delete(id)
+ipcMain.on('chat:abort', (event, id: string) => {
+  if (typeof id === 'string') chatRequests.abort(id, event.sender.id)
 })
 
 // 应用菜单：提供标准编辑角色，让复制/剪切/粘贴/全选快捷键生效
@@ -697,7 +862,7 @@ function setupMenu(): void {
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac ? [{ role: 'appMenu' as const }] : []),
     { role: 'editMenu' },
-    { role: 'viewMenu' },
+    ...(!app.isPackaged ? [{ role: 'viewMenu' as const }] : []),
     { role: 'windowMenu' }
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))

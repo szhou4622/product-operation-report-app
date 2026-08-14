@@ -18,7 +18,16 @@ function readJson(path) {
 
 function loadPublicConfig() {
   const local = readJson(outputPath)
-  if (local?.baseURL && local?.model) return local
+  if (local?.baseURL && local?.model) {
+    return {
+      ...local,
+      fallbackModels: Array.isArray(local.fallbackModels)
+        ? local.fallbackModels
+        : (String(local.model).toLowerCase() === 'gpt-5.5'
+            ? ['claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+            : [])
+    }
+  }
 
   const settings = readJson(join(defaultUserData, 'settings.json'))
   const profiles = Array.isArray(settings?.profiles) ? settings.profiles : []
@@ -31,7 +40,10 @@ function loadPublicConfig() {
     baseURL: profile.baseURL,
     model: profile.model,
     supportsVision: profile.supportsVision !== false,
-    temperature: profile.temperature ?? 0.3
+    temperature: profile.temperature ?? 0.3,
+    fallbackModels: profile.model.toLowerCase() === 'gpt-5.5'
+      ? ['claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+      : []
   }
 }
 
@@ -97,7 +109,8 @@ function saveEncryptedConfig(config, apiKey) {
     apiKeyEnc: safeStorage.encryptString(apiKey).toString('base64'),
     model: String(config.model).trim(),
     supportsVision: config.supportsVision !== false,
-    temperature: Number.isFinite(temperature) && temperature >= 0 && temperature <= 2 ? temperature : 0.3
+    temperature: Number.isFinite(temperature) && temperature >= 0 && temperature <= 2 ? temperature : 0.3,
+    fallbackModels: Array.isArray(config.fallbackModels) ? config.fallbackModels.slice(0, 3) : []
   }
   try {
     writeFileSync(tempPath, JSON.stringify(output, null, 2), { encoding: 'utf8', mode: 0o600 })

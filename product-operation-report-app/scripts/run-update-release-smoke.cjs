@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const assert = require('assert/strict')
-const { createHash } = require('crypto')
+const { createHash, generateKeyPairSync, verify } = require('crypto')
 const { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require('fs')
 const { tmpdir } = require('os')
 const { join } = require('path')
@@ -27,6 +27,9 @@ async function run() {
     }
 
     const output = join(root, 'output', 'latest.json')
+    const signing = generateKeyPairSync('ed25519')
+    const signingKey = join(root, 'update-signing-private.pem')
+    writeFileSync(signingKey, signing.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 })
     const result = await buildManifest({
       projectRoot: root,
       version,
@@ -34,7 +37,8 @@ async function run() {
       notesFile: join(root, 'release-notes.txt'),
       minSupportedVersion: '9.0.0',
       output,
-      force: false
+      force: false,
+      signingKey
     })
     const saved = JSON.parse(readFileSync(output, 'utf8'))
     assert.equal(saved.app_name, 'ProductOperationReport')
@@ -42,6 +46,14 @@ async function run() {
     assert.equal(saved.min_supported_version, '9.0.0')
     assert.deepEqual(saved.notes, ['第一条', '第二条'])
     assert.equal(saved.force, false)
+    assert.equal(typeof saved.signature, 'string')
+    const { canonicalValue } = require('./prepare-update-release.cjs')
+    assert.equal(verify(
+      null,
+      Buffer.from(canonicalValue(saved), 'utf8'),
+      signing.publicKey,
+      Buffer.from(saved.signature, 'base64')
+    ), true)
     for (const [key, filename] of Object.entries(artifactDefinitions(version))) {
       assert.equal(saved.download_url[key], `https://update.dadaozixun.com/product-operation-report/releases/${version}/${filename}`)
       assert.equal(saved.sha256[key], createHash('sha256').update(payloads[key]).digest('hex'))
@@ -49,12 +61,12 @@ async function run() {
     assert.deepEqual(saved, result.manifest)
 
     await assert.rejects(
-      buildManifest({ projectRoot: root, version, artifactsDir: artifacts, publicRoot: 'http://unsafe.example.test' }),
+      buildManifest({ projectRoot: root, version, artifactsDir: artifacts, publicRoot: 'http://unsafe.example.test', signingKey }),
       /HTTPS/
     )
     rmSync(join(artifacts, artifactDefinitions(version).mac_x64))
     await assert.rejects(
-      buildManifest({ projectRoot: root, version, artifactsDir: artifacts }),
+      buildManifest({ projectRoot: root, version, artifactsDir: artifacts, signingKey }),
       /缺少 mac_x64 安装包/
     )
     process.stdout.write('run-update-release-smoke: PASS\n')

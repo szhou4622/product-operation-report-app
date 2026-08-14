@@ -1,5 +1,7 @@
+import { app } from 'electron'
+
 export const LICENSE_APP_NAME = 'ProductOperationReport'
-const allowDevelopmentOverrides = process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+const allowDevelopmentOverrides = !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
 const developmentLicenseBaseUrl =
   allowDevelopmentOverrides
     ? process.env.PRODUCT_REPORT_DEV_LICENSE_BASE_URL?.trim().replace(/\/+$/, '')
@@ -11,6 +13,16 @@ export const LICENSE_DEVICE_STATUS_URL = `${LICENSE_BASE_URL}/device/status`
 
 export const UPDATE_BASE_URL = 'https://update.dadaozixun.com'
 export const UPDATE_LATEST_URL = `${UPDATE_BASE_URL}/api/update/latest`
+
+const developmentAiProxyBaseUrl =
+  allowDevelopmentOverrides
+    ? process.env.PRODUCT_REPORT_DEV_AI_PROXY_BASE_URL?.trim().replace(/\/+$/, '')
+    : ''
+export const AI_PROXY_BASE_URL = developmentAiProxyBaseUrl || 'https://api.dadaozixun.com/api/product-operation-report/v1'
+export const AI_PROXY_SESSION_URL = `${AI_PROXY_BASE_URL}/session`
+export const AI_PROXY_WALLET_URL = `${AI_PROXY_BASE_URL}/wallet`
+export const AI_PROXY_REDEEM_URL = `${AI_PROXY_BASE_URL}/wallet/redeem`
+export const AI_PROXY_HEALTH_URL = `${AI_PROXY_BASE_URL}/health`
 
 // 服务器短时不可用时，已完成服务器验证的设备可继续离线使用 72 小时。
 export const LICENSE_OFFLINE_GRACE_MS = 72 * 60 * 60 * 1000

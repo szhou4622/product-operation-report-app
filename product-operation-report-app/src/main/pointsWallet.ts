@@ -35,13 +35,42 @@ interface StoredWallet {
   ledger: StoredLedgerEntry[]
 }
 
+type ModelTokenPrices = Pick<
+  PointsPricingInfo,
+  'inputUsdPerMillion' | 'outputUsdPerMillion' | 'cachedInputUsdPerMillion' | 'cacheCreationUsdPerMillion'
+>
+
+const MODEL_PRICES: Readonly<Record<string, ModelTokenPrices>> = {
+  'gpt-5.5': {
+    inputUsdPerMillion: 1.25,
+    outputUsdPerMillion: 7.5,
+    cachedInputUsdPerMillion: 0.125,
+    cacheCreationUsdPerMillion: 0.8
+  },
+  'claude-sonnet-4-6': {
+    inputUsdPerMillion: 0.4,
+    outputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.04,
+    cacheCreationUsdPerMillion: 0.2
+  },
+  'gemini-3-flash': {
+    inputUsdPerMillion: 1.2,
+    outputUsdPerMillion: 6,
+    cachedInputUsdPerMillion: 0.12,
+    cacheCreationUsdPerMillion: 0.6
+  },
+  'kimi-k2.6': {
+    inputUsdPerMillion: 0.8,
+    outputUsdPerMillion: 4,
+    cachedInputUsdPerMillion: 0.08,
+    cacheCreationUsdPerMillion: 0.4
+  }
+}
+
 const DEFAULT_PRICING: PointsPricingInfo = {
   model: 'gpt-5.5',
   currency: 'USD',
-  inputUsdPerMillion: 1.25,
-  outputUsdPerMillion: 7.5,
-  cachedInputUsdPerMillion: 0.125,
-  cacheCreationUsdPerMillion: 0.8,
+  ...MODEL_PRICES['gpt-5.5'],
   usdCnyRate: 7.2,
   pointsPerCny: 100,
   cnyPerCostPoint: 0.01,
@@ -50,16 +79,27 @@ const DEFAULT_PRICING: PointsPricingInfo = {
 }
 
 function envNumber(name: string, fallback: number, min: number, max: number): number {
+  if (app.isPackaged || process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES !== '1') return fallback
   const parsed = Number(process.env[name])
   return Number.isFinite(parsed) && parsed >= min && parsed <= max ? parsed : fallback
 }
 
-export function getPointsPricing(): PointsPricingInfo {
+function configuredPricingModel(model: string): string | undefined {
+  const normalized = model.trim().toLowerCase()
+  return Object.keys(MODEL_PRICES).find((candidate) =>
+    normalized === candidate || normalized.startsWith(`${candidate}-`)
+  )
+}
+
+export function getPointsPricing(model = DEFAULT_PRICING.model): PointsPricingInfo {
+  const configuredModel = configuredPricingModel(model) || DEFAULT_PRICING.model
   const usdCnyRate = envNumber('PRODUCT_REPORT_USD_CNY_RATE', DEFAULT_PRICING.usdCnyRate, 1, 20)
   const pointsPerCny = envNumber('PRODUCT_REPORT_POINTS_PER_CNY', DEFAULT_PRICING.pointsPerCny, 0.01, 10_000)
   const costRate = envNumber('PRODUCT_REPORT_COST_RATE', DEFAULT_PRICING.costRate, 0.01, 1)
   return {
     ...DEFAULT_PRICING,
+    ...MODEL_PRICES[configuredModel],
+    model: configuredModel,
     usdCnyRate,
     pointsPerCny,
     cnyPerCostPoint: 1 / pointsPerCny,
@@ -144,6 +184,12 @@ function writeWallet(wallet: StoredWallet): void {
 
 function roundPoints(milli: number): number {
   return Math.round(milli) / MILLI_POINTS
+}
+
+function ceilMilliPoints(points: number): number {
+  const raw = Math.max(0, points) * MILLI_POINTS
+  const nearest = Math.round(raw)
+  return Math.abs(raw - nearest) < 1e-7 ? nearest : Math.ceil(raw)
 }
 
 function publicEntry(entry: StoredLedgerEntry): PointsLedgerEntry {
@@ -274,18 +320,15 @@ export function clearLocalPointsAfterUnbind(unbindId: string): PointsWalletStatu
   return toStatus(wallet)
 }
 
-function isPricedModel(model: string): boolean {
-  return model.toLowerCase() === 'gpt-5.5' || model.toLowerCase().startsWith('gpt-5.5-')
-}
-
 export function calculateUsagePoints(record: TokenUsageRecord): {
   costPoints: number
   chargedPoints: number
   costMilli: number
   chargedMilli: number
 } | null {
-  if (record.eventType !== 'final' || record.usageSource !== 'provider' || !isPricedModel(record.model)) return null
-  const pricing = getPointsPricing()
+  const pricingModel = configuredPricingModel(record.model)
+  if (record.eventType !== 'final' || record.usageSource !== 'provider' || !pricingModel) return null
+  const pricing = getPointsPricing(pricingModel)
   const regularInput = Math.max(
     0,
     record.inputTokens - record.cachedInputTokens - record.cacheCreationInputTokens
@@ -298,8 +341,8 @@ export function calculateUsagePoints(record: TokenUsageRecord): {
     1_000_000
   const costPoints = costUsd * pricing.usdCnyRate * pricing.pointsPerCny
   const chargedPoints = costPoints * pricing.chargeMultiplier
-  const costMilli = Math.max(0, Math.ceil(costPoints * MILLI_POINTS))
-  const chargedMilli = Math.max(0, Math.ceil(chargedPoints * MILLI_POINTS))
+  const costMilli = ceilMilliPoints(costPoints)
+  const chargedMilli = ceilMilliPoints(chargedPoints)
   return { costPoints: roundPoints(costMilli), chargedPoints: roundPoints(chargedMilli), costMilli, chargedMilli }
 }
 

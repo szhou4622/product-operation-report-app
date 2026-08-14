@@ -9,3 +9,4 @@ dist/
 settings.json
 managed-model.local.json
 managed-model.json
+.secrets/

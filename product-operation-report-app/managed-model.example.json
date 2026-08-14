@@ -6,5 +6,10 @@
   "apiKey": "replace-with-private-api-key",
   "model": "gpt-5.5",
   "supportsVision": true,
-  "temperature": 0.3
+  "temperature": 0.3,
+  "fallbackModels": [
+    "claude-sonnet-4-6",
+    "gemini-3-flash",
+    "kimi-k2.6"
+  ]
 }

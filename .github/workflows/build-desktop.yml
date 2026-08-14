@@ -7,7 +7,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   package:
@@ -45,10 +45,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -56,11 +56,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Create private managed model config
-        env:
-          MANAGED_MODEL_CONFIG_JSON: ${{ secrets.MANAGED_MODEL_CONFIG_JSON }}
-        run: npm run config:managed:from-env
 
       - name: Audit packaged dependencies
         run: npm audit --omit=dev --audit-level=high
@@ -70,6 +65,18 @@ jobs:
 
       - name: Build installer
         run: npm run ${{ matrix.script }} -- --${{ matrix.arch }}
+
+      - name: Verify installer contains no model provider secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            package_root="dist/win-unpacked"
+          else
+            package_root="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
+          fi
+          [[ -n "${package_root}" && -e "${package_root}" ]]
+          node scripts/verify-package-secrets.cjs "${package_root}"
 
       - name: Verify packaged Windows runtime
         if: matrix.os == 'windows-latest'
@@ -101,7 +108,7 @@ jobs:
           grep -q "${expected_arch}" <<<"${binary_details}"
 
       - name: Upload installer
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
@@ -114,10 +121,12 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
       - name: Download all installers
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-assets
           merge-multiple: true
@@ -146,20 +155,19 @@ jobs:
       UPDATE_SERVER_PORT: ${{ vars.UPDATE_SERVER_PORT }}
       UPDATE_SERVER_SSH_PRIVATE_KEY: ${{ secrets.UPDATE_SERVER_SSH_PRIVATE_KEY }}
       UPDATE_SERVER_KNOWN_HOSTS: ${{ secrets.UPDATE_SERVER_KNOWN_HOSTS }}
-      MIN_SUPPORTED_VERSION: ${{ vars.PRODUCT_OPERATION_REPORT_MIN_SUPPORTED_VERSION }}
-      FORCE_UPDATE: ${{ vars.FORCE_PRODUCT_OPERATION_REPORT_UPDATE }}
+      UPDATE_MANIFEST_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_MANIFEST_SIGNING_PRIVATE_KEY }}
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
       - name: Download all installers
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-assets
           merge-multiple: true
@@ -168,6 +176,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          : "${UPDATE_MANIFEST_SIGNING_PRIVATE_KEY:?Missing UPDATE_MANIFEST_SIGNING_PRIVATE_KEY secret}"
+          install -d -m 0700 "${RUNNER_TEMP}/update-signing"
+          printf '%s\n' "${UPDATE_MANIFEST_SIGNING_PRIVATE_KEY}" > "${RUNNER_TEMP}/update-signing/private.pem"
+          chmod 0600 "${RUNNER_TEMP}/update-signing/private.pem"
           version="${GITHUB_REF_NAME#v}"
           args=(
             product-operation-report-app/scripts/prepare-update-release.cjs
@@ -175,13 +187,8 @@ jobs:
             --artifacts-dir release-assets
             --notes-file product-operation-report-app/release-notes.txt
             --output update-package/latest.json
+            --signing-key "${RUNNER_TEMP}/update-signing/private.pem"
           )
-          if [[ -n "${MIN_SUPPORTED_VERSION:-}" ]]; then
-            args+=(--min-supported-version "${MIN_SUPPORTED_VERSION}")
-          fi
-          if [[ "${FORCE_UPDATE:-false}" == "true" ]]; then
-            args+=(--force)
-          fi
           node "${args[@]}"
           cp product-operation-report-app/scripts/deploy-update-release.sh update-package/
           cp release-assets/* update-package/
@@ -227,6 +234,16 @@ jobs:
           node -e '
             const fs = require("fs");
             const body = JSON.parse(fs.readFileSync("published-update.json", "utf8"));
+            const expectedManifest = JSON.parse(fs.readFileSync("update-package/latest.json", "utf8"));
             const expected = process.argv[1];
+            const canonical = (value) => {
+              if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+              if (value && typeof value === "object") {
+                return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+              }
+              return JSON.stringify(value);
+            };
             if (body.app_name !== "ProductOperationReport" || body.version !== expected) process.exit(1);
+            if (body.force !== false || typeof body.signature !== "string" || body.signature.length < 32) process.exit(1);
+            if (canonical(body) !== canonical(expectedManifest)) process.exit(1);
           ' "${version}"

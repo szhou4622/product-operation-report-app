@@ -428,6 +428,7 @@ export interface SavedProject {
 export interface TestModelOptions {
   profile: ModelProfile
   withImageDataUrl?: string // 传入则测试多模态读图
+  timeoutMs?: number // 仅主进程测试使用；界面默认 20 秒
 }
 
 export interface TestModelResult {

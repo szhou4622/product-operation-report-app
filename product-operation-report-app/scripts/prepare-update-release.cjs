@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { createHash } = require('crypto')
+const { createHash, createPrivateKey, sign } = require('crypto')
 const { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require('fs')
 const { dirname, join, resolve } = require('path')
 
@@ -69,6 +69,25 @@ function hashFile(path) {
   })
 }
 
+function canonicalValue(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return JSON.stringify(value)
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(',')}]`
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value)
+      .filter(([key, item]) => key !== 'signature' && item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right, 'en'))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalValue(item)}`).join(',')}}`
+  }
+  throw new Error('更新签名内容包含不支持的值')
+}
+
+function signManifest(manifest, privateKeyPath) {
+  if (!privateKeyPath || !existsSync(privateKeyPath)) throw new Error('缺少更新签名私钥；拒绝生成未签名更新配置')
+  const key = createPrivateKey(readFileSync(privateKeyPath, 'utf8'))
+  return sign(null, Buffer.from(canonicalValue(manifest), 'utf8'), key).toString('base64')
+}
+
 async function buildManifest(options) {
   const projectRoot = resolve(options.projectRoot || join(__dirname, '..'))
   const packageJson = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'))
@@ -113,6 +132,10 @@ async function buildManifest(options) {
     notes: readNotes(options.notesFile ? resolve(options.notesFile) : join(projectRoot, 'release-notes.txt')),
     force: options.force === true
   }
+  manifest.signature = signManifest(
+    manifest,
+    resolve(options.signingKey || process.env.PRODUCT_REPORT_UPDATE_SIGNING_KEY || join(projectRoot, '.secrets', 'update-signing-private.pem'))
+  )
 
   const output = resolve(options.output || join(projectRoot, 'dist', 'update-release', 'latest.json'))
   mkdirSync(dirname(output), { recursive: true })
@@ -130,7 +153,8 @@ async function main() {
     minSupportedVersion: args.minSupportedVersion,
     publicRoot: args.publicRoot,
     output: args.output,
-    force: args.force
+    force: args.force,
+    signingKey: args.signingKey
   })
   process.stdout.write(`${JSON.stringify({
     ok: true,
@@ -159,5 +183,7 @@ module.exports = {
   compareVersions,
   normalizeVersion,
   parseArguments,
-  readNotes
+  readNotes,
+  canonicalValue,
+  signManifest
 }

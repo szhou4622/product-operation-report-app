@@ -26,7 +26,8 @@ function encrypt(value: string): string {
   if (safeStorage.isEncryptionAvailable()) {
     return safeStorage.encryptString(value).toString('base64')
   }
-  // 加密不可用（少见，主要在某些 Linux 环境）时退化为明文存储并打标记
+  if (app.isPackaged) throw new Error('系统安全存储暂不可用，无法保存模型凭证。')
+  // 仅开发态允许退化，正式安装版不会把密钥明文落盘。
   return PLAIN_PREFIX + Buffer.from(value, 'utf8').toString('base64')
 }
 
@@ -145,11 +146,18 @@ export function saveSettings(settings: AppSettings): AppSettings {
 }
 
 export function getActiveProfile(): ModelProfile | null {
+  return getActiveProfiles()[0] ?? null
+}
+
+/** 内置模式按既定顺序返回主模型与备用模型；普通用户配置仍只使用当前选中模型。 */
+export function getActiveProfiles(): ModelProfile[] {
   const managed = getManagedModelState()
-  if (managed.enabled) return managed.profile
+  if (managed.enabled) return managed.profiles
   const s = loadSettings()
-  if (!s.activeProfileId) return s.profiles[0] ?? null
-  return s.profiles.find((p) => p.id === s.activeProfileId) ?? s.profiles[0] ?? null
+  const profile = !s.activeProfileId
+    ? s.profiles[0]
+    : s.profiles.find((p) => p.id === s.activeProfileId) ?? s.profiles[0]
+  return profile ? [profile] : []
 }
 
 /** 返回给界面的设置；内置模式下绝不暴露任何本地或内置 API Key。 */

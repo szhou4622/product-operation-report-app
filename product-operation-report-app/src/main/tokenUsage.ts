@@ -107,7 +107,12 @@ export function estimateRequestTokens(
 export function classifyModelFailure(message: string, status: TokenUsageStatus): string | undefined {
   if (status === 'started' || status === 'success') return undefined
   if (status === 'aborted') return 'user_aborted'
+  if (/HTTP\s+(401|403)\b|unauthori[sz]ed|forbidden|API\s*Key|鉴权|认证失败|授权失败/i.test(message)) return 'authentication'
+  if (/content[_ -]?filter|policy[_ -]?violation|blocked|内容安全|安全限制|政策拒绝|safety/i.test(message)) return 'safety'
+  if (/provider_route_unavailable/i.test(message)) return 'provider_route_unavailable'
   if (/429|额度受限|服务繁忙/i.test(message)) return 'rate_limited'
+  if (/model[_ -]?(not[_ -]?found|unavailable)|unknown model|模型不存在|模型不可用/i.test(message)) return 'model_unavailable'
+  if (/HTTP\s+4\d\d\b/i.test(message)) return 'client_error'
   if (/timeout|超时|长时间没有响应/i.test(message)) return 'timeout'
   if (/fetch failed|ECONN|ENOTFOUND|network|网络|terminated|socket/i.test(message)) return 'network'
   if (/不完整|提前结束|length/i.test(message)) return 'incomplete'

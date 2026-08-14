@@ -100,6 +100,11 @@ async function run(): Promise<void> {
   assert.equal(csvResult.result?.ok, true, JSON.stringify(csvResult))
   assert.match(csvResult.result?.text || '', /alpha/)
 
+  const markdown = new TextEncoder().encode('# 产品手卡\n\n- 核心卖点：安装版 Markdown 可解析')
+  const markdownResult = await request(child, 'markdown', 'file', '产品手卡.MD', exactBuffer(markdown))
+  assert.equal(markdownResult.result?.ok, true, JSON.stringify(markdownResult))
+  assert.match(markdownResult.result?.text || '', /安装版 Markdown 可解析/)
+
   const raggedCsv = new TextEncoder().encode('name,value\nalpha,1,extra')
   const raggedResult = await request(
     child,
@@ -198,7 +203,7 @@ evidence-confidence: confirmed
 void app.whenReady().then(async () => {
   try {
     await run()
-    console.log('Packaged ASAR checks passed: CSV, XLSX, PDF, ZIP, offline HTML renderer and bundled Skill.')
+    console.log('Packaged ASAR checks passed: Markdown, CSV, XLSX, PDF, ZIP, offline HTML renderer and bundled Skill.')
     app.exit(0)
   } catch (error) {
     console.error(error)

@@ -56,6 +56,8 @@ export function normalizeProviderUsage(raw: unknown, fallbackModel: string): Mod
     nestedTokenNumber(usage.input_tokens_details, 'cache_creation_input_tokens')
   )
   const declaredTotal = tokenNumber(usage.total_tokens)
+  if (cachedInputTokens + cacheCreationInputTokens > inputTokens) return undefined
+  if (declaredTotal && declaredTotal < inputTokens + outputTokens) return undefined
   return {
     source: 'provider',
     inputTokens,
@@ -113,9 +115,9 @@ function finishReasonError(reason: unknown): string | undefined {
   return `模型提前停止（${reason}），本次内容未作为完整结果保存。`
 }
 
-function modelRequestError(error: unknown): string {
+function modelRequestError(error: unknown, timeoutMs = SETTINGS_REQUEST_TIMEOUT_MS): string {
   if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-    return `请求超过 ${SETTINGS_REQUEST_TIMEOUT_MS / 1000} 秒未响应，请检查 Base URL 或网络后重试。`
+    return `请求超过 ${timeoutMs / 1000} 秒未响应，请检查 Base URL 或网络后重试。`
   }
   return error instanceof Error ? error.message : String(error)
 }
@@ -194,6 +196,7 @@ function endpoint(baseURL: string): string {
 /** 非流式：测试连通性 */
 export async function testModel(opts: TestModelOptions): Promise<TestModelResult> {
   const { profile, withImageDataUrl } = opts
+  const timeoutMs = Math.min(60_000, Math.max(1_000, opts.timeoutMs ?? SETTINGS_REQUEST_TIMEOUT_MS))
   const started = Date.now()
   try {
     const userContent: ChatMessage['content'] = withImageDataUrl
@@ -217,10 +220,10 @@ export async function testModel(opts: TestModelOptions): Promise<TestModelResult
       body: JSON.stringify({
         model: profile.model,
         messages: toOpenAIMessages(messages, profile.supportsVision && !!withImageDataUrl),
-        temperature: profile.temperature ?? 0.3,
+        ...(profile.temperature === undefined ? {} : { temperature: profile.temperature }),
         stream: false
       }),
-      signal: AbortSignal.timeout(SETTINGS_REQUEST_TIMEOUT_MS)
+      signal: AbortSignal.timeout(timeoutMs)
     })
 
     const raw = await readLimitedText(res, MAX_SETTINGS_RESPONSE_BYTES)
@@ -257,7 +260,7 @@ export async function testModel(opts: TestModelOptions): Promise<TestModelResult
   } catch (e) {
     return {
       ok: false,
-      message: modelRequestError(e),
+      message: modelRequestError(e, timeoutMs),
       latencyMs: Date.now() - started
     }
   }
@@ -269,7 +272,7 @@ export async function chatStream(
   messages: ChatMessage[],
   onEvent: (ev: ChatStreamEvent) => void,
   signal?: AbortSignal,
-  policy?: { reasoningEffort?: 'low' }
+  policy?: { reasoningEffort?: 'low'; requestHeaders?: Record<string, string> }
 ): Promise<void> {
   let full = ''
   let latestUsage: ModelTokenUsage | undefined
@@ -290,12 +293,13 @@ export async function chatStream(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${profile.apiKey}`
+        Authorization: `Bearer ${profile.apiKey}`,
+        ...(policy?.requestHeaders || {})
       },
       body: JSON.stringify({
         model: profile.model,
         messages: toOpenAIMessages(messages, profile.supportsVision),
-        temperature: profile.temperature ?? 0.3,
+        ...(profile.temperature === undefined ? {} : { temperature: profile.temperature }),
         stream: true,
         stream_options: { include_usage: true },
         ...(withReasoningEffort && policy?.reasoningEffort

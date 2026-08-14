@@ -1,5 +1,5 @@
 appId: com.example.product-operation-report
-productName: 产品经营报告
+productName: 产品与内容经营报告系统
 directories:
   output: dist
   buildResources: build
@@ -9,10 +9,7 @@ files:
   - package.json
 asarUnpack:
   - assets/**/*
-# 发布流程从私有构建变量生成该文件；它被 Git 忽略，不能提交真实 API Key。
-extraResources:
-  - from: managed-model.json
-    to: managed-model.json
+# 正式安装包只连接业务代理；模型供应商密钥绝不进入构建产物。
 afterPack: build/afterPack.cjs
 electronFuses:
   runAsNode: false

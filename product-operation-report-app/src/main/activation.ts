@@ -1,4 +1,4 @@
-import { app } from 'electron'
+import { app, safeStorage } from 'electron'
 import { execFileSync } from 'child_process'
 import {
   createCipheriv,
@@ -265,6 +265,10 @@ function encryptionKey(deviceId: string): Buffer {
 }
 
 function encryptActivationCode(code: string, deviceId: string): string {
+  if (safeStorage.isEncryptionAvailable()) {
+    return `v2safe:${safeStorage.encryptString(code).toString('base64')}`
+  }
+  if (app.isPackaged) throw new Error('系统安全存储暂不可用，无法安全保存授权凭证。请重启电脑后再试。')
   const iv = randomBytes(12)
   const cipher = createCipheriv('aes-256-gcm', encryptionKey(deviceId), iv)
   const encrypted = Buffer.concat([cipher.update(code, 'utf8'), cipher.final()])
@@ -274,6 +278,14 @@ function encryptActivationCode(code: string, deviceId: string): string {
 
 function decryptActivationCode(value: string | undefined, deviceId: string): string | null {
   if (!value) return null
+  if (value.startsWith('v2safe:')) {
+    if (!safeStorage.isEncryptionAvailable()) return null
+    try {
+      return safeStorage.decryptString(Buffer.from(value.slice('v2safe:'.length), 'base64'))
+    } catch {
+      return null
+    }
+  }
   try {
     const [version, ivValue, tagValue, encryptedValue] = value.split(':')
     if (version !== 'v1' || !ivValue || !tagValue || !encryptedValue) return null
@@ -446,7 +458,7 @@ function parseServerLicense(body: Record<string, unknown>, httpOk: boolean): Ser
   const rejectedStatus =
     bindingStatus === 'unbound' ||
     ['disabled', 'expired', 'invalid', 'revoked', 'blocked', 'machine_mismatch'].some((item) => status.includes(item))
-  const ok = httpOk && explicitOk !== false && explicitOk !== 0 && explicitOk !== 'false' && !rejectedStatus
+  const ok = httpOk && explicitOk === true && !rejectedStatus
 
   const typeText = String(pickFirst(payload, body, ['license_type', 'type', 'code_type']) || '').toLowerCase()
   const unlimitedValue = pickFirst(payload, body, ['unlimited', 'is_unlimited', 'permanent'])
@@ -644,11 +656,7 @@ async function requestServerDeviceUnbind(
     )
     const explicitOk = pickFirst(payload, body, ['ok', 'success', 'unbound'])
     const bindingStatus = normalizeBindingStatus(pickFirstDeep(body, ['binding_status']))
-    const ok = response.ok &&
-      explicitOk !== false &&
-      explicitOk !== 0 &&
-      explicitOk !== 'false' &&
-      bindingStatus !== 'active'
+    const ok = response.ok && explicitOk === true && bindingStatus === 'unbound'
     return {
       ok,
       unavailable,
@@ -686,7 +694,53 @@ export function getActivationStatus(): ActivationStatus {
   const deviceId = getDeviceId()
   const record = readStoredActivation()
   const migrated = record && recordMatchesDevice(record, deviceId) ? migrateLegacyDevice(record, deviceId) : record
+  if (app.isPackaged && migrated?.version === 1) {
+    return {
+      deviceId,
+      codeCount: ACTIVATION_CODE_COUNT,
+      appName: LICENSE_APP_NAME,
+      activated: false,
+      unlimited: false,
+      offline: false,
+      message: '旧版本地授权需要重新输入原激活码完成服务器登记；登记后原有激活码和积分仍然保留。'
+    }
+  }
   return toStatus(migrated, deviceId)
+}
+
+/** 仅供主进程向业务代理换取短期会话；不得通过 preload 暴露给界面。 */
+export function getLicenseProxyIdentity(): {
+  appName: string
+  deviceId: string
+  licenseId?: string
+  deviceCredential: string
+  deviceSession: string
+  softwareVersion: string
+  platform: string
+} {
+  const deviceId = getDeviceId()
+  const record = readStoredActivation()
+  if (!record || record.version !== 2 || !recordMatchesDevice(record, deviceId)) {
+    throw new Error('旧版授权需要重新输入原激活码完成服务器登记，之后才能生成新报告。')
+  }
+  const status = toStatus(record, deviceId)
+  if (!status.activated || record.source !== 'server' || record.bindingStatus === 'unbound') {
+    throw new Error(status.message || '当前服务器授权不可用，请重新激活。')
+  }
+  const deviceCredential = decryptServerSecret(record.encryptedDeviceCredential, deviceId)
+  const deviceSession = decryptServerSecret(record.encryptedDeviceSession, deviceId)
+  if (!deviceCredential || !deviceSession) {
+    throw new Error('本机缺少服务器设备凭证，请重新输入原激活码。')
+  }
+  return {
+    appName: LICENSE_APP_NAME,
+    deviceId,
+    licenseId: record.licenseId,
+    deviceCredential,
+    deviceSession,
+    softwareVersion: app.getVersion(),
+    platform: `${process.platform}-${process.arch}`
+  }
 }
 
 export async function getActivationStatusWithServerCheck(): Promise<ActivationStatus> {
@@ -743,6 +797,15 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
       revokedReason: undefined,
       serverMessage: result.message
     }
+    if (code && !current.encryptedCode?.startsWith('v2safe:')) {
+      baseUpdated.encryptedCode = encryptActivationCode(code, deviceId)
+    }
+    if (deviceCredential && !current.encryptedDeviceCredential?.startsWith('v2safe:')) {
+      baseUpdated.encryptedDeviceCredential = encryptServerSecret(deviceCredential, deviceId)
+    }
+    if (deviceSession && !current.encryptedDeviceSession?.startsWith('v2safe:')) {
+      baseUpdated.encryptedDeviceSession = encryptServerSecret(deviceSession, deviceId)
+    }
     writeStoredActivation(baseUpdated)
     return toStatus(baseUpdated, deviceId)
   }
@@ -795,7 +858,7 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
     }
     const now = new Date()
     const activationCredits =
-      server.creditsRemaining !== undefined && server.creditsRemaining > 0
+      server.creditsRemaining !== undefined
         ? server.creditsRemaining
         : server.creditsGranted
     const baseRecord: ServerStoredActivation = {
@@ -855,7 +918,7 @@ export async function redeemPointsWithCode(input: string): Promise<{
   const result = await requestServerActivation(enteredCode, currentStatus.deviceId)
   if (!result.ok) return { ok: false, message: result.message }
   const rechargePoints =
-    result.creditsRemaining !== undefined && result.creditsRemaining > 0
+    result.creditsRemaining !== undefined
       ? result.creditsRemaining
       : result.creditsGranted
   if (result.licenseType !== 'credits' || (rechargePoints || 0) <= 0) {

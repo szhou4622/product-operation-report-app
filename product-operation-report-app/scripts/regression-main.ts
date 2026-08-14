@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createCipheriv, createHash, randomBytes } from 'node:crypto'
+import { createCipheriv, createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { app, BrowserWindow } from 'electron'
@@ -23,17 +23,25 @@ import {
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
   getActiveProfile,
+  getActiveProfiles,
   loadRendererSettings,
   loadSettings,
   saveRendererSettings,
   saveSettings
 } from '../src/main/settings'
 import { managedModelInternals } from '../src/main/managedModel'
+import { runModelFallbackSequence, shouldTryModelFallback } from '../src/main/modelFallback'
+import {
+  ChatRequestRegistry,
+  validateChatStartPayload
+} from '../src/main/chatAdmission'
 import { readBundledSopRules } from '../src/main/sopRules'
 import { checkForUpdates, compareVersions, downloadUpdate } from '../src/main/updater'
+import { canonicalUpdateManifest, verifyUpdateManifestSignature } from '../src/main/updateSignature'
 import {
   appendTokenUsageRecord,
   buildTokenUsageDashboard,
+  classifyModelFailure,
   estimateRequestTokens,
   readTokenUsageRecords,
   sanitizeModelTaskContext,
@@ -318,7 +326,7 @@ async function testServerActivationAndCredits(): Promise<void> {
   }
 }
 
-async function testStandardCodeWithGrantedCreditsAndZeroServerBalance(): Promise<void> {
+async function testExplicitZeroServerBalanceDoesNotReissueGrantedCredits(): Promise<void> {
   const originalFetch = globalThis.fetch
   const activationFile = join(tempUserData, 'activation.json')
   const activationBackup = `${activationFile}.bak`
@@ -353,17 +361,17 @@ async function testStandardCodeWithGrantedCreditsAndZeroServerBalance(): Promise
     const activated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
     assert.equal(activated.ok, true)
     assert.equal(activated.status.licenseType, 'credits')
-    assert.equal(activated.status.creditsRemaining, 100)
-    assert.equal(applyActivationPoints(activated.status).addedPoints, 100)
-    assert.equal(getPointsWalletStatus().balancePoints, 100)
+    assert.equal(activated.status.creditsRemaining, 0)
     assert.equal(applyActivationPoints(activated.status).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 100, 'the compatibility grant must remain idempotent')
+    assert.equal(getPointsWalletStatus().balancePoints, 0)
+    assert.equal(applyActivationPoints(activated.status).addedPoints, 0)
+    assert.equal(getPointsWalletStatus().balancePoints, 0, 'an explicit zero server balance must never be reissued')
 
     const repeated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
     assert.equal(repeated.ok, true, 'same-device activation may reuse locally encrypted device credentials')
-    assert.equal(repeated.status.creditsRemaining, 100)
+    assert.equal(repeated.status.creditsRemaining, 0)
     assert.equal(applyActivationPoints(repeated.status).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 100)
+    assert.equal(getPointsWalletStatus().balancePoints, 0)
   } finally {
     globalThis.fetch = originalFetch
     rmSync(activationFile, { force: true })
@@ -632,6 +640,23 @@ function testUpdateVersionComparison(): void {
   assert.equal(compareVersions('2.0.0', '10.0.0'), -1)
 }
 
+function testUpdateManifestSignature(): void {
+  const keys = generateKeyPairSync('ed25519')
+  const publicKey = keys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
+  const manifest: Record<string, unknown> = {
+    app_name: 'ProductOperationReport',
+    version: '9.9.9',
+    download_url: { windows_x64: 'https://update.dadaozixun.com/test.exe' },
+    sha256: { windows_x64: 'a'.repeat(64) },
+    notes: ['安全更新'],
+    force: false
+  }
+  manifest.signature = sign(null, canonicalUpdateManifest(manifest), keys.privateKey).toString('base64')
+  assert.equal(verifyUpdateManifestSignature(manifest, publicKey), true)
+  assert.equal(verifyUpdateManifestSignature({ ...manifest, version: '9.9.10' }, publicKey), false)
+  assert.equal(verifyUpdateManifestSignature({ ...manifest, signature: '' }, publicKey), false)
+}
+
 async function testUpdateConfigAndChecksum(): Promise<void> {
   const originalFetch = globalThis.fetch
   const payload = Buffer.from('verified-update-payload', 'utf8')
@@ -644,7 +669,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         app_name: 'ProductOperationReport',
         version: '999.0.0',
         min_supported_version: '998.0.0',
-        download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
+        download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
         sha256: { windows_x64: '0'.repeat(64) },
         notes: ['测试更新'],
         force: false
@@ -661,7 +686,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.exe' })
+      Object.defineProperty(response, 'url', { value: 'https://update.dadaozixun.com/POR-test-update.exe' })
       return response
     }) as typeof fetch
     const rejected = await downloadUpdate()
@@ -671,7 +696,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'ProductOperationReport',
       version: '999.0.1',
-      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
+      download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
       sha256: { windows_x64: correctChecksum },
       notes: '通过校验',
       force: false
@@ -685,7 +710,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://downloads.example.test/POR-test-update.exe' })
+      Object.defineProperty(response, 'url', { value: 'https://update.dadaozixun.com/POR-test-update.exe' })
       return response
     }) as typeof fetch
     const accepted = await downloadUpdate()
@@ -699,7 +724,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'ProductOperationReport',
       version: '999.0.2',
-      download_url: { windows_x64: 'https://downloads.example.test/not-an-installer.html' },
+      download_url: { windows_x64: 'https://update.dadaozixun.com/not-an-installer.html' },
       sha256: { windows_x64: correctChecksum },
       notes: [],
       force: false
@@ -709,7 +734,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'AnotherProduct',
       version: '999.0.3',
-      download_url: { windows_x64: 'https://downloads.example.test/POR-test-update.exe' },
+      download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
       sha256: { windows_x64: correctChecksum },
       notes: [],
       force: false
@@ -730,24 +755,42 @@ function testManagedModelIsolation(): void {
     apiKey: secret,
     model: 'managed-model',
     supportsVision: true,
-    temperature: 0.3
+    temperature: 0.3,
+    fallbackModels: ['claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
   }
   const parsed = managedModelInternals.parseConfig(validConfig)
   assert.equal(parsed.enabled, true)
   assert.equal(parsed.profile?.apiKey, secret)
   assert.equal(parsed.profile?.baseURL, 'https://managed.example.com/v1')
+  assert.deepEqual(parsed.profiles.map((item) => item.model), [
+    'managed-model', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6'
+  ])
+  assert.equal(parsed.profiles[0].temperature, 0.3)
+  assert.equal(parsed.profiles[1].temperature, undefined)
+  assert.equal(parsed.profiles.every((item) => item.apiKey === secret), true)
   assert.equal(JSON.stringify(parsed.info).includes(secret), false)
   assert.equal(managedModelInternals.parseConfig({ ...validConfig, apiKey: '' }).profile, null)
   assert.equal(managedModelInternals.parseConfig({ ...validConfig, baseURL: 'http://remote.example.com/v1' }).profile, null)
   assert.equal(managedModelInternals.parseConfig({ ...validConfig, enabled: false }).enabled, false)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, fallbackModels: ['managed-model'] }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, fallbackModels: ['a', 'b', 'c', 'd'] }).profile, null)
+  assert.deepEqual(
+    managedModelInternals.parseConfig({ ...validConfig, model: 'gpt-5.5', fallbackModels: undefined }).profiles.map((item) => item.model),
+    ['gpt-5.5', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+  )
 
   process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON = JSON.stringify(validConfig)
+  assert.notEqual(getActiveProfile()?.apiKey, secret, '开发开关未启用时必须忽略模型环境变量')
+  process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES = '1'
   try {
     const rendererSettings = loadRendererSettings()
     assert.equal(rendererSettings.profiles.length, 0)
     assert.equal(rendererSettings.managedModel?.configured, true)
     assert.equal(JSON.stringify(rendererSettings).includes(secret), false)
     assert.equal(getActiveProfile()?.apiKey, secret)
+    assert.deepEqual(getActiveProfiles().map((item) => item.model), [
+      'managed-model', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6'
+    ])
 
     const saved = saveRendererSettings({
       ...rendererSettings,
@@ -770,7 +813,119 @@ function testManagedModelIsolation(): void {
     assert.equal(getActiveProfile()?.id, 'managed-model')
   } finally {
     delete process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON
+    delete process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES
   }
+}
+
+function testModelFallbackSafety(): void {
+  assert.equal(classifyModelFailure('HTTP 429 Too Many Requests', 'error'), 'rate_limited')
+  assert.equal(classifyModelFailure('HTTP 401 Unauthorized', 'error'), 'authentication')
+  assert.equal(classifyModelFailure('模型因内容安全限制提前停止', 'error'), 'safety')
+  assert.equal(
+    classifyModelFailure('HTTP 503 {"message":"provider_route_unavailable"}', 'error'),
+    'provider_route_unavailable'
+  )
+  assert.equal(shouldTryModelFallback({ failureKind: 'rate_limited', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'network', outputChars: 1, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'authentication', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'safety', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: true, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: false, hasNext: false }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'model_unavailable', outputChars: 0, aborted: false, hasNext: true }), true)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_route_unavailable', outputChars: 0, aborted: false, hasNext: true }), true)
+}
+
+function testChatAdmissionSecurity(): void {
+  const id = 'b4f81b86-1a5b-4e39-830e-1271165bb8ee'
+  const context = {
+    reportSessionId: 'report-security-test',
+    taskType: 'summary' as const,
+    taskKey: 'summary:1',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 1,
+    imageCount: 0
+  }
+  const valid = validateChatStartPayload({
+    id,
+    messages: [{ role: 'user', content: '请总结资料。' }],
+    context
+  })
+  assert.equal(valid.id, id)
+  assert.throws(
+    () => validateChatStartPayload({ id, messages: [{ role: 'user', content: 'x'.repeat(2_000_001) }], context }),
+    /过大/
+  )
+  assert.throws(
+    () => validateChatStartPayload({
+      id,
+      messages: [{ role: 'user', content: [{ type: 'image', dataUrl: 'https://127.0.0.1/private.png' }] }],
+      context: { ...context, isVision: true, imageCount: 1 }
+    }),
+    /图片/
+  )
+
+  const registry = new ChatRequestRegistry(4)
+  const first = new AbortController()
+  registry.claim(id, 101, first)
+  assert.throws(() => registry.claim(id, 101, new AbortController()), /重复/)
+  assert.equal(registry.abort(id, 202), false)
+  assert.equal(first.signal.aborted, false)
+  assert.equal(registry.abort(id, 101), true)
+  assert.equal(first.signal.aborted, true)
+  registry.release(id, 101, first)
+  assert.equal(registry.size, 0)
+}
+
+async function testModelFallbackSequence(): Promise<void> {
+  const profiles = ['gpt-5.5', 'claude-sonnet-4-6', 'gemini-3-flash'].map((model, index) => ({
+    id: `fallback-test-${index}`,
+    name: model,
+    baseURL: 'https://example.invalid/v1',
+    apiKey: 'secret',
+    model,
+    supportsVision: true
+  }))
+  const attempts: string[] = []
+  const usageModels: string[] = []
+  const recovered = await runModelFallbackSequence(profiles, async (current, index) => {
+    attempts.push(current.model)
+    usageModels.push(current.model)
+    if (index === 0) {
+      return {
+        terminal: { type: 'error' as const, message: 'HTTP 429', usage: { source: 'missing' as const, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: current.model } },
+        failureKind: 'model_unavailable',
+        outputChars: 0,
+        hasVisibleOutput: false,
+        aborted: false
+      }
+    }
+    return {
+      terminal: { type: 'done' as const, full: '完整报告', usage: { source: 'provider' as const, inputTokens: 10, outputTokens: 2, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 12, model: current.model } },
+      outputChars: 4,
+      hasVisibleOutput: true,
+      aborted: false
+    }
+  })
+  assert.deepEqual(attempts, ['gpt-5.5', 'claude-sonnet-4-6'])
+  assert.deepEqual(usageModels, attempts)
+  assert.equal(recovered.profile.model, 'claude-sonnet-4-6')
+  assert.equal(recovered.outcome.terminal.type, 'done')
+
+  const partialAttempts: string[] = []
+  const partial = await runModelFallbackSequence(profiles, async (current) => {
+    partialAttempts.push(current.model)
+    return {
+      terminal: { type: 'error' as const, message: '网络中断', usage: { source: 'missing' as const, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: current.model } },
+      failureKind: 'network',
+      outputChars: 2,
+      hasVisibleOutput: true,
+      aborted: false
+    }
+  })
+  assert.deepEqual(partialAttempts, ['gpt-5.5'])
+  assert.equal(partial.outcome.terminal.type, 'error')
 }
 
 async function testSourceInvalidation(): Promise<void> {
@@ -1051,8 +1206,8 @@ async function testDoubleExportGuard(): Promise<void> {
   }
   useStore.setState({
     phase: 'done',
-    artifacts: { 9: '最终报告' },
-    reportMarkdown: '最终报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false,
     exportStatus: ''
   })
@@ -1174,6 +1329,7 @@ async function testStrictModelCompletion(): Promise<void> {
     }) as typeof fetch
     await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => normalEvents.push(event))
     assert.deepEqual(streamingRequestBody?.stream_options, { include_usage: true })
+    assert.equal('temperature' in (streamingRequestBody || {}), false)
     const usageEvent = normalEvents.find((event) => event.type === 'usage')
     assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.inputTokens : 0, 120)
     assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.cachedInputTokens : 0, 40)
@@ -1521,6 +1677,22 @@ async function testRealTokenPointsBilling(): Promise<void> {
   })
   assert.equal(calculateUsagePoints(stoppedRetry)?.chargedPoints, 180)
   assert.equal(settleTokenUsage(stoppedRetry).balancePoints, 6_760)
+
+  for (const item of [
+    { model: 'claude-sonnet-4-6', cost: 288, charged: 576 },
+    { model: 'gemini-3-flash', cost: 864, charged: 1_728 },
+    { model: 'kimi-k2.6', cost: 576, charged: 1_152 }
+  ]) {
+    const charge = calculateUsagePoints(liveBillingRecord({
+      model: item.model,
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      totalTokens: 1_000_000
+    }))
+    assert.equal(charge?.costPoints, item.cost)
+    assert.equal(charge?.chargedPoints, item.charged)
+  }
+  assert.equal(calculateUsagePoints(liveBillingRecord({ model: 'unknown-model' })), null)
 
   const activation = {
     activated: true,
@@ -1918,6 +2090,43 @@ async function testCsvAndArchiveGuards(): Promise<void> {
   assert.equal(utf16WithoutBomParsed.ok, true)
   assert.match(utf16WithoutBomParsed.text, /你好/)
 
+  const utf8Markdown = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from('# 产品手卡\n\n- 核心卖点：中文 Markdown 可解析\n', 'utf8')
+  ])
+  const utf8MarkdownParsed = await parseFile(
+    '产品手卡.MD',
+    utf8Markdown.buffer.slice(
+      utf8Markdown.byteOffset,
+      utf8Markdown.byteOffset + utf8Markdown.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(utf8MarkdownParsed.ok, true)
+  assert.match(utf8MarkdownParsed.text, /中文 Markdown 可解析/)
+
+  const gbMarkdown = iconv.encode('# 竞品说明\n\n价格带：100-199元\n', 'gb18030')
+  const gbMarkdownParsed = await parseFile(
+    '竞品说明.markdown',
+    gbMarkdown.buffer.slice(gbMarkdown.byteOffset, gbMarkdown.byteOffset + gbMarkdown.byteLength) as ArrayBuffer
+  )
+  assert.equal(gbMarkdownParsed.ok, true)
+  assert.match(gbMarkdownParsed.text, /竞品说明/)
+  assert.match(gbMarkdownParsed.text, /价格带/)
+
+  const utf16Markdown = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('# 用户画像\n\n已育女性为核心人群', 'utf16le')
+  ])
+  const utf16MarkdownParsed = await parseFile(
+    '用户画像.md',
+    utf16Markdown.buffer.slice(
+      utf16Markdown.byteOffset,
+      utf16Markdown.byteOffset + utf16Markdown.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(utf16MarkdownParsed.ok, true)
+  assert.match(utf16MarkdownParsed.text, /已育女性为核心人群/)
+
   const malformed = Buffer.from('name,comment\nA,"没有结束\n', 'utf8')
   const malformedParsed = await parseFile(
     'malformed.csv',
@@ -2012,14 +2221,14 @@ async function testFileCountGuard(): Promise<void> {
     reportStale: false,
     analysisSessionId: crypto.randomUUID()
   })
-  const files = Array.from({ length: 201 }, (_, index) => ({
+  const files = Array.from({ length: 51 }, (_, index) => ({
     name: `资料-${index}.txt`,
     size: 2,
     arrayBuffer: async () => new TextEncoder().encode('ok').buffer
   })) as unknown as File[]
   await useStore.getState().addSources(files)
-  assert.equal(useStore.getState().sources.length, 200)
-  assert.match(useStore.getState().messages[0]?.text || '', /最多保留 200/)
+  assert.equal(useStore.getState().sources.length, 50)
+  assert.match(useStore.getState().messages[0]?.text || '', /最多保留 50/)
 }
 
 async function testZipExpansionGlobalCountGuard(): Promise<void> {
@@ -2054,7 +2263,7 @@ async function testZipExpansionGlobalCountGuard(): Promise<void> {
     arrayBuffer: async () => new ArrayBuffer(8)
   })) as unknown as File[]
   await useStore.getState().addSources(zips)
-  assert.equal(useStore.getState().sources.length, 200)
+  assert.equal(useStore.getState().sources.length, 50)
   assert.equal(useStore.getState().sources.filter((source) => /数量提示/.test(source.name)).length, 1)
 }
 
@@ -2236,8 +2445,8 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
     ],
     cleanDetails: [{ id: 'blank', name: '资料一.csv', text: '旧清洗' }],
     cleanedData: '旧清洗',
-    artifacts: { 9: '已完成报告' },
-    reportMarkdown: '已完成报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false
   })
   useStore.getState().setUnconfirmedAttribution('自有数据')
@@ -2246,7 +2455,7 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
   assert.equal(afterBulk.sources.find((source) => source.id === 'chosen')?.attribution, '竞品数据')
   assert.equal(afterBulk.sources.find((source) => source.id === 'failed')?.attribution, undefined)
   assert.equal(afterBulk.cleanDetails.length, 0)
-  assert.equal(afterBulk.reportMarkdown, '已完成报告')
+  assert.equal(afterBulk.reportMarkdown, HTML_REPORT_FIXTURE)
   assert.equal(afterBulk.reportStale, true)
 
   let opened = ''
@@ -2264,8 +2473,8 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
   }
   useStore.setState({
     phase: 'done',
-    artifacts: { 9: '已完成报告' },
-    reportMarkdown: '已完成报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false,
     exportStatus: '',
     lastExportPath: ''
@@ -2291,6 +2500,22 @@ function testExportButtonContract(): void {
   assert.equal(component.includes('其他格式'), false)
 }
 
+function testOptionalOneClickUpdateContract(): void {
+  const appComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'),
+    'utf8'
+  )
+  assert.match(appComponent, /const handleApplyUpdate = async/u)
+  assert.ok(appComponent.includes('立即更新'))
+  assert.ok(appComponent.includes('稍后更新'))
+  assert.match(appComponent, /downloadUpdate\(\)[\s\S]{0,800}installUpdate\(\)/u)
+  assert.doesNotMatch(appComponent, /handleDownloadUpdate|handleInstallUpdate/u)
+
+  const workflow = readFileSync(join(process.cwd(), '..', '.github', 'workflows', 'build-desktop.yml'), 'utf8')
+  assert.doesNotMatch(workflow, /FORCE_PRODUCT_OPERATION_REPORT_UPDATE|PRODUCT_OPERATION_REPORT_MIN_SUPPORTED_VERSION/u)
+  assert.match(workflow, /body\.force !== false/u)
+}
+
 async function testWorkbenchTopbarContract(): Promise<void> {
   const appComponent = readFileSync(
     join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'),
@@ -2299,6 +2524,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   const expectedGuideUrl =
     'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
   assert.ok(appComponent.includes(expectedGuideUrl))
+  assert.ok(appComponent.includes('产品与内容经营报告系统'))
+  assert.ok(appComponent.includes('专业的产品经营与内容分析报告系统'))
   assert.equal(appComponent.includes('FU5FdRkHFoNH7JxUp6wciLksnEe'), false)
   assert.equal(appComponent.includes('Token 统计'), false, 'Token statistics are not exposed in the customer UI')
   assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
@@ -2315,6 +2542,11 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   assert.match(settingsComponent, /deactivateCurrentDevice/u)
   assert.doesNotMatch(settingsComponent, /毛利|每百万|真实成本|按真实 Token/u)
   assert.equal(/if \(!open\) return null[\s\S]{0,500}getReportResultCacheStats\(/u.test(settingsComponent), false)
+  const phaseTrackerComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'PhaseTracker.tsx'),
+    'utf8'
+  )
+  assert.ok(phaseTrackerComponent.includes('最多上传 50 份资料'))
 
   const styles = readFileSync(
     join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
@@ -2329,8 +2561,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
           <div class="brand">
             <span class="brand-mark"></span>
             <span class="brand-copy">
-              <span class="brand-main">产品经营报告</span>
-              <span class="sub">专业的产品经营分析与报告系统</span>
+              <span class="brand-main">产品与内容经营报告系统</span>
+              <span class="sub">专业的产品经营与内容分析报告系统</span>
             </span>
           </div>
           <a class="tutorial-link" href="${expectedGuideUrl}">
@@ -2985,18 +3217,25 @@ async function run(): Promise<void> {
   await testActivationAndSettingsBackup()
   console.log('Regression: server activation, offline grace and idempotent credits')
   await testServerActivationAndCredits()
-  console.log('Regression: standard activation codes with an explicit credit grant')
-  await testStandardCodeWithGrantedCreditsAndZeroServerBalance()
+  console.log('Regression: explicit zero server balance never reissues granted credits')
+  await testExplicitZeroServerBalanceDoesNotReissueGrantedCredits()
   console.log('Regression: safe device unbind and original-code rebind')
   await testDeviceUnbindAndRebind()
   console.log('Regression: primary activation code remains unchanged after points recharge')
   await testPrimaryActivationAndRechargeCodeSeparation()
   console.log('Regression: update version comparison')
   testUpdateVersionComparison()
+  console.log('Regression: signed update manifest')
+  testUpdateManifestSignature()
   console.log('Regression: update config and SHA256 guard')
   await testUpdateConfigAndChecksum()
   console.log('Regression: managed model secret isolation')
   testManagedModelIsolation()
+  console.log('Regression: fallback model safety boundaries')
+  testModelFallbackSafety()
+  await testModelFallbackSequence()
+  console.log('Regression: main-process chat admission and request ownership')
+  testChatAdmissionSecurity()
   console.log('Regression: source invalidation')
   await testSourceInvalidation()
   console.log('Regression: reset save rollback')
@@ -3035,6 +3274,8 @@ async function run(): Promise<void> {
   await testBulkAttributionAndExportOpen()
   console.log('Regression: original export button contract')
   testExportButtonContract()
+  console.log('Regression: optional one-click update contract')
+  testOptionalOneClickUpdateContract()
   console.log('Regression: adaptive workbench topbar')
   await testWorkbenchTopbarContract()
   console.log('Regression: adaptive HTML report renderer')

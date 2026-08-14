@@ -1,5 +1,6 @@
 import { app } from 'electron'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { getManagedModelState } from '../src/main/managedModel'
 import { testModel } from '../src/main/model'
 
@@ -9,12 +10,20 @@ if (process.env.APPDATA) {
 
 async function run(): Promise<void> {
   const managed = getManagedModelState()
-  if (!managed.enabled || !managed.profile) {
+  if (!managed.enabled || !managed.profile || !managed.profiles.length) {
     throw new Error('没有可用的私有内置模型配置。')
   }
-  const result = await testModel({ profile: managed.profile })
-  if (!result.ok) throw new Error('内置模型服务未通过连通性检查。')
-  console.log(`Managed model smoke passed (${result.latencyMs ?? 0}ms; secret not rendered).`)
+  const image = `data:image/png;base64,${readFileSync(join(app.getAppPath(), 'assets', 'product-logo.png')).toString('base64')}`
+  let totalLatencyMs = 0
+  for (const profile of managed.profiles) {
+    const result = await testModel({ profile, withImageDataUrl: image, timeoutMs: 60_000 })
+    if (!result.ok) {
+      const reason = result.message.replace(/sk-[A-Za-z0-9_-]+/gu, '[secret]').slice(0, 240)
+      throw new Error(`内置模型服务未通过连通性检查：${profile.model}；${reason}`)
+    }
+    totalLatencyMs += result.latencyMs ?? 0
+  }
+  console.log(`Managed model smoke passed (${managed.profiles.length} vision models; ${totalLatencyMs}ms; secret not rendered).`)
 }
 
 void app.whenReady().then(async () => {

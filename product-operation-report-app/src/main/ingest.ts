@@ -2,10 +2,11 @@ import * as XLSX from 'xlsx'
 import Papa from 'papaparse'
 import mammoth from 'mammoth'
 import JSZip from 'jszip'
+import iconv from 'iconv-lite'
 import type { ArchiveItem, ParsedFile } from '../shared/types'
 
 const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif']
-const DOC_TABLE_EXTS = ['xlsx', 'xls', 'csv', 'pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt']
+const DOC_TABLE_EXTS = ['xlsx', 'xls', 'csv', 'pdf', 'docx', 'pptx', 'md', 'markdown', 'txt']
 const MAX_PARSE_BYTES = 40 * 1024 * 1024
 const MAX_ARCHIVE_BYTES = 120 * 1024 * 1024
 const MAX_ARCHIVE_ENTRIES = 120
@@ -94,10 +95,10 @@ function parseXlsx(buf: Buffer): string {
 
 function decodeTextBuffer(buf: Buffer): string {
   if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
-    return new TextDecoder('utf-16le').decode(buf.subarray(2))
+    return iconv.decode(buf.subarray(2), 'utf16-le')
   }
   if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
-    return new TextDecoder('utf-16be').decode(buf.subarray(2))
+    return iconv.decode(buf.subarray(2), 'utf16-be')
   }
   const sampleLength = Math.min(buf.length - (buf.length % 2), 8192)
   let evenZeros = 0
@@ -107,10 +108,10 @@ function decodeTextBuffer(buf: Buffer): string {
     if (buf[index + 1] === 0) oddZeros++
   }
   if (oddZeros >= 4 && oddZeros > evenZeros * 3) {
-    return new TextDecoder('utf-16le').decode(buf)
+    return iconv.decode(buf, 'utf16-le')
   }
   if (evenZeros >= 4 && evenZeros > oddZeros * 3) {
-    return new TextDecoder('utf-16be').decode(buf)
+    return iconv.decode(buf, 'utf16-be')
   }
   let utf8: string
   try {
@@ -118,14 +119,18 @@ function decodeTextBuffer(buf: Buffer): string {
   } catch {
     utf8 = ''
   }
-  const gb18030 = new TextDecoder('gb18030').decode(buf)
   const hasUtf8Bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf
   const cjkCount = (value: string): number => (value.match(/[\u3400-\u9fff]/g) || []).length
   const suspiciousCount = (value: string): number => (value.match(/[\u0370-\u052f]/g) || []).length
-  const text =
-    !utf8 || (!hasUtf8Bom && cjkCount(gb18030) > cjkCount(utf8) && suspiciousCount(utf8) > 0)
-      ? gb18030
-      : utf8
+  // UTF-8 是 Markdown 的默认编码。只有 UTF-8 严格解码失败，或出现典型的中文编码误判特征时，
+  // 才加载 GB18030 结果；不再依赖不同 Electron/Node 版本对 TextDecoder('gb18030') 的支持情况。
+  let text = utf8
+  if (!utf8) {
+    text = iconv.decode(buf, 'gb18030')
+  } else if (!hasUtf8Bom && suspiciousCount(utf8) > 0) {
+    const gb18030 = iconv.decode(buf, 'gb18030')
+    if (cjkCount(gb18030) > cjkCount(utf8)) text = gb18030
+  }
   return text.replace(/^\uFEFF/, '')
 }
 

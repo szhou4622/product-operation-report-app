@@ -128,7 +128,10 @@ export default function PhaseTracker(): JSX.Element {
         </div>
 
         <div className="source-health">
-          <div className="source-health-title">资料状态</div>
+          <div className="source-health-title">
+            <span>资料状态</span>
+            <small>最多上传 50 份资料</small>
+          </div>
           <div className="health-row">
             <span>已上传</span>
             <b>{sources.length} 份</b>

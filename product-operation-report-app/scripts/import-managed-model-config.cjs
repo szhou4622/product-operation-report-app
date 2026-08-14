@@ -60,7 +60,10 @@ app.whenReady().then(() => {
       supportsVision: profile.supportsVision !== false,
       temperature: Number.isFinite(storedTemperature) && storedTemperature >= 0 && storedTemperature <= 2
         ? storedTemperature
-        : 0.3
+        : 0.3,
+      fallbackModels: model.toLowerCase() === 'gpt-5.5'
+        ? ['claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+        : []
     }
     writeFileSync(tempPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 })
     if (existsSync(outputPath)) rmSync(outputPath, { force: true })

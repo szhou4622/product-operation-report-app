@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useStore } from '../store'
-import { validateReport } from '../validate'
+import { validateReport, validateReportStructure } from '../validate'
 
 export default function ReportPreview(): JSX.Element {
   const reportMarkdown = useStore((s) => s.reportMarkdown)
@@ -18,16 +18,17 @@ export default function ReportPreview(): JSX.Element {
 
   const reportGenerating = phase === 'cleaning' || phase === 'analyzing'
   const exporting = exportStatus === '导出中…'
+  const warnings = useMemo(
+    () => (reportGenerating ? [] : validateReport(reportMarkdown)),
+    [reportGenerating, reportMarkdown]
+  )
   const canExport =
     Boolean(reportMarkdown) &&
     !reportGenerating &&
     !exporting &&
     artifacts[9] === reportMarkdown &&
-    (phase === 'done' || reportStale)
-  const warnings = useMemo(
-    () => (reportGenerating ? [] : validateReport(reportMarkdown)),
-    [reportGenerating, reportMarkdown]
-  )
+    (phase === 'done' || reportStale) &&
+    validateReportStructure(reportMarkdown).length === 0
   const headings = useMemo(
     () =>
       reportMarkdown

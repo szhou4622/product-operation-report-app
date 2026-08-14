@@ -353,11 +353,11 @@ export default function SettingsModal(): JSX.Element | null {
             <div className="settings-guide">
               <div className="settings-guide-main">
                 <span className="settings-guide-kicker">无需填写 API Key</span>
-                <b>{managed.configured ? '内置 AI 服务已就绪' : '内置 AI 服务需要维护'}</b>
+                <b>{managed.configured ? 'AI 服务已就绪' : 'AI 服务需要维护'}</b>
                 <span>
                   {managed.configured
-                    ? '模型和授权已由软件配置完成，直接上传资料并开始生成报告即可。'
-                    : managed.error || '内置模型服务暂不可用，请联系软件管理员。'}
+                    ? '服务和授权已由软件配置完成，直接上传资料并开始生成报告即可。'
+                    : managed.error || 'AI 服务暂不可用，请联系软件管理员。'}
                 </span>
               </div>
             </div>
@@ -365,7 +365,7 @@ export default function SettingsModal(): JSX.Element | null {
               {managed.configured ? '✓ 服务配置正常' : '✗ 服务配置异常'}
               {'\n'}
               {managed.configured
-                ? `${managed.name} · ${managed.model}${managed.supportsVision ? ' · 支持图片识别' : ''}`
+                ? `支持文字资料分析${managed.supportsVision ? '和图片识别' : ''}`
                 : '用户无需自行修改设置，请把此提示反馈给软件管理员。'}
             </div>
             <section className="service-device-transfer" aria-labelledby="service-device-title">

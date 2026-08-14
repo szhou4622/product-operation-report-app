@@ -11,8 +11,15 @@ const SOP_GUIDE_URL =
   'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
 
 function friendlyUiError(value: unknown, fallback: string): string {
-  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
+  const raw = (value instanceof Error ? value.message : String(value || ''))
+    .replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
   if (!raw) return fallback
+  if (/更新配置签名无效|update.*signature|signature.*invalid/i.test(raw)) {
+    return '更新信息暂时无法验证，已为你停止本次更新。当前版本可以继续正常使用，请稍后再试。'
+  }
   if (/ENOSPC|no space|磁盘.*满/i.test(raw)) return '磁盘空间不足，请清理空间后重试。'
   if (/EACCES|EPERM|permission|access denied|权限/i.test(raw)) {
     return '没有写入权限，请关闭占用文件的软件，或换一个可保存的位置后重试。'
@@ -405,17 +412,26 @@ export default function App(): JSX.Element {
     }
   }
 
-  const handleDownloadUpdate = async (): Promise<void> => {
+  const handleApplyUpdate = async (): Promise<void> => {
     if (updateBusy !== 'idle') return
-    setUpdateBusy('download')
     setUpdateError('')
-    setUpdateProgress({ receivedBytes: 0, percent: 0 })
     try {
-      const result = await window.api.downloadUpdate()
-      if (result.info) setUpdateInfo(result.info)
-      if (!result.ok) setUpdateError(result.message)
+      if (!updateInfo?.downloaded) {
+        setUpdateBusy('download')
+        setUpdateProgress({ receivedBytes: 0, percent: 0 })
+        const download = await window.api.downloadUpdate()
+        if (download.info) setUpdateInfo(download.info)
+        if (!download.ok) {
+          setUpdateError(download.message)
+          return
+        }
+      }
+      setUpdateBusy('install')
+      const install = await window.api.installUpdate()
+      if (install.info) setUpdateInfo(install.info)
+      if (!install.ok) setUpdateError(install.message)
     } catch (error) {
-      setUpdateError(friendlyUiError(error, '更新下载失败，旧版本仍可继续使用。'))
+      setUpdateError(friendlyUiError(error, '更新失败，当前版本仍可继续使用，请稍后重试。'))
     } finally {
       setUpdateBusy('idle')
     }
@@ -437,20 +453,6 @@ export default function App(): JSX.Element {
     } catch (error) {
       setUpdateCheckNotice(friendlyUiError(error, '暂时无法检查更新，请稍后重试。'))
     } finally {
-      setUpdateBusy('idle')
-    }
-  }
-
-  const handleInstallUpdate = async (): Promise<void> => {
-    if (updateBusy !== 'idle') return
-    setUpdateBusy('install')
-    setUpdateError('')
-    try {
-      const result = await window.api.installUpdate()
-      if (result.info) setUpdateInfo(result.info)
-      if (!result.ok) setUpdateError(result.message)
-    } catch (error) {
-      setUpdateError(friendlyUiError(error, '无法启动安装程序，请重新下载。'))
       setUpdateBusy('idle')
     }
   }
@@ -512,7 +514,7 @@ export default function App(): JSX.Element {
           <div className="activation-logo">
             <ProductLogo />
           </div>
-          <div className="activation-kicker">产品经营报告</div>
+          <div className="activation-kicker">产品与内容经营报告系统</div>
           <h1>首次使用需要激活</h1>
           <p>请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。</p>
           <label className="activation-field">
@@ -576,12 +578,12 @@ export default function App(): JSX.Element {
     <div className="app app-workbench">
       <div className="topbar">
         <div className="brand">
-          <span className="brand-mark" aria-label="产品经营报告 Logo">
+          <span className="brand-mark" aria-label="产品与内容经营报告系统 Logo">
             <ProductLogo />
           </span>
           <span className="brand-copy">
-            <span className="brand-main">产品经营报告</span>
-            <span className="sub">专业的产品经营分析与报告系统</span>
+            <span className="brand-main">产品与内容经营报告系统</span>
+            <span className="sub">专业的产品经营与内容分析报告系统</span>
           </span>
         </div>
         <a
@@ -614,15 +616,6 @@ export default function App(): JSX.Element {
           </span>
         </a>
         <div className="right">
-          <span className="model-pill">
-            {managed
-              ? managed.configured
-                ? `内置模型：${managed.model}`
-                : '内置模型需要维护'
-              : active
-                ? `模型：${active.name}（${active.model}）`
-                : '未配置模型'}
-          </span>
           <button
             className="btn new-analysis-button"
             type="button"
@@ -784,7 +777,7 @@ export default function App(): JSX.Element {
             <div className="update-heading">
               <div>
                 <div className="privacy-kicker">{updateInfo.force ? '必须更新' : '发现新版本'}</div>
-                <h2 id="update-title">产品经营报告 {updateInfo.latestVersion}</h2>
+                <h2 id="update-title">产品与内容经营报告系统 {updateInfo.latestVersion}</h2>
               </div>
               <span className={`update-badge${updateInfo.force ? ' force' : ''}`}>
                 {updateInfo.force ? '更新后才能继续' : '可稍后更新'}
@@ -821,17 +814,17 @@ export default function App(): JSX.Element {
                   稍后更新
                 </button>
               )}
-              {updateInfo.downloaded ? (
-                <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleInstallUpdate()}>
-                  {updateBusy === 'install' ? '正在启动安装…' : '立即安装'}
-                </button>
-              ) : (
-                <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleDownloadUpdate()}>
-                  {updateBusy === 'download' ? '正在下载…' : updateError ? '重新下载' : '立即下载'}
-                </button>
-              )}
+              <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleApplyUpdate()}>
+                {updateBusy === 'download'
+                  ? '正在下载…'
+                  : updateBusy === 'install'
+                    ? '正在启动安装…'
+                    : updateError
+                      ? '重新更新'
+                      : '立即更新'}
+              </button>
             </div>
-            <div className="update-safety-note">下载完成后会自动校验 SHA256，校验通过才会启动安装。</div>
+            <div className="update-safety-note">点击后会自动下载并校验安装包，校验通过才会启动安装。</div>
           </div>
         </div>
       )}
@@ -840,27 +833,27 @@ export default function App(): JSX.Element {
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">
           <div className="privacy-card">
             <div className="privacy-kicker">首次使用确认</div>
-            <h2 id="privacy-title">上传资料会发送到{managed ? '软件内置的' : '当前配置的'} AI 模型服务</h2>
+            <h2 id="privacy-title">上传资料会发送到 AI 分析服务</h2>
             <p>
-              本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给当前模型接口处理。
-              请确认你有权使用这些资料，并已了解相关商业数据会进入{managed ? '软件内置的' : '你配置的'} AI 服务。
+              本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给 AI 分析服务处理。
+              请确认你有权使用这些资料，并已了解相关商业数据会进入 AI 分析服务。
             </p>
             <div className="privacy-endpoint">
-              <span>当前模型服务</span>
+              <span>当前分析服务</span>
               <b>
                 {managed
                   ? managed.configured
-                    ? `${managed.name} · ${managed.model}`
-                    : '内置服务配置异常，请联系软件管理员'
+                    ? '软件分析服务已就绪'
+                    : '分析服务配置异常，请联系软件管理员'
                   : active
-                    ? `${active.name} · ${active.baseURL}`
-                    : '尚未配置，稍后将在设置中选择模型服务'}
+                    ? '自定义分析服务已就绪'
+                    : '尚未配置，请先完成分析服务设置'}
               </b>
             </div>
             <ul className="privacy-list">
-              <li>AI 分析需要联网调用{managed ? '软件内置的模型服务' : '你配置的模型接口'}。</li>
+              <li>AI 分析需要联网调用分析服务。</li>
               <li>如果资料包含客户隐私、合同、价格政策等敏感信息，请先确认是否允许上传分析。</li>
-              <li>{managed ? '模型授权由软件统一管理，你不需要填写或保存 API Key。' : '你可以在设置中更换模型服务商或 API Key。'}</li>
+              <li>{managed ? '服务授权由软件统一管理，你不需要填写或保存 API Key。' : '你可以在设置中更换分析服务或 API Key。'}</li>
             </ul>
             {privacyError && <div className="privacy-error">{privacyError}</div>}
             <div className="privacy-actions">
@@ -872,7 +865,7 @@ export default function App(): JSX.Element {
               <button
                 className="btn primary"
                 disabled={privacySaving || !modelConfigured}
-                title={modelConfigured ? '' : managed ? '内置模型服务暂不可用' : '请先完成模型设置'}
+                title={modelConfigured ? '' : managed ? 'AI 服务暂不可用' : '请先完成分析服务设置'}
                 onClick={() => void acceptPrivacy()}
               >
                 {privacySaving ? '保存中…' : modelConfigured ? '我已知晓，继续使用' : managed ? '服务暂不可用' : '请先设置模型'}

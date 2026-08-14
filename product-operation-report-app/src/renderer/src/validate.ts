@@ -112,3 +112,18 @@ export function validateReport(md: string): string[] {
 
   return warnings
 }
+
+/** 只返回会导致导出丢章、乱序或缺核心表格的硬错误；证据不足提醒仍允许用户导出。 */
+export function validateReportStructure(md: string): string[] {
+  const hardPrefixes = [
+    '报告标题前出现了多余文本',
+    '报告缺少标准章节',
+    '报告章节顺序疑似不符合标准模板',
+    '报告出现模板外二级章节',
+    '报告缺少「生成日期',
+    '第 9 章缺少',
+    '报告末尾缺少',
+    '报告缺少目标格式要求的表格列'
+  ]
+  return validateReport(md).filter((warning) => hardPrefixes.some((prefix) => warning.startsWith(prefix)))
+}
