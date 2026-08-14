@@ -4308,6 +4308,12 @@ body.resizing .pane-resizer {
   gap: 4px;
 }
 
+.service-device-heading > .service-device-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .service-device-heading span {
   color: #2563eb;
   font-size: 11px;
@@ -4413,6 +4419,14 @@ body.resizing .pane-resizer {
 
   .service-device-heading {
     grid-template-columns: 1fr;
+  }
+
+  .service-device-heading > .service-device-actions {
+    width: 100%;
+  }
+
+  .service-device-heading > .service-device-actions .btn {
+    flex: 1;
   }
 
   .service-license-code {

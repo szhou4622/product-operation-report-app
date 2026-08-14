@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, dialog, ipcMain, Menu, session } from 'electron'
+import { app, shell, BrowserWindow, clipboard, dialog, ipcMain, Menu, session } from 'electron'
 import { randomUUID } from 'crypto'
 import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
@@ -23,6 +23,7 @@ import { runModelFallbackSequence } from './modelFallback'
 import {
   cancelParsingForOwner,
   disposeParseService,
+  hasParsingForOwner,
   parseArchiveInUtility,
   parseFileInUtility
 } from './parseService'
@@ -41,6 +42,7 @@ import {
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
+  revealCurrentActivationCode,
   redeemPointsWithCode
 } from './activation'
 import { readBundledSopRules } from './sopRules'
@@ -81,11 +83,7 @@ import { appendCostOptimizationEvent } from './costOptimization'
 import { ChatRequestRegistry, validateChatStartPayload } from './chatAdmission'
 import {
   authorizeProxyProfiles,
-  canStartProxyReport,
   clearAiProxySession,
-  getProxyReportCharge,
-  getProxyWallet,
-  redeemProxyPoints,
   testProxyHealth
 } from './aiProxy'
 
@@ -97,10 +95,16 @@ if (developmentUserDataDir) app.setPath('userData', resolve(developmentUserDataD
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
+let hardExitTimer: ReturnType<typeof setTimeout> | null = null
 const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) app.quit()
+
+function armHardExitWatchdog(): void {
+  if (hardExitTimer) return
+  hardExitTimer = setTimeout(() => app.exit(0), 4_000)
+}
 
 function resolveWindowIcon(): string | undefined {
   const candidates = [
@@ -150,6 +154,31 @@ function ensureActivated(): void {
   if (!getActivationStatus().activated) throw new Error('软件未激活，请先输入激活码。')
 }
 
+function authorizationWallet(status = getActivationStatus()) {
+  const localShape = getPointsWalletStatus()
+  return {
+    ...localShape,
+    balancePoints: status.creditsRemaining ?? 0,
+    unlimited: status.unlimited,
+    totalTopupPoints: 0,
+    totalCostPoints: 0,
+    totalChargedPoints: 0,
+    unbilledUsageCount: 0,
+    ledger: []
+  }
+}
+
+function broadcastAuthorization(status = getActivationStatus()): void {
+  const wallet = getManagedModelState().mode === 'proxy'
+    ? authorizationWallet(status)
+    : applyActivationPoints(status).wallet
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue
+    window.webContents.send('activation:changed', status)
+    window.webContents.send('points:changed', wallet)
+  }
+}
+
 function createWindow(): void {
   if (app.isPackaged) {
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -185,70 +214,44 @@ function createWindow(): void {
   const ownerId = window.webContents.id
 
   let forceClose = false
-  let closeRequestId = ''
-  let closeTimer: ReturnType<typeof setTimeout> | null = null
-  let closeGuardReady = false
+  let closePromptOpen = false
   const finishClose = (): void => {
+    cancelParsingForOwner(ownerId, '软件正在关闭，文件解析已停止。')
+    chatRequests.abortOwner(ownerId)
+    if (process.platform !== 'darwin') armHardExitWatchdog()
     forceClose = true
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = null
     window.close()
   }
-  const scheduleCloseTimeout = (delay = 5000): void => {
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = setTimeout(() => {
-      closeTimer = null
-      if (!closeRequestId || window.isDestroyed()) return
-      void dialog
-        .showMessageBox(window, {
-          type: 'warning',
-          title: '保存时间较长',
-          message: '软件正在保存当前分析，暂时还不能安全关闭。',
-          detail: '建议继续等待，避免丢失刚才的操作。',
-          buttons: ['继续等待', '仍然退出'],
-          defaultId: 0,
-          cancelId: 0
-        })
-        .then((result) => {
-          if (window.isDestroyed() || !closeRequestId) return
-          if (result.response === 1) finishClose()
-          else scheduleCloseTimeout(10000)
-        })
-    }, delay)
-  }
-  const onCloseReady = (
-    event: Electron.IpcMainEvent,
-    payload: { id?: string; ok?: boolean; error?: string }
-  ): void => {
-    if (event.sender !== window.webContents || !closeRequestId || payload?.id !== closeRequestId) return
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = null
-    closeRequestId = ''
-    if (payload.ok) {
+
+  window.on('close', (event) => {
+    if (forceClose || window.webContents.isDestroyed()) return
+    event.preventDefault()
+    if (closePromptOpen) return
+    const activePhase = latestProjectSnapshot?.phase === 'cleaning' || latestProjectSnapshot?.phase === 'analyzing'
+    const hasActiveWork = activePhase || hasParsingForOwner(ownerId) || chatRequests.hasOwner(ownerId)
+    if (!hasActiveWork) {
       finishClose()
       return
     }
-    void dialog.showMessageBox(window, {
-      type: 'error',
-      title: '暂时无法关闭',
-      message: '当前分析还没有保存成功。',
-      detail: payload.error || '请检查磁盘空间或文件权限，然后再关闭软件。',
-      buttons: ['我知道了']
-    })
-  }
-  ipcMain.on('app:close-ready', onCloseReady)
-  const onCloseGuardState = (event: Electron.IpcMainEvent, ready: boolean): void => {
-    if (event.sender === window.webContents) closeGuardReady = Boolean(ready)
-  }
-  ipcMain.on('app:close-guard-state', onCloseGuardState)
-
-  window.on('close', (event) => {
-    if (forceClose || !closeGuardReady || window.webContents.isDestroyed()) return
-    event.preventDefault()
-    if (closeRequestId) return
-    closeRequestId = randomUUID()
-    window.webContents.send('app:before-close', { id: closeRequestId })
-    scheduleCloseTimeout()
+    closePromptOpen = true
+    void dialog
+      .showMessageBox(window, {
+        type: 'warning',
+        title: '当前任务还没有完成',
+        message: '资料仍在上传、解析或分析，确定要退出软件吗？',
+        detail: '退出会停止当前任务。已经自动保存的资料和历史报告不会删除，下次打开可以继续处理。',
+        buttons: ['停止任务并退出', '继续使用'],
+        defaultId: 1,
+        cancelId: 1
+      })
+      .then((result) => {
+        closePromptOpen = false
+        if (result.response === 0 && !window.isDestroyed()) finishClose()
+      })
+      .catch(() => {
+        closePromptOpen = false
+        if (!window.isDestroyed()) finishClose()
+      })
   })
   window.on('session-end', () => {
     if (latestProjectSnapshot) {
@@ -262,18 +265,14 @@ function createWindow(): void {
   })
 
   window.webContents.on('render-process-gone', () => {
-    closeGuardReady = false
     cancelParsingForOwner(ownerId, '界面已重新加载，旧文件解析已停止。')
     chatRequests.abortOwner(ownerId)
   })
 
   window.on('ready-to-show', () => window.show())
   window.on('closed', () => {
-    if (closeTimer) clearTimeout(closeTimer)
     cancelParsingForOwner(ownerId, '窗口已关闭，旧文件解析已停止。')
     chatRequests.abortOwner(ownerId)
-    ipcMain.removeListener('app:close-ready', onCloseReady)
-    ipcMain.removeListener('app:close-guard-state', onCloseGuardState)
     if (mainWindow === window) mainWindow = null
   })
 
@@ -383,43 +382,37 @@ ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:refresh', async () => {
   const status = await getActivationStatusWithServerCheck()
-  const wallet = status.activated && getManagedModelState().mode === 'proxy'
-    ? await getProxyWallet().catch(() => null)
-    : applyActivationPoints(status).wallet
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) {
-      window.webContents.send('activation:changed', status)
-      if (wallet) window.webContents.send('points:changed', wallet)
-    }
-  }
+  broadcastAuthorization(status)
   return status
 })
 ipcMain.handle('activation:activate', async (_e, code: string) => {
   const result = await activateWithCode(code)
   if (result.ok) {
     clearAiProxySession()
-    const wallet = getManagedModelState().mode === 'proxy'
-      ? await getProxyWallet().catch(() => null)
-      : applyActivationPoints(result.status).wallet
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) {
-        window.webContents.send('activation:changed', result.status)
-        if (wallet) window.webContents.send('points:changed', wallet)
-      }
-    }
+    broadcastAuthorization(result.status)
   }
   return result
 })
+ipcMain.handle('activation:code:reveal', () => revealCurrentActivationCode())
+ipcMain.handle('activation:code:copy', () => {
+  const result = revealCurrentActivationCode()
+  if (!result.ok || !result.activationCode) return { ok: false, message: result.message }
+  clipboard.writeText(result.activationCode)
+  return { ok: true, message: '激活码已复制到剪贴板。', maskedCode: result.maskedCode }
+})
 ipcMain.handle('activation:deactivate', async () => {
-  const before = getPointsWalletStatus()
+  const proxyMode = getManagedModelState().mode === 'proxy'
+  const before = proxyMode ? authorizationWallet() : getPointsWalletStatus()
   const result = await deactivateCurrentDevice()
-  let wallet = before
+  let wallet = proxyMode ? authorizationWallet(result.status) : before
   if (result.ok && result.unbindId) {
     clearAiProxySession()
-    try {
-      wallet = clearLocalPointsAfterUnbind(result.unbindId)
-    } catch {
-      result.message += ' 本机积分显示未能清理，但云端授权已解除；请不要在旧电脑继续使用，并联系管理员。'
+    if (!proxyMode) {
+      try {
+        wallet = clearLocalPointsAfterUnbind(result.unbindId)
+      } catch {
+        result.message += ' 本机积分显示未能清理，但云端授权已解除；请不要在旧电脑继续使用，并联系管理员。'
+      }
     }
   }
   for (const window of BrowserWindow.getAllWindows()) {
@@ -440,18 +433,21 @@ ipcMain.handle('license:consumeAnalysisCredit', (_e, operationId: string) => {
 })
 ipcMain.handle('points:get', async () => {
   ensureActivated()
-  if (getManagedModelState().mode === 'proxy') return getProxyWallet()
+  if (getManagedModelState().mode === 'proxy') return authorizationWallet()
   applyActivationPoints(getActivationStatus())
   return reconcileTokenUsage(await readTokenUsageRecords())
 })
 ipcMain.handle('points:canStartReport', () => (
   getManagedModelState().mode === 'proxy'
-    ? canStartProxyReport()
+    ? (() => {
+        const access = canStartLicensedAnalysis()
+        return { ok: access.ok, message: access.message, wallet: authorizationWallet(access.status) }
+      })()
     : canStartPointsReport(getActivationStatus())
 ))
 ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => ({
   chargedPoints: getManagedModelState().mode === 'proxy'
-    ? await getProxyReportCharge(reportSessionId)
+    ? 0
     : getReportChargedPoints(reportSessionId)
 }))
 ipcMain.handle('points:grantDevelopment', () => {
@@ -464,11 +460,16 @@ ipcMain.handle('points:grantDevelopment', () => {
 })
 ipcMain.handle('points:redeem', async (_e, code: string) => {
   if (getManagedModelState().mode === 'proxy') {
-    const result = await redeemProxyPoints(code)
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.isDestroyed()) window.webContents.send('points:changed', result.wallet)
+    const merged = await redeemPointsWithCode(code)
+    const wallet = authorizationWallet(merged.status)
+    if (merged.ok) broadcastAuthorization(merged.status)
+    return {
+      ok: merged.ok,
+      message: merged.message,
+      activation: merged.status,
+      addedPoints: merged.addedPoints,
+      wallet
     }
-    return result
   }
   const before = getPointsWalletStatus()
   const currentActivation = getActivationStatus()
@@ -687,7 +688,7 @@ ipcMain.on(
     try {
       if (managedState.mode === 'proxy') {
         try {
-          const access = await canStartProxyReport()
+          const access = canStartLicensedAnalysis()
           if (!access.ok) {
             event.sender.send(channel, { type: 'error', message: access.message, usage: emptyUsage() })
             return
@@ -764,6 +765,7 @@ ipcMain.on(
                 ? {
                     requestHeaders: {
                       'x-request-id': attemptRequestId,
+                      'x-billing-request-id': context.billingRequestId,
                       'x-report-session-id': context.reportSessionId,
                       'x-task-key': context.taskKey,
                       'x-task-type': context.taskType,
@@ -830,9 +832,16 @@ ipcMain.on(
         await appendTokenUsageRecord(finalRecord).catch((error) => {
           console.error('Unable to append token usage final record:', error)
         })
-        const wallet = managedState.mode === 'proxy'
-          ? await getProxyWallet().catch(() => undefined)
+        let wallet = managedState.mode === 'proxy'
+          ? undefined
           : settleTokenUsage(finalRecord)
+        if (managedState.mode === 'proxy' && terminal.type === 'done') {
+          const refreshed = await getActivationStatusWithServerCheck().catch(() => getActivationStatus())
+          wallet = authorizationWallet(refreshed)
+          for (const window of BrowserWindow.getAllWindows()) {
+            if (!window.isDestroyed()) window.webContents.send('activation:changed', refreshed)
+          }
+        }
         for (const window of BrowserWindow.getAllWindows()) {
           if (!window.isDestroyed() && wallet) window.webContents.send('points:changed', wallet)
         }
@@ -889,6 +898,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('will-quit', () => {
+app.on('before-quit', () => {
+  armHardExitWatchdog()
+  chatRequests.abortAll()
   disposeParseService()
 })

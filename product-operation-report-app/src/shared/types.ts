@@ -39,7 +39,9 @@ export interface ActivationStatus {
   activatedAt?: string
   licenseId?: string
   /** 当前用于软件授权和设备绑定的主激活码；不包含后来输入的积分充值码。 */
-  activationCode?: string
+  /** The full code is never included in normal renderer state. */
+  activationCodeAvailable: boolean
+  maskedActivationCode?: string
   codeCount: number
   appName: string
   source?: 'server' | 'legacy'
@@ -51,7 +53,17 @@ export interface ActivationStatus {
   offlineUntil?: string
   bindingStatus?: 'active' | 'unbound'
   transferCount?: number
+  requiresRevalidation: boolean
+  lastServerSyncAt?: string
   message?: string
+}
+
+export interface ActivationCodeAccessResult {
+  ok: boolean
+  message: string
+  /** Present only for the explicit reveal operation. Copy is performed in the main process. */
+  activationCode?: string
+  maskedCode?: string
 }
 
 export interface ActivationResult {
@@ -100,6 +112,7 @@ export interface PointsLedgerEntry {
 
 export interface PointsWalletStatus {
   balancePoints: number
+  unlimited?: boolean
   totalTopupPoints: number
   totalCostPoints: number
   totalChargedPoints: number
@@ -165,6 +178,8 @@ export interface ModelTaskContext {
   reportSessionId: string
   taskType: ModelTaskType
   taskKey: string
+  /** Stable across automatic retries and fallback models for one logical billable task. */
+  billingRequestId: string
   attempt: number
   isVision: boolean
   sourceCount: number
@@ -412,6 +427,8 @@ export interface ProjectCleanDetailSnapshot {
 
 export interface SavedProject {
   revision: number
+  /** Stable billing namespace retained across crash recovery and project restore. */
+  analysisSessionId?: string
   sources: ProjectSourceSnapshot[]
   messages: ProjectMessageSnapshot[]
   cleanedData: string

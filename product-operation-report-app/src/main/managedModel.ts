@@ -168,7 +168,8 @@ function explicitConfigPath(): string | null {
  * 该函数永远不会把 API Key 写入日志或错误信息。
  */
 export function getManagedModelState(): ManagedModelState {
-  if (app.isPackaged) {
+  const allowDevelopmentOverrides = !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+  if (app.isPackaged || !allowDevelopmentOverrides) {
     const state = parseConfig({
       version: 1,
       enabled: true,
@@ -183,10 +184,9 @@ export function getManagedModelState(): ManagedModelState {
     return { ...state, mode: 'proxy' }
   }
 
-  const allowDevelopmentOverrides = !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
-  if (allowDevelopmentOverrides && process.env.PRODUCT_REPORT_DISABLE_MANAGED_MODEL === '1') return disabledState()
+  if (process.env.PRODUCT_REPORT_DISABLE_MANAGED_MODEL === '1') return disabledState()
 
-  const inline = allowDevelopmentOverrides ? process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON?.trim() : ''
+  const inline = process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON?.trim()
   if (inline) {
     try {
       return parseConfig(JSON.parse(inline))
@@ -195,7 +195,7 @@ export function getManagedModelState(): ManagedModelState {
     }
   }
 
-  const explicit = allowDevelopmentOverrides ? explicitConfigPath() : null
+  const explicit = explicitConfigPath()
   if (explicit) return existsSync(explicit) ? readConfigFile(explicit) : invalidState()
 
   const candidates = [join(app.getAppPath(), 'managed-model.local.json')]

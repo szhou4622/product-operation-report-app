@@ -4,6 +4,7 @@ import type {
   ArchiveItem,
   ActivationResult,
   ActivationDeactivationResult,
+  ActivationCodeAccessResult,
   ActivationStatus,
   ChatMessage,
   ChatStreamEvent,
@@ -58,6 +59,12 @@ const api = {
 
   activate: (code: string): Promise<ActivationResult> =>
     ipcRenderer.invoke('activation:activate', code),
+
+  revealActivationCode: (): Promise<ActivationCodeAccessResult> =>
+    ipcRenderer.invoke('activation:code:reveal'),
+
+  copyActivationCode: (): Promise<ActivationCodeAccessResult> =>
+    ipcRenderer.invoke('activation:code:copy'),
 
   deactivateCurrentDevice: (): Promise<ActivationDeactivationResult> =>
     ipcRenderer.invoke('activation:deactivate'),
@@ -116,27 +123,6 @@ const api = {
     ipcRenderer.invoke('project:archive', project),
 
   loadPreviousProject: (): Promise<SavedProject | null> => ipcRenderer.invoke('project:loadPrevious'),
-
-  onBeforeClose: (handler: () => void | Promise<void>): (() => void) => {
-    const listener = async (_event: unknown, payload: { id: string }): Promise<void> => {
-      try {
-        await handler()
-        ipcRenderer.send('app:close-ready', { id: payload.id, ok: true })
-      } catch (error) {
-        ipcRenderer.send('app:close-ready', {
-          id: payload.id,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        })
-      }
-    }
-    ipcRenderer.on('app:before-close', listener)
-    ipcRenderer.send('app:close-guard-state', true)
-    return () => {
-      ipcRenderer.removeListener('app:before-close', listener)
-      ipcRenderer.send('app:close-guard-state', false)
-    }
-  },
 
   testModel: (opts: TestModelOptions): Promise<TestModelResult> =>
     ipcRenderer.invoke('model:test', opts),

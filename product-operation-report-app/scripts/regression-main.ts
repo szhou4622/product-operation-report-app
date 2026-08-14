@@ -13,11 +13,14 @@ import { chatStream, listModels, normalizeProviderUsage, testModel } from '../sr
 import { loadLastProject, saveLastProject } from '../src/main/project'
 import {
   activateWithCode,
+  activationInternals,
+  canStartLicensedAnalysis,
   consumeAnalysisCredit,
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
   LEGACY_ACTIVATION_POINTS,
+  revealCurrentActivationCode,
   redeemPointsWithCode
 } from '../src/main/activation'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
@@ -29,7 +32,7 @@ import {
   saveRendererSettings,
   saveSettings
 } from '../src/main/settings'
-import { managedModelInternals } from '../src/main/managedModel'
+import { getManagedModelState, managedModelInternals } from '../src/main/managedModel'
 import { runModelFallbackSequence, shouldTryModelFallback } from '../src/main/modelFallback'
 import {
   ChatRequestRegistry,
@@ -152,6 +155,9 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   writeFileSync(join(tempUserData, 'last-project.json.bak'), JSON.stringify(snapshot(5, '更新备份')), 'utf8')
   assert.equal(loadLastProject()?.revision, 5)
   assert.equal(loadLastProject()?.reportMarkdown, '更新备份')
+  const billingSnapshot = { ...snapshot(6, 'billing-id'), analysisSessionId: 'stable-billing-session' }
+  await saveLastProject(billingSnapshot)
+  assert.equal(loadLastProject()?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
 }
 
 async function testActivationAndSettingsBackup(): Promise<void> {
@@ -199,11 +205,45 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   }
   writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(previouslyStoredUnlimited), 'utf8')
   const migratedUnlimited = getActivationStatus()
-  assert.equal(migratedUnlimited.licenseType, 'credits')
-  assert.equal(migratedUnlimited.unlimited, false)
-  assert.equal(migratedUnlimited.creditsRemaining, 2_000)
-  assert.equal(migratedUnlimited.licenseId, activationStatus.licenseId, 'legacy code keeps one stable top-up identity')
-  assert.equal(applyActivationPoints(migratedUnlimited).addedPoints, 0, 'upgrading an old unlimited record cannot grant twice')
+  assert.equal(migratedUnlimited.licenseType, 'unlimited')
+  assert.equal(migratedUnlimited.unlimited, true)
+  assert.equal(migratedUnlimited.requiresRevalidation, true)
+  assert.equal(migratedUnlimited.licenseId, 'old-server-unlimited-id')
+
+  const recoveryCode = 'PRO-LEGACY-RECOVERY-TEST'
+  const malformedLegacyRecord = {
+    version: 2,
+    appName: 'ProductOperationReport',
+    source: 'server',
+    codeHash: createHash('sha256')
+      .update(`product-operation-report:activation:v1:${recoveryCode.replace(/[^A-Z0-9]/g, '')}`, 'utf8')
+      .digest('hex'),
+    encryptedCode: encryptV032StoredCode(recoveryCode, deviceId),
+    deviceId,
+    activatedAt: new Date().toISOString(),
+    licenseId: 'malformed-v2-recovery-id',
+    licenseType: 'credits',
+    unlimited: false,
+    creditsRemaining: 100,
+    bindingStatus: 'active'
+  }
+  rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+  rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+  const malformedText = JSON.stringify(malformedLegacyRecord, null, 2).replace(
+    /\n}$/, ',\n  "serverMessage": "truncated legacy text\n}'
+  )
+  writeFileSync(join(tempUserData, 'activation.json'), malformedText, 'utf8')
+  writeFileSync(join(tempUserData, 'activation.json.bak'), malformedText, 'utf8')
+  const recoveredMalformedRecord = getActivationStatus()
+  assert.equal(recoveredMalformedRecord.activated, true, 'a v2 record with only a corrupt trailing serverMessage is recovered')
+  assert.equal(recoveredMalformedRecord.licenseId, 'malformed-v2-recovery-id')
+  assert.equal(revealCurrentActivationCode().activationCode, recoveryCode)
+  const recoveredJson = JSON.parse(readFileSync(join(tempUserData, 'activation.json'), 'utf8')) as Record<string, unknown>
+  assert.equal(recoveredJson.version, 3, 'recovered v2 records are rewritten in the non-secret v3 format')
+  assert.equal(recoveredJson.encryptedCode, undefined)
+
+  rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+  rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
   writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(activationRecord), 'utf8')
   const firstSettings = {
     profiles: [{ ...profile, name: '第一配置', apiKey: ' key-one ' }],
@@ -234,23 +274,122 @@ async function testActivationAndSettingsBackup(): Promise<void> {
 }
 
 async function testServerActivationAndCredits(): Promise<void> {
+  const liveActivationEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    action: 'activated',
+    grant_score: 100,
+    data: {
+      app_name: 'ProductOperationReport'
+    },
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'live-envelope-primary',
+      primary_code_id: 'live-envelope-primary',
+      license_type: 'standard',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456',
+      device_credential: 'live-device-credential',
+      device_session: 'live-device-session',
+      action: 'activated'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(liveActivationEnvelope.ok, true, 'the production activation envelope must be accepted')
+  assert.equal(liveActivationEnvelope.licenseId, 'live-envelope-primary')
+  assert.equal(liveActivationEnvelope.creditsRemaining, 100)
+
+  const liveMergedEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    action: 'balance_merged',
+    grant_score: 0,
+    primary_code_id: 'live-envelope-primary',
+    merged_code_id: 'live-envelope-recharge',
+    data: { app_name: 'ProductOperationReport' },
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'live-envelope-recharge',
+      primary_code_id: 'live-envelope-primary',
+      merged_code_id: 'live-envelope-recharge',
+      action: 'balance_merged',
+      grant_score: 100,
+      license_type: 'standard',
+      remaining_credits: 110,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(liveMergedEnvelope.ok, true, 'a completed production merge must not be reported as failed')
+  assert.equal(liveMergedEnvelope.grantScore, 0, 'the top-level transaction grant is authoritative')
+  assert.equal(liveMergedEnvelope.primaryLicenseId, 'live-envelope-primary')
+  assert.equal(liveMergedEnvelope.creditsRemaining, 110)
+
+  const conflictingEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    app_name: 'AnotherApp',
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'conflicting-envelope',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(conflictingEnvelope.ok, false, 'conflicting top-level and license identities must fail closed')
+  assert.equal(conflictingEnvelope.contractInvalid, true)
+
+  const requestEchoOnly = activationInternals.parseServerLicense({
+    ok: true,
+    data: {
+      app_name: 'ProductOperationReport',
+      code_id: 'request-echo-must-not-be-trusted',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(requestEchoOnly.ok, false, 'request echo data must never become an authorization result')
+  assert.equal(requestEchoOnly.contractInvalid, true)
+
   const originalFetch = globalThis.fetch
   const code = 'SERVER-POINTS-TEST-CODE'
   let requestBody: Record<string, unknown> = {}
   try {
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes('/device/status')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'license-test-points',
+          license_type: 'credits',
+          remaining_credits: 150,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getActivationStatus().deviceId.toUpperCase(),
+          message: '后台补发积分后余额已刷新'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
       return new Response(JSON.stringify({
         ok: true,
-        license: {
-          license_id: 'license-test-points',
-          license_type: 'credits',
-          credits: 100,
-          unlimited: false,
-          status: 'active',
-          device_credential: 'points-device-credential',
-          session_token: 'points-device-session'
-        },
+        app_name: 'ProductOperationReport',
+        code_id: 'license-test-points',
+        license_type: 'credits',
+        remaining_credits: 100,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'points-device-credential',
+        device_session: 'points-device-session',
         message: '激活成功'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
@@ -259,21 +398,23 @@ async function testServerActivationAndCredits(): Promise<void> {
     assert.equal(activated.status.licenseType, 'credits')
     assert.equal(activated.status.creditsRemaining, 100)
     assert.equal(requestBody.app_name, 'ProductOperationReport')
+    assert.equal(requestBody.license_protocol_version, 2)
     assert.equal(requestBody.activation_code, code)
     assert.equal(requestBody.machine_code, activated.status.deviceId)
-    assert.equal(typeof requestBody.software_version, 'string')
-    assert.equal(typeof requestBody.platform, 'string')
+    assert.equal(typeof requestBody.client_version, 'string')
+    assert.equal(requestBody.software_version, undefined)
+    assert.equal(requestBody.platform, undefined)
     assert.doesNotMatch(readFileSync(join(tempUserData, 'activation.json'), 'utf8'), new RegExp(code))
 
     const firstUse = consumeAnalysisCredit('analysis-session-one')
     assert.equal(firstUse.ok, true)
-    assert.equal(firstUse.status.creditsRemaining, 99)
+    assert.equal(firstUse.status.creditsRemaining, 100, 'the client never subtracts authoritative server credits')
     const repeatedUse = consumeAnalysisCredit('analysis-session-one')
-    assert.equal(repeatedUse.status.creditsRemaining, 99)
+    assert.equal(repeatedUse.status.creditsRemaining, 100)
 
     const refreshed = await getActivationStatusWithServerCheck()
     assert.equal(refreshed.activated, true)
-    assert.equal(refreshed.creditsRemaining, 99)
+    assert.equal(refreshed.creditsRemaining, 150)
     assert.equal(refreshed.offline, false)
 
     globalThis.fetch = (async () => { throw new TypeError('network unavailable') }) as typeof fetch
@@ -291,14 +432,16 @@ async function testServerActivationAndCredits(): Promise<void> {
 
     globalThis.fetch = (async () => new Response(JSON.stringify({
       ok: true,
-      success: true,
+      app_name: 'ProductOperationReport',
       code_id: 'license-test-unlimited',
       license_type: 'unlimited',
-      credits: 0,
+      remaining_credits: 0,
       unlimited: true,
-      status: 'active',
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: getActivationStatus().deviceId,
       device_credential: 'unlimited-device-credential',
-      session_token: 'unlimited-device-session',
+      device_session: 'unlimited-device-session',
       message: '激活成功'
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
     const unlimited = await activateWithCode('SERVER-UNLIMITED-TEST-CODE')
@@ -334,26 +477,27 @@ async function testExplicitZeroServerBalanceDoesNotReissueGrantedCredits(): Prom
   try {
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
     pointsWalletInternals.resetForTests()
     globalThis.fetch = (async () => {
       activationCalls += 1
       return new Response(JSON.stringify({
         ok: true,
-        success: true,
-        license: {
-          code_id: 'standard-code-with-points',
-          license_type: 'standard',
-          credits: 100,
-          remaining_credits: 0,
-          unlimited: false,
-          binding_status: 'active',
-          ...(activationCalls === 1
-            ? {
-                device_credential: 'standard-points-credential',
-                session_token: 'standard-points-session'
-              }
-            : {})
-        },
+        app_name: 'ProductOperationReport',
+        code_id: 'standard-code-with-points',
+        license_type: 'standard',
+        remaining_credits: 0,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        ...(activationCalls === 1
+          ? {
+              device_credential: 'standard-points-credential',
+              device_session: 'standard-points-session'
+            }
+          : {}),
         message: activationCalls === 1 ? '激活成功' : '该激活码已绑定本机，授权仍然有效。'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
@@ -402,11 +546,14 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
         statusHeaders = new Headers(init?.headers)
         return new Response(JSON.stringify({
           ok: true,
+          app_name: 'ProductOperationReport',
           binding_status: 'active',
-          license_id: 'license-device-rebind',
+          code_id: 'license-device-rebind',
           license_type: 'credits',
-          remaining_points: 2_000,
+          remaining_credits: 2_000,
+          unlimited: false,
           transfer_count: 0,
+          machine_code: getActivationStatus().deviceId,
           message: '设备授权有效'
         }), { status: 200, headers: { 'content-type': 'application/json' } })
       }
@@ -447,17 +594,17 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
       activationCalls += 1
       return new Response(JSON.stringify({
         ok: true,
-        license: {
-          license_id: 'license-device-rebind',
-          license_type: 'credits',
-          remaining_points: mode === 'rebind' ? 1_234.5 : 2_000,
-          unlimited: false,
-          status: 'active',
-          binding_status: 'active',
-          transfer_count: mode === 'rebind' ? 1 : 0,
-          device_credential: 'fake-device-credential',
-          session_token: 'fake-device-session'
-        },
+        app_name: 'ProductOperationReport',
+        code_id: 'license-device-rebind',
+        license_type: 'credits',
+        remaining_credits: mode === 'rebind' ? 1_234.5 : 2_000,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: mode === 'rebind' ? 1 : 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'fake-device-credential',
+        device_session: 'fake-device-session',
+        ...(mode === 'rebind' ? { action: 'rebound', grant_score: 0 } : {}),
         message: '激活成功'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
@@ -469,11 +616,12 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     const storedText = readFileSync(activationFile, 'utf8')
     assert.equal(storedText.includes('fake-device-credential'), false, 'device credential must be encrypted at rest')
     assert.equal(storedText.includes('fake-device-session'), false, 'device session must be encrypted at rest')
-    assert.equal(
-      typeof (JSON.parse(storedText) as Record<string, unknown>).encryptedCode,
-      'string',
-      'the primary activation code is retained only as an encrypted local value for status display'
-    )
+    const storedJson = JSON.parse(storedText) as Record<string, unknown>
+    assert.equal(storedJson.encryptedCode, undefined, 'activation.json must not contain the activation code ciphertext')
+    assert.equal(storedJson.encryptedDeviceCredential, undefined)
+    assert.equal(storedJson.encryptedDeviceSession, undefined)
+    const vaultBytes = readFileSync(join(tempUserData, 'license-vault.bin'))
+    assert.equal(vaultBytes.includes(Buffer.from(code)), false, 'the secure vault must not contain plaintext activation codes')
     assert.equal((await getActivationStatusWithServerCheck()).activated, true)
     assert.equal(statusMethod, 'GET')
     assert.equal(statusHeaders.get('authorization'), 'Bearer fake-device-session')
@@ -483,6 +631,8 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     oldClientRecord.encryptedCode = encryptV032StoredCode(code, activated.status.deviceId)
     delete oldClientRecord.encryptedDeviceCredential
     delete oldClientRecord.encryptedDeviceSession
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
     writeFileSync(activationFile, JSON.stringify(oldClientRecord), 'utf8')
     writeFileSync(activationBackup, JSON.stringify(oldClientRecord), 'utf8')
 
@@ -516,7 +666,9 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     assert.equal(unbound.unbindId, 'unbind-test-001')
     assert.equal(unbindBody.app_name, 'ProductOperationReport')
     assert.equal(unbindBody.machine_code, activated.status.deviceId)
-    assert.equal(unbindBody.device_credential, 'fake-device-credential')
+    assert.equal(unbindBody.device_credential, undefined, 'credentials belong in authenticated headers, not the JSON body')
+    assert.equal(unbindBody.current_code_id, 'license-device-rebind')
+    assert.equal(unbindBody.license_protocol_version, 2)
     assert.equal(unbindHeaders.get('authorization'), 'Bearer fake-device-session')
     assert.equal(unbindBody.activation_code, undefined, 'unbind must not submit the activation code')
     assert.equal(unbindBody.points_balance, undefined, 'server keeps the authoritative points balance')
@@ -544,6 +696,8 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
 
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
     const deviceId = getActivationStatus().deviceId
     const v1Record = {
       version: 1,
@@ -574,53 +728,91 @@ async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
   const originalFetch = globalThis.fetch
   const primaryCode = 'PRIMARY-A-CODE'
   const rechargeCode = 'RECHARGE-B-CODE'
+  const mergedWithoutLocalPrimaryCode = 'MERGED-WITHOUT-LOCAL-PRIMARY'
   const activationFile = join(tempUserData, 'activation.json')
   const activationBackup = `${activationFile}.bak`
+  let rechargeCalls = 0
   try {
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
     pointsWalletInternals.resetForTests()
     globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
       const code = String(body.activation_code || '')
       const isRecharge = code === rechargeCode
+      const isMergedWithoutLocalPrimary = code === mergedWithoutLocalPrimaryCode
+      if (isRecharge) rechargeCalls += 1
+      if ((isRecharge && rechargeCalls === 1) || isMergedWithoutLocalPrimary) {
+        return new Response(JSON.stringify({
+          ok: true,
+          action: 'balance_merged',
+          primary_code_id: 'license-a-primary',
+          merged_code_id: 'license-b-recharge',
+          message: 'balance merged',
+          data: { app_name: 'ProductOperationReport' },
+          license: {
+            app_name: 'ProductOperationReport',
+            code_id: 'license-b-recharge',
+            primary_code_id: 'license-a-primary',
+            merged_code_id: 'license-b-recharge',
+            action: 'balance_merged',
+            license_type: 'credits',
+            remaining_credits: 120,
+            unlimited: false,
+            binding_status: 'active',
+            transfer_count: 0,
+            machine_code: getActivationStatus().deviceId
+          }
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (isRecharge && rechargeCalls > 1) {
+        return new Response(JSON.stringify({ ok: false, error: '这个积分码已经合并过' }), {
+          status: 409,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
       return new Response(JSON.stringify({
         ok: true,
-        license: {
-          license_id: isRecharge ? 'license-b-recharge' : 'license-a-primary',
-          license_type: 'credits',
-          remaining_points: isRecharge ? 100 : 20,
-          binding_status: 'active',
-          transfer_count: 0,
-          device_credential: isRecharge ? 'credential-b' : 'credential-a',
-          session_token: isRecharge ? 'session-b' : 'session-a'
-        },
+        app_name: 'ProductOperationReport',
+        code_id: 'license-a-primary',
+        license_type: 'credits',
+        remaining_credits: isRecharge ? 120 : 20,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        ...(!isRecharge ? { device_credential: 'credential-a', device_session: 'session-a' } : {}),
         message: '激活成功'
       }), { status: 200, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
 
+    const missingPrimaryRecovery = await activateWithCode(mergedWithoutLocalPrimaryCode)
+    assert.equal(missingPrimaryRecovery.ok, false)
+    assert.match(missingPrimaryRecovery.message, /主激活码/)
+    assert.equal(existsSync(activationFile), false, 'a merged recharge code must never replace the missing primary')
+
     const primary = await activateWithCode(primaryCode)
     assert.equal(primary.ok, true)
-    assert.equal(primary.status.activationCode, primaryCode)
-    assert.equal(applyActivationPoints(primary.status).addedPoints, 20)
-    assert.equal(getPointsWalletStatus().balancePoints, 20)
+    assert.equal(primary.status.activationCodeAvailable, true)
+    assert.equal(primary.status.creditsRemaining, 20)
+    assert.equal(revealCurrentActivationCode().activationCode, primaryCode)
 
     const grant = await redeemPointsWithCode(rechargeCode)
     assert.equal(grant.ok, true)
-    assert.equal(grant.grantId, 'license-b-recharge')
+    assert.equal(grant.grantId, 'license-a-primary')
     assert.equal(grant.points, 100)
-    assert.equal(applyRechargeCodePoints(grant.grantId || '', grant.points || 0).addedPoints, 100)
-    assert.equal(getPointsWalletStatus().balancePoints, 120)
+    assert.equal(grant.status.creditsRemaining, 120)
     assert.equal(getActivationStatus().licenseId, 'license-a-primary')
-    assert.equal(getActivationStatus().activationCode, primaryCode, 'B code must not replace the displayed A code')
+    assert.equal(revealCurrentActivationCode().activationCode, primaryCode, 'B code must not replace the primary code')
 
     const repeatedGrant = await redeemPointsWithCode(rechargeCode)
-    assert.equal(repeatedGrant.ok, true)
-    assert.equal(applyRechargeCodePoints(repeatedGrant.grantId || '', repeatedGrant.points || 0).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 120)
+    assert.equal(repeatedGrant.ok, false)
+    assert.equal(getActivationStatus().creditsRemaining, 120)
     const primaryAsRecharge = await redeemPointsWithCode(primaryCode)
     assert.equal(primaryAsRecharge.ok, false)
-    assert.match(primaryAsRecharge.message, /当前软件激活码不能作为积分码/)
+    assert.match(primaryAsRecharge.message, /主激活码/)
     const stored = readFileSync(activationFile, 'utf8')
     assert.equal(stored.includes(primaryCode), false, 'primary code must be encrypted at rest')
     assert.equal(stored.includes(rechargeCode), false, 'recharge code must never be stored in activation state')
@@ -628,7 +820,131 @@ async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
     globalThis.fetch = originalFetch
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
     pointsWalletInternals.resetForTests()
+  }
+}
+
+async function testLicenseProtocolV2StrictContract(): Promise<void> {
+  const successfulStatusWithoutMessage = activationInternals.parseServerLicense({
+    ok: true,
+    app_name: 'ProductOperationReport',
+    code_id: 'status-without-message',
+    remaining_credits: 100,
+    unlimited: false,
+    binding_status: 'active',
+    transfer_count: 0,
+    machine_code: 'ABCDEF123456'
+  }, 200, 'abcdef123456')
+  assert.equal(successfulStatusWithoutMessage.ok, true)
+  assert.equal(successfulStatusWithoutMessage.message, '授权验证成功。')
+
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const vaultFile = join(tempUserData, 'license-vault.bin')
+  const vaultBackup = `${vaultFile}.bak`
+  const code = 'STRICT-V2-PRIMARY-CODE'
+  let mode: 'active' | 'unauthorized' | 'conflict' = 'active'
+  let balance = 100
+  let activationBody: Record<string, unknown> = {}
+  let activationHeaders = new Headers()
+  try {
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/device/status')) {
+        if (mode === 'unauthorized') {
+          return new Response(JSON.stringify({ ok: false, error: 'device credential expired' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'strict-v2-primary',
+          license_type: 'credits',
+          remaining_credits: balance,
+          ...(mode === 'conflict' ? { remaining_points: balance + 1 } : {}),
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getActivationStatus().deviceId,
+          message: 'status refreshed'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      activationBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      activationHeaders = new Headers(init?.headers)
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'strict-v2-primary',
+        license_type: 'credits',
+        remaining_credits: balance,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'strict-device-credential-rotated',
+        device_session: 'strict-device-session-rotated',
+        grant_score: 9_999,
+        message: 'activated'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.creditsRemaining, 100, 'grant_score must never replace the authoritative balance')
+    assert.equal('activationCode' in activated.status, false, 'normal status must never expose the full activation code')
+    assert.equal(revealCurrentActivationCode().activationCode, code)
+    assert.deepEqual(
+      Object.keys(activationBody).sort(),
+      ['activation_code', 'app_name', 'client_version', 'license_protocol_version', 'machine_code'].sort(),
+      'first activation sends only the canonical v2 fields'
+    )
+
+    balance = 42
+    const reduced = await getActivationStatusWithServerCheck()
+    assert.equal(reduced.creditsRemaining, 42, 'administrator deductions overwrite the local display immediately')
+    assert.equal(reduced.requiresRevalidation, false)
+
+    mode = 'unauthorized'
+    const unauthorized = await getActivationStatusWithServerCheck()
+    assert.equal(unauthorized.activated, true, '401 keeps local history access')
+    assert.equal(unauthorized.requiresRevalidation, true)
+    assert.equal(canStartLicensedAnalysis().ok, false, '401 blocks new cloud work')
+    assert.equal(revealCurrentActivationCode().activationCode, code, '401 must not delete the original activation code')
+
+    mode = 'active'
+    const refreshed = await activateWithCode(code)
+    assert.equal(refreshed.ok, true)
+    assert.equal(activationBody.credential_refresh, true)
+    assert.equal(activationBody.current_code_id, 'strict-v2-primary')
+    assert.equal(activationHeaders.get('authorization'), 'Bearer strict-device-session-rotated')
+    assert.equal(refreshed.status.creditsRemaining, 42, 'credential rotation must not add credits')
+
+    mode = 'conflict'
+    const conflicted = await getActivationStatusWithServerCheck()
+    assert.equal(conflicted.activated, true)
+    assert.equal(conflicted.creditsRemaining, 42, 'conflicting aliases must not overwrite the last trusted balance')
+    assert.equal(conflicted.requiresRevalidation, true)
+    assert.match(conflicted.message || '', /冲突/)
+
+    const json = readFileSync(activationFile, 'utf8')
+    const storedSummary = JSON.parse(json) as Record<string, unknown>
+    assert.equal(storedSummary.activationCodeStored, true, 'the non-secret summary records vault availability')
+    assert.equal(typeof storedSummary.maskedActivationCode, 'string', 'the default UI uses a non-secret masked summary')
+    for (const secret of [code, 'strict-device-credential-rotated', 'strict-device-session-rotated']) {
+      assert.equal(json.includes(secret), false, 'activation.json must never contain full secrets')
+    }
+    assert.equal(json.includes('encryptedCode'), false, 'legacy embedded secret fields are removed after migration')
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
   }
 }
 
@@ -780,6 +1096,7 @@ function testManagedModelIsolation(): void {
   )
 
   process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON = JSON.stringify(validConfig)
+  assert.equal(getManagedModelState().mode, 'proxy', 'normal development startup must exercise the production proxy path')
   assert.notEqual(getActiveProfile()?.apiKey, secret, '开发开关未启用时必须忽略模型环境变量')
   process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES = '1'
   try {
@@ -869,6 +1186,8 @@ function testChatAdmissionSecurity(): void {
   const registry = new ChatRequestRegistry(4)
   const first = new AbortController()
   registry.claim(id, 101, first)
+  assert.equal(registry.hasOwner(101), true)
+  assert.equal(registry.hasOwner(202), false)
   assert.throws(() => registry.claim(id, 101, new AbortController()), /重复/)
   assert.equal(registry.abort(id, 202), false)
   assert.equal(first.signal.aborted, false)
@@ -876,6 +1195,36 @@ function testChatAdmissionSecurity(): void {
   assert.equal(first.signal.aborted, true)
   registry.release(id, 101, first)
   assert.equal(registry.size, 0)
+  assert.equal(registry.hasOwner(101), false)
+
+  const second = new AbortController()
+  const third = new AbortController()
+  registry.claim('5f26ccac-8b0d-49eb-a49e-53d044098a52', 101, second)
+  registry.claim('30c33d60-7d4a-4676-b48b-d81febc34ac1', 202, third)
+  registry.abortAll()
+  assert.equal(second.signal.aborted, true)
+  assert.equal(third.signal.aborted, true)
+  assert.equal(registry.size, 0)
+}
+
+function testCloseDuringActiveWorkContract(): void {
+  const mainSource = readFileSync(join(process.cwd(), 'src', 'main', 'index.ts'), 'utf8')
+  const preloadSource = readFileSync(join(process.cwd(), 'src', 'preload', 'index.ts'), 'utf8')
+  const rendererSource = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'), 'utf8')
+  assert.match(mainSource, /hasParsingForOwner\(ownerId\)/)
+  assert.match(mainSource, /chatRequests\.hasOwner\(ownerId\)/)
+  assert.match(mainSource, /停止任务并退出/)
+  assert.match(mainSource, /cancelParsingForOwner\(ownerId, '软件正在关闭/)
+  assert.match(mainSource, /chatRequests\.abortOwner\(ownerId\)/)
+  assert.match(mainSource, /setTimeout\(\(\) => app\.exit\(0\), 4_000\)/)
+  assert.match(mainSource, /chatRequests\.abortAll\(\)/)
+  assert.match(mainSource, /app\.on\('before-quit'/)
+  const parseServiceSource = readFileSync(join(process.cwd(), 'src', 'main', 'parseService.ts'), 'utf8')
+  assert.match(parseServiceSource, /process\.kill\(pid, 'SIGKILL'\)/)
+  assert.match(parseServiceSource, /for \(const item of waiting\) settleItem\(item, serviceBlockedError\)\s+finish\(\)/)
+  assert.doesNotMatch(mainSource, /app:before-close/)
+  assert.doesNotMatch(preloadSource, /app:close-ready|app:close-guard-state|app:before-close/)
+  assert.doesNotMatch(rendererSource, /onBeforeClose/)
 }
 
 async function testModelFallbackSequence(): Promise<void> {
@@ -1476,16 +1825,19 @@ async function testTokenUsageMeasurement(): Promise<void> {
   ], 30)
   assert.equal(estimate.inputTokens >= 2_000, true)
   assert.equal(estimate.outputTokens, 10)
-  assert.equal(sanitizeModelTaskContext({
+  const stableContext = sanitizeModelTaskContext({
     reportSessionId: 'report-1',
     taskType: 'source_clean',
     taskKey: 'report-1:source_clean:file-1',
+    billingRequestId: 'report-1:source_clean:file-1',
     attempt: 1,
     isVision: true,
     sourceCount: 3,
     imageCount: 1,
     sourceId: 'file-1'
-  })?.isVision, true)
+  })
+  assert.equal(stableContext?.isVision, true)
+  assert.equal(stableContext?.billingRequestId, 'report-1:source_clean:file-1')
   assert.equal(sanitizeModelTaskContext({
     reportSessionId: 'bad id with spaces',
     taskType: 'summary',
@@ -2531,6 +2883,16 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
   assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary|points-ledger-preview/u)
   assert.equal(appComponent.includes('更换电脑'), false, 'device transfer is not placed in the points dialog')
+  assert.match(
+    appComponent,
+    /onChange=\{\(event\) => \{[\s\S]{0,180}setActivationCode\([\s\S]{0,100}setActivationError\(''\)/u,
+    'changing the activation code clears an error that belongs to the previous code'
+  )
+  assert.match(
+    appComponent,
+    /placeholder="POR-XXXX-XXXX-XXXX-XXXX"[\s\S]{0,120}disabled=\{activationBusy\}/u,
+    'the activation code cannot change while its request is in flight'
+  )
   const settingsComponent = readFileSync(
     join(process.cwd(), 'src', 'renderer', 'src', 'components', 'SettingsModal.tsx'),
     'utf8'
@@ -2540,6 +2902,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   assert.match(settingsComponent, /设备授权/u)
   assert.match(settingsComponent, /更换电脑/u)
   assert.match(settingsComponent, /deactivateCurrentDevice/u)
+  assert.equal(settingsComponent.includes('刷新余额'), false, 'service status does not expose a manual balance refresh button')
+  assert.equal(settingsComponent.includes('refreshAuthorization'), false, 'manual balance refresh handler is removed with its button')
   assert.doesNotMatch(settingsComponent, /毛利|每百万|真实成本|按真实 Token/u)
   assert.equal(/if \(!open\) return null[\s\S]{0,500}getReportResultCacheStats\(/u.test(settingsComponent), false)
   const phaseTrackerComponent = readFileSync(
@@ -3223,6 +3587,8 @@ async function run(): Promise<void> {
   await testDeviceUnbindAndRebind()
   console.log('Regression: primary activation code remains unchanged after points recharge')
   await testPrimaryActivationAndRechargeCodeSeparation()
+  console.log('Regression: strict License Protocol v2 contract and secure credential vault')
+  await testLicenseProtocolV2StrictContract()
   console.log('Regression: update version comparison')
   testUpdateVersionComparison()
   console.log('Regression: signed update manifest')
@@ -3236,6 +3602,8 @@ async function run(): Promise<void> {
   await testModelFallbackSequence()
   console.log('Regression: main-process chat admission and request ownership')
   testChatAdmissionSecurity()
+  console.log('Regression: closing during upload or analysis never waits on a renderer snapshot')
+  testCloseDuringActiveWorkContract()
   console.log('Regression: source invalidation')
   await testSourceInvalidation()
   console.log('Regression: reset save rollback')

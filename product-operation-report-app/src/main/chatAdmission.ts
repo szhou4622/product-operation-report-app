@@ -117,6 +117,18 @@ export class ChatRequestRegistry {
     }
   }
 
+  abortAll(): void {
+    for (const entry of this.entries.values()) entry.controller.abort()
+    this.entries.clear()
+  }
+
+  hasOwner(ownerId: number): boolean {
+    for (const entry of this.entries.values()) {
+      if (entry.ownerId === ownerId) return true
+    }
+    return false
+  }
+
   get size(): number {
     return this.entries.size
   }

@@ -72,6 +72,7 @@ export default function App(): JSX.Element {
   const initialized = useStore((s) => s.initialized)
   const persistencePaused = useStore((s) => s.persistencePaused)
   const projectRevision = useStore((s) => s.projectRevision)
+  const analysisSessionId = useStore((s) => s.analysisSessionId)
   const settings = useStore((s) => s.settings)
   const phase = useStore((s) => s.phase)
   const sources = useStore((s) => s.sources)
@@ -186,6 +187,7 @@ export default function App(): JSX.Element {
         .saveLastProject(
           buildProjectSnapshot({
             projectRevision,
+            analysisSessionId,
             sources,
             messages,
             cleanedData,
@@ -207,13 +209,14 @@ export default function App(): JSX.Element {
         })
     }, 100)
     return () => window.clearTimeout(handle)
-  }, [initialized, persistencePaused, settings, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
+  }, [initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
 
   useLayoutEffect(() => {
     if (!initialized || persistencePaused) return
     window.api.cacheProjectSnapshot(
       buildProjectSnapshot({
         projectRevision,
+        analysisSessionId,
         sources,
         messages,
         cleanedData,
@@ -225,15 +228,7 @@ export default function App(): JSX.Element {
         steering
       })
     )
-  }, [initialized, persistencePaused, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportForEmergencyCache, reportStale, phase, steering])
-
-  useEffect(() => {
-    if (!initialized) return
-    return window.api.onBeforeClose(async () => {
-      const state = useStore.getState()
-      await window.api.saveLastProject(buildProjectSnapshot(state))
-    })
-  }, [initialized])
+  }, [initialized, persistencePaused, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportForEmergencyCache, reportStale, phase, steering])
 
   useEffect(() => {
     if (newAnalysisState !== 'success' && newAnalysisState !== 'error') return
@@ -256,8 +251,10 @@ export default function App(): JSX.Element {
     settings && modelConfigured && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
   )
   const updateVisible = Boolean(updateInfo?.available && !updateDismissed)
-  const licenseLabel = pointsWallet
-    ? pointsWallet.balancePoints < 0
+  const licenseLabel = activationStatus?.unlimited || pointsWallet?.unlimited
+    ? '无限使用'
+    : pointsWallet
+      ? pointsWallet.balancePoints < 0
       ? `欠费 ${formatPoints(Math.abs(pointsWallet.balancePoints))} 积分`
       : `剩余 ${formatPoints(pointsWallet.balancePoints)} 积分`
     : '积分加载中'
@@ -393,6 +390,7 @@ export default function App(): JSX.Element {
   const submitReplacementActivation = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
     if (replacementBusy) return
+    if (!window.confirm('确认将这个积分码合并到当前主授权吗？\n\n合并成功后，积分码只能使用一次，当前主激活码不会改变。')) return
     setReplacementBusy(true)
     setReplacementError('')
     try {
@@ -522,9 +520,13 @@ export default function App(): JSX.Element {
             <input
               autoFocus
               value={activationCode}
-              onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
+              onChange={(event) => {
+                setActivationCode(event.target.value.toUpperCase())
+                setActivationError('')
+              }}
               placeholder="POR-XXXX-XXXX-XXXX-XXXX"
               spellCheck={false}
+              disabled={activationBusy}
             />
           </label>
           <div className="activation-device">
@@ -648,7 +650,7 @@ export default function App(): JSX.Element {
             </button>
           )}
           <button
-            className={`license-pill${activationStatus.offline ? ' offline' : ''}${(pointsWallet?.balancePoints ?? 0) <= 0 ? ' empty' : ''}`}
+            className={`license-pill${activationStatus.offline ? ' offline' : ''}${!activationStatus.unlimited && (pointsWallet?.balancePoints ?? 0) <= 0 ? ' empty' : ''}`}
             type="button"
             title={activationStatus.message || '查看积分余额或输入充值码'}
             onClick={() => {
@@ -656,7 +658,7 @@ export default function App(): JSX.Element {
               setLicenseEntryOpen(true)
             }}
           >
-            {licenseLabel}{activationStatus.offline ? ' · 离线可用' : ''}
+            {licenseLabel}{activationStatus.requiresRevalidation ? ' · 待验证' : ''}
           </button>
           {appVersion && (
             <button
@@ -738,7 +740,9 @@ export default function App(): JSX.Element {
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="license-entry-title">
           <form className="privacy-card license-entry-card" onSubmit={(event) => void submitReplacementActivation(event)}>
             <div className="privacy-kicker">积分余额</div>
-            <h2 id="license-entry-title">剩余 {formatPoints(pointsWallet?.balancePoints ?? 0)} 积分</h2>
+            <h2 id="license-entry-title">
+              {activationStatus.unlimited ? '无限使用' : `剩余 ${formatPoints(pointsWallet?.balancePoints ?? 0)} 积分`}
+            </h2>
             <p>如需充值，请输入管理员发放的积分码。</p>
             <label className="activation-field">
               <span>积分充值码</span>

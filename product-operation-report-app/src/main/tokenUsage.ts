@@ -49,19 +49,21 @@ export function sanitizeModelTaskContext(input: unknown): ModelTaskContext | und
   const value = input as Record<string, unknown>
   const reportSessionId = safeIdentifier(value.reportSessionId, true)
   const taskKey = safeIdentifier(value.taskKey, true)
+  const billingRequestId = safeIdentifier(value.billingRequestId, true) || taskKey
   const taskType = TASK_TYPES.includes(value.taskType as ModelTaskType)
     ? (value.taskType as ModelTaskType)
     : undefined
   const attempt = boundedCount(value.attempt, 20)
   const sourceCount = boundedCount(value.sourceCount, 500)
   const imageCount = boundedCount(value.imageCount, 500)
-  if (!reportSessionId || !taskKey || !taskType || !attempt || sourceCount === undefined || imageCount === undefined) {
+  if (!reportSessionId || !taskKey || !billingRequestId || !taskType || !attempt || sourceCount === undefined || imageCount === undefined) {
     return undefined
   }
   return {
     reportSessionId,
     taskType,
     taskKey,
+    billingRequestId,
     attempt,
     isVision: value.isVision === true,
     sourceCount,

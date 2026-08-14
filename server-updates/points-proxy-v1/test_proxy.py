@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import importlib.util
+import io
+import json
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 MODULE_PATH = Path(__file__).with_name("product_report_proxy.py")
@@ -253,6 +257,106 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(wallet["locked_milli"], 0)
 
 
+class ProviderKeyringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="por-provider-keyring-")
+        self.path = Path(self.temp.name, "provider-keys.json")
+        self.fallback = {model: ("https://fallback.example/v1", "fallback-secret-0001") for model in proxy.ALLOWED_MODELS}
+        self.keyring = proxy.ProviderKeyring(str(self.path), self.fallback, proxy.ALLOWED_MODELS)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_keyring(self, generation: int, active: str, keys: dict[str, str]) -> None:
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({
+            "version": 1,
+            "generation": generation,
+            "profiles": {
+                "ccg-main": {
+                    "base_url": "https://provider.example/v1",
+                    "active_key_id": active,
+                    "keys": keys,
+                }
+            },
+            "models": {model: "ccg-main" for model in proxy.ALLOWED_MODELS},
+        }), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+
+    def test_atomic_rotation_changes_only_new_request_snapshots(self) -> None:
+        self.write_keyring(1, "key-a", {"key-a": "secret-a-0000000001"})
+        old_request = self.keyring.active("gpt-5.5")
+        self.write_keyring(2, "key-b", {
+            "key-a": "secret-a-0000000001",
+            "key-b": "secret-b-0000000002",
+        })
+        new_request = self.keyring.active("gpt-5.5")
+        self.assertEqual(old_request.key_id, "key-a")
+        self.assertEqual(new_request.key_id, "key-b")
+        self.assertEqual(old_request.key_id, "key-a", "in-flight snapshot must remain immutable")
+        self.assertEqual([route.key_id for route in self.keyring.candidates("gpt-5.5")], ["key-b", "key-a"])
+
+    def test_invalid_replacement_keeps_last_known_good_without_exposing_secrets(self) -> None:
+        self.write_keyring(1, "key-a", {"key-a": "secret-a-0000000001"})
+        self.assertEqual(self.keyring.active("gpt-5.5").key_id, "key-a")
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text('{"version":1,"profiles":', encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+        self.assertEqual(self.keyring.active("gpt-5.5").key_id, "key-a")
+        health_text = json.dumps(self.keyring.health())
+        self.assertIn("last_known_good", health_text)
+        self.assertNotIn("secret-a-0000000001", health_text)
+
+    def test_missing_file_uses_existing_environment_route_for_compatibility(self) -> None:
+        active = self.keyring.active("claude-sonnet-4-6")
+        self.assertEqual(active.base_url, "https://fallback.example/v1")
+        self.assertEqual(active.key_id, "environment")
+
+    def test_installer_creates_a_private_server_only_keyring(self) -> None:
+        install = Path(__file__).with_name("install.sh").read_text(encoding="utf-8")
+        service = Path(__file__).with_name("product-report-proxy.service").read_text(encoding="utf-8")
+        self.assertIn("chmod 0600 /etc/product-operation-report/provider-keys.json", install)
+        self.assertIn("-m 0750 -o root -g product-report-proxy /etc/product-operation-report", install)
+        self.assertIn("provider_keyring.py", install)
+        self.assertIn("ReadOnlyPaths=/etc/product-operation-report", service)
+
+    def test_auth_failure_uses_standby_before_any_stream_is_returned(self) -> None:
+        candidates = (
+            proxy.ProviderRouteSnapshot("gpt-5.5", "https://provider.example/v1", "key-b", "secret-b-0000000002"),
+            proxy.ProviderRouteSnapshot("gpt-5.5", "https://provider.example/v1", "key-a", "secret-a-0000000001"),
+        )
+        successful_stream = object()
+        authorizations = []
+
+        def fake_open(request, timeout):
+            authorizations.append(request.get_header("Authorization"))
+            if len(authorizations) == 1:
+                raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO(b"rejected"))
+            return successful_stream
+
+        with patch.object(proxy, "urlopen", side_effect=fake_open):
+            opened = proxy.open_provider_stream(candidates, b"{}", "test-request")
+        self.assertIs(opened, successful_stream)
+        self.assertEqual(len(authorizations), 2)
+
+    def test_non_auth_provider_failure_does_not_try_a_second_key(self) -> None:
+        candidates = (
+            proxy.ProviderRouteSnapshot("gpt-5.5", "https://provider.example/v1", "key-b", "secret-b-0000000002"),
+            proxy.ProviderRouteSnapshot("gpt-5.5", "https://provider.example/v1", "key-a", "secret-a-0000000001"),
+        )
+        calls = []
+
+        def fake_open(request, timeout):
+            calls.append(request)
+            raise HTTPError(request.full_url, 429, "rate limited", {}, io.BytesIO(b"retry later"))
+
+        with patch.object(proxy, "urlopen", side_effect=fake_open):
+            with self.assertRaises(HTTPError):
+                proxy.open_provider_stream(candidates, b"{}", "test-request")
+        self.assertEqual(len(calls), 1)
+
 class LicenseContractTests(unittest.TestCase):
     def valid_result(self, **overrides):
         result = {
@@ -349,6 +453,9 @@ class LicenseContractTests(unittest.TestCase):
         self.assertIn("limit_req zone=por_chat", config)
         self.assertIn("limit_conn por_conn", config)
         self.assertIn("return 404", config)
+        common = MODULE_PATH.with_name("nginx-proxy-common.conf").read_text(encoding="utf-8")
+        self.assertNotIn("proxy_read_timeout", common)
+        self.assertIn("proxy_read_timeout 360s", config)
 
 
 if __name__ == "__main__":

@@ -15,12 +15,47 @@
 1. 备份授权数据库、Nginx 和现有服务。
 2. 将本目录复制到服务器临时目录。
 3. 执行 `sudo bash install.sh`（只安装，不启动）。
-4. 编辑 `/etc/product-operation-report/proxy.env`，只在服务器填写新轮换的 CCG Key。
+4. 编辑 `/etc/product-operation-report/proxy.env` 检查非敏感配置；模型 Key 使用下面的服务器密钥保险箱写入，不写进客户端、安装包或 GitHub。
 5. 使用真实授权响应样本验证 `AUTHORIZATION_CONTRACT.md`，再在回环地址测试 `/health`、`/session`、充值与扣费。
 6. `install.sh` 会安装 Nginx 限流区和公共代理片段；将 `nginx-location.conf` 加入 `api.dadaozixun.com` 后执行 `nginx -t`。
 7. `systemctl enable --now product-report-proxy`，再重载 Nginx。
 
-不要把 `proxy.env`、CCG Key、会话令牌或数据库复制回客户端或 GitHub Actions。
+不要把 `proxy.env`、`provider-keys.json`、CCG Key、会话令牌或数据库复制回客户端或 GitHub Actions。
+
+## 模型 Key 无停机轮换
+
+首次配置或更换 Key 时，在服务器执行（命令会隐藏输入，不把 Key 放进命令行历史或进程列表）：
+
+```bash
+sudo /usr/local/sbin/product-report-rotate-key set \
+  --profile ccg-main \
+  --key-id 2026-08-b \
+  --base-url https://ccg-cli.online/v1 \
+  --models gpt-5.5,claude-sonnet-4-6,gemini-3-flash,kimi-k2.6 \
+  --activate
+```
+
+脚本会先用新 Key 做一个极小的真实请求验证，通过后才原子写入。运行中的代理会在下一次请求自动读取新版本，不需要重启；已经开始的请求继续使用它启动时取得的旧 Key。旧 Key 会保留为备用，如果新 Key 在建连时返回 401/403，代理会在尚未向用户输出内容前自动尝试备用 Key。
+
+查看配置只显示标识，不显示密钥：
+
+```bash
+sudo /usr/local/sbin/product-report-rotate-key status
+```
+
+需要回滚时，将旧标识重新设为活动 Key：
+
+```bash
+sudo /usr/local/sbin/product-report-rotate-key activate --profile ccg-main --key-id 2026-08-a
+```
+
+确认新 Key 稳定并等待至少 10 分钟（覆盖最长在途请求）后，再删除非活动旧 Key：
+
+```bash
+sudo /usr/local/sbin/product-report-rotate-key remove --profile ccg-main --key-id 2026-08-a
+```
+
+`provider-keys.json` 由服务账号独占读取，权限固定为 `0600`。文件损坏、写入中断或权限错误时，代理继续使用内存中的上一份有效配置，并在 `/health` 只报告安全的加载状态和备用数量，绝不返回 Key、Key 哈希或完整配置。
 
 默认四个模型可共用同一线路；如果需要抵御单个供应商、账号、DNS 或密钥整体故障，应按 `proxy.env.example` 为备用模型配置独立 Base URL 和独立 Key。代理会校验上游返回的模型名；返回模型与请求不一致时按两者中更高的价格保守结算并保留审计信息。
 

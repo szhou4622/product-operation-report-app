@@ -29,6 +29,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from provider_keyring import ProviderKeyring, ProviderRouteSnapshot
+
 
 APP_NAME = "ProductOperationReport"
 HOST = os.environ.get("POR_PROXY_HOST", "127.0.0.1")
@@ -45,6 +47,9 @@ LICENSE_ACTIVATE_URL = os.environ.get(
 )
 PROVIDER_BASE_URL = os.environ.get("POR_PROVIDER_BASE_URL", "https://ccg-cli.online/v1").rstrip("/")
 PROVIDER_API_KEY = os.environ.get("POR_PROVIDER_API_KEY", "").strip()
+PROVIDER_KEYS_FILE = os.environ.get(
+    "POR_PROVIDER_KEYS_FILE", "/etc/product-operation-report/provider-keys.json"
+).strip()
 SESSION_TTL_SECONDS = max(120, min(3600, int(os.environ.get("POR_SESSION_TTL_SECONDS", "900"))))
 DAILY_COST_LIMIT_CNY = max(1.0, float(os.environ.get("POR_DAILY_COST_LIMIT_CNY", "100")))
 USD_CNY_RATE = max(1.0, float(os.environ.get("POR_USD_CNY_RATE", "7.2")))
@@ -88,6 +93,7 @@ PROVIDER_ROUTES = {
     )
     for model, prefix in MODEL_ENV_PREFIXES.items()
 }
+PROVIDER_KEYRING = ProviderKeyring(PROVIDER_KEYS_FILE, PROVIDER_ROUTES, ALLOWED_MODELS)
 LEGACY_NAMESPACE = "product-operation-report:activation:v1:"
 
 
@@ -320,13 +326,14 @@ def verify_license(identity: dict[str, Any]) -> tuple[str, int, str]:
     device_session = text(identity.get("device_session"), 8192)
     if app_name != APP_NAME or not machine or not credential or not device_session:
         raise ApiError(401, "当前设备授权信息不完整，请重新激活。")
-    status_url = f"{LICENSE_STATUS_URL}?{urlencode({
+    status_query = urlencode({
         'app_name': APP_NAME,
         'machine_code': machine,
         'license_id': license_id,
         'software_version': 'proxy',
         'platform': 'server-proxy',
-    })}"
+    })
+    status_url = f"{LICENSE_STATUS_URL}?{status_query}"
     request = Request(
         status_url, method="GET",
         headers={"Accept": "application/json",
@@ -626,9 +633,46 @@ def points_for_usage(model: str, input_tokens: int, output_tokens: int, cached: 
 
 
 def provider_route(model: str) -> tuple[str, str]:
-    if model not in PROVIDER_ROUTES:
+    if model not in ALLOWED_MODELS:
         raise ApiError(400, "模型不在服务器允许列表中。")
-    return PROVIDER_ROUTES[model]
+    route = PROVIDER_KEYRING.active(model)
+    return (route.base_url, route.api_key) if route else ("", "")
+
+
+def provider_route_candidates(model: str) -> tuple[ProviderRouteSnapshot, ...]:
+    if model not in ALLOWED_MODELS:
+        raise ApiError(400, "模型不在服务器允许列表中。")
+    return PROVIDER_KEYRING.candidates(model)
+
+
+def open_provider_stream(
+    candidates: tuple[ProviderRouteSnapshot, ...], upstream_data: bytes, request_id: str
+) -> Any:
+    """Open one upstream stream, using standby keys only for pre-stream auth failures."""
+    last_auth_error: HTTPError | None = None
+    for candidate_index, candidate in enumerate(candidates):
+        request = Request(
+            f"{candidate.base_url}/chat/completions",
+            data=upstream_data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "Authorization": f"Bearer {candidate.api_key}",
+                "X-Request-Id": request_id,
+            },
+        )
+        try:
+            return urlopen(request, timeout=300)
+        except HTTPError as error:
+            # Authentication rejection occurs before any successful response body
+            # is streamed. Other errors are never retried with a second secret.
+            if error.code in (401, 403) and candidate_index + 1 < len(candidates):
+                error.read(16 * 1024)
+                last_auth_error = error
+                continue
+            raise
+    raise last_auth_error or OSError("no provider route available")
 
 
 def points_for_verified_usage(requested_model: str, response_model: str | None, input_tokens: int,
@@ -897,7 +941,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
             if path == "/health":
-                self.json_response(200, {"ok": True, "service": "product-operation-report", "models": list(ALLOWED_MODELS)})
+                self.json_response(200, {
+                    "ok": True,
+                    "service": "product-operation-report",
+                    "models": list(ALLOWED_MODELS),
+                    "provider_keyring": PROVIDER_KEYRING.health(),
+                })
                 return
             if path == "/wallet":
                 session = require_session(self.headers)
@@ -940,8 +989,8 @@ class Handler(BaseHTTPRequestHandler):
         session = require_session(self.headers, verify=True)
         body = self.read_json()
         model, input_estimate = validate_messages(body)
-        provider_base_url, provider_api_key = provider_route(model)
-        if not provider_api_key:
+        provider_candidates = provider_route_candidates(model)
+        if not provider_candidates:
             raise ApiError(503, "模型服务密钥尚未在服务器配置。")
         request_id = text(self.headers.get("x-request-id"), 240)
         report_id = text(self.headers.get("x-report-session-id"), 200)
@@ -976,13 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
         if task_type in ("source_clean", "summary") and body.get("reasoning_effort") == "low":
             upstream_body["reasoning_effort"] = "low"
         reserve_request(session, request_id, report_id, task_key, task_type, model, attempt, input_estimate)
-        request = Request(
-            f"{provider_base_url}/chat/completions",
-            data=json.dumps(upstream_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json", "Accept": "text/event-stream",
-                     "Authorization": f"Bearer {provider_api_key}", "X-Request-Id": request_id},
-        )
+        upstream_data = json.dumps(upstream_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         mark_upstream_submitted(request_id)
         usage: dict[str, int] | None = None
         output_chars = 0
@@ -991,13 +1034,13 @@ class Handler(BaseHTTPRequestHandler):
         final_status = "failed"
         try:
             try:
-                upstream = urlopen(request, timeout=300)
+                upstream = open_provider_stream(provider_candidates, upstream_data, request_id)
             except HTTPError as error:
-                detail = error.read(16 * 1024).decode("utf-8", "replace")[:500]
+                error.read(16 * 1024)
                 settle_request(session, request_id, "failed", model, None, input_estimate, 0, False)
-                if error.code in (404, 408, 425, 429) or error.code >= 500:
+                if error.code in (401, 403, 404, 408, 425, 429) or error.code >= 500:
                     raise ApiError(503, f"provider_route_unavailable：模型线路暂时不可用（{error.code}）") from error
-                raise ApiError(error.code, f"模型服务拒绝请求（{error.code}）{detail}") from error
+                raise ApiError(error.code, f"模型服务拒绝请求（{error.code}）。") from error
             except (URLError, TimeoutError, OSError) as error:
                 settle_request(session, request_id, "failed", model, None, input_estimate, 0, False)
                 raise ApiError(503, "provider_route_unavailable：模型线路连接失败。") from error
@@ -1044,8 +1087,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    if not any(api_key for _, api_key in PROVIDER_ROUTES.values()):
-        print("WARNING: POR_PROVIDER_API_KEY is not configured; chat requests will be rejected.", flush=True)
+    if not PROVIDER_KEYRING.has_any_key():
+        print("WARNING: no server-side provider key is configured; chat requests will be rejected.", flush=True)
     recover_interrupted_requests()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True

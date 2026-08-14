@@ -100,9 +100,16 @@ function stopUtility(state: UtilityState): void {
     queueMicrotask(pump)
   }
   const watchdog = setTimeout(() => {
-    if (finished || state.process.pid === undefined) {
+    if (finished) return
+    const pid = state.process.pid
+    if (pid === undefined) {
       finish()
       return
+    }
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      // The application-level hard-exit watchdog remains the final fallback.
     }
     serviceBlockedError = new Error(
       '文件解析组件未能安全停止。请先保存当前工作，重启软件后再上传文件。'
@@ -110,6 +117,7 @@ function stopUtility(state: UtilityState): void {
     const waiting = queue
     queue = []
     for (const item of waiting) settleItem(item, serviceBlockedError)
+    finish()
   }, 3_000)
   watchdog.unref?.()
   state.process.once('exit', finish)
@@ -386,6 +394,10 @@ export function cancelParsingForOwner(ownerId: number, reason = '已取消文件
     if (utilityState && item.generation === utilityState.generation) stopUtility(utilityState)
   }
   queueMicrotask(pump)
+}
+
+export function hasParsingForOwner(ownerId: number): boolean {
+  return current?.ownerId === ownerId || queue.some((item) => item.ownerId === ownerId)
 }
 
 export function disposeParseService(): void {

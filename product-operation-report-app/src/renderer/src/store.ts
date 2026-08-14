@@ -221,6 +221,7 @@ function restorePhase(project: SavedProject): Phase {
 
 export function buildProjectSnapshot(state: {
   projectRevision: number
+  analysisSessionId: string
   sources: Source[]
   messages: ChatMsg[]
   cleanedData: string
@@ -233,6 +234,7 @@ export function buildProjectSnapshot(state: {
 }): SavedProject {
   return {
     revision: state.projectRevision,
+    analysisSessionId: state.analysisSessionId,
     sources: state.sources.map((s) => ({
       id: s.id,
       name: s.name,
@@ -698,6 +700,7 @@ async function runFinalReportInParts(params: {
         reportSessionId: params.taskContext.reportSessionId,
         taskType: params.taskContext.taskType,
         taskKey: `${params.taskContext.taskKeyPrefix}:${part.id}`,
+        billingRequestId: `${params.taskContext.taskKeyPrefix}:${part.id}`,
         isVision: false,
         sourceCount: params.taskContext.sourceCount,
         imageCount: params.taskContext.imageCount,
@@ -1046,7 +1049,7 @@ export const useStore = create<StoreState>((set, get) => ({
       initialized: true,
       persistencePaused: false,
       projectRevision: lastProject?.revision || 0,
-      analysisSessionId: crypto.randomUUID(),
+      analysisSessionId: lastProject?.analysisSessionId || crypto.randomUUID(),
       previousProjectAvailable: Boolean(previousProject),
       settings,
       sopRules,
@@ -1217,7 +1220,7 @@ export const useStore = create<StoreState>((set, get) => ({
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
       projectRevision: current.projectRevision + 1,
-      analysisSessionId: crypto.randomUUID(),
+      analysisSessionId: previous.analysisSessionId || crypto.randomUUID(),
       reportReuseOffer: null,
       previousProjectAvailable: false,
       persistencePaused: true
@@ -1814,6 +1817,7 @@ export const useStore = create<StoreState>((set, get) => ({
               reportSessionId: sessionId,
               taskType: 'source_clean',
               taskKey: `${sessionId}:source_clean:${s.id}`,
+              billingRequestId: `${sessionId}:source_clean:${s.id}`,
               isVision: s.kind === 'image',
               sourceCount,
               imageCount,
@@ -1888,6 +1892,7 @@ export const useStore = create<StoreState>((set, get) => ({
         reportSessionId: sessionId,
         taskType: 'summary',
         taskKey: `${sessionId}:summary`,
+        billingRequestId: `${sessionId}:summary`,
         isVision: false,
         sourceCount,
         imageCount
@@ -2004,6 +2009,7 @@ export const useStore = create<StoreState>((set, get) => ({
             reportSessionId: sessionId,
             taskType: 'analysis_step',
             taskKey: `${sessionId}:analysis_step:${step.id}`,
+            billingRequestId: `${sessionId}:analysis_step:${step.id}`,
             isVision: false,
             sourceCount: get().sources.length,
             imageCount: get().sources.filter((source) => source.kind === 'image').length,

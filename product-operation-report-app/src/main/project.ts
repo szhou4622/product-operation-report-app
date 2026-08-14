@@ -139,6 +139,9 @@ function sanitizeProject(value: unknown): SavedProject {
   const input = isPlainObject(value) ? value : {}
   return {
     revision: sanitizeRevision(input.revision),
+    analysisSessionId: typeof input.analysisSessionId === 'string' && /^[\w.:@/+-]{1,240}$/u.test(input.analysisSessionId)
+      ? input.analysisSessionId
+      : undefined,
     sources: Array.isArray(input.sources)
       ? input.sources
           .map((source) => sanitizeSource(source))
