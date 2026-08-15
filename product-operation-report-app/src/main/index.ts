@@ -382,6 +382,7 @@ ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:refresh', async () => {
   const status = await getActivationStatusWithServerCheck()
+  if (!status.activated) clearAiProxySession()
   broadcastAuthorization(status)
   return status
 })
@@ -837,6 +838,7 @@ ipcMain.on(
           : settleTokenUsage(finalRecord)
         if (managedState.mode === 'proxy' && terminal.type === 'done') {
           const refreshed = await getActivationStatusWithServerCheck().catch(() => getActivationStatus())
+          if (!refreshed.activated) clearAiProxySession()
           wallet = authorizationWallet(refreshed)
           for (const window of BrowserWindow.getAllWindows()) {
             if (!window.isDestroyed()) window.webContents.send('activation:changed', refreshed)

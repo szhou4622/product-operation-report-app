@@ -724,6 +724,99 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
   }
 }
 
+async function testRemoteAdminUnbindReturnsToActivation(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'REMOTE-ADMIN-UNBIND-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  let statusMode: 'active' | 'unbound' | 'unauthorized' = 'active'
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) {
+      rmSync(file, { force: true })
+    }
+    activationInternals.resetRuntimeValidationForTests()
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      const machineCode = getActivationStatus().deviceId
+      if (url.includes('/device/status')) {
+        if (statusMode === 'unauthorized') {
+          return new Response(JSON.stringify({ ok: false, error: '设备凭证已撤销' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          binding_status: statusMode === 'unbound' ? 'unbound' : 'active',
+          code_id: 'remote-admin-unbind-license',
+          license_type: 'credits',
+          remaining_credits: 130,
+          unlimited: false,
+          transfer_count: statusMode === 'unbound' ? 1 : 0,
+          machine_code: machineCode,
+          message: statusMode === 'unbound'
+            ? '当前设备已在服务器解除绑定，请重新输入激活码。'
+            : '设备授权有效'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'remote-admin-unbind-license',
+        license_type: 'credits',
+        remaining_credits: 130,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 1,
+        machine_code: machineCode,
+        device_credential: 'remote-admin-device-credential',
+        device_session: 'remote-admin-device-session',
+        action: 'rebound',
+        grant_score: 0,
+        message: '重新绑定成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.activated, true)
+
+    statusMode = 'unbound'
+    const unbound = await getActivationStatusWithServerCheck()
+    assert.equal(unbound.activated, false, 'a server-side unbind must leave the active application state')
+    assert.equal(unbound.bindingStatus, 'unbound')
+    assert.equal(unbound.activationCodeAvailable, true, 'the original code remains recoverable from secure storage')
+    assert.match(unbound.message || '', /解除绑定/)
+    assert.equal(revealCurrentActivationCode().activationCode, code)
+
+    statusMode = 'active'
+    const rebound = await activateWithCode(code)
+    assert.equal(rebound.ok, true, 'the original code can explicitly bind the machine again')
+    assert.equal(rebound.status.activated, true)
+
+    statusMode = 'unauthorized'
+    const revokedCredential = await getActivationStatusWithServerCheck()
+    assert.equal(revokedCredential.activated, false, 'a revoked device credential must return to activation')
+    assert.equal(revokedCredential.requiresRevalidation, true)
+    assert.equal(revokedCredential.activationCodeAvailable, true)
+    assert.match(revokedCredential.message || '', /重新输入原激活码/)
+
+    statusMode = 'active'
+    const revalidated = await activateWithCode(code)
+    assert.equal(revalidated.ok, true)
+    assert.equal(revalidated.status.activated, true)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) {
+      rmSync(file, { force: true })
+    }
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
 async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
   const originalFetch = globalThis.fetch
   const primaryCode = 'PRIMARY-A-CODE'
@@ -913,7 +1006,7 @@ async function testLicenseProtocolV2StrictContract(): Promise<void> {
 
     mode = 'unauthorized'
     const unauthorized = await getActivationStatusWithServerCheck()
-    assert.equal(unauthorized.activated, true, '401 keeps local history access')
+    assert.equal(unauthorized.activated, false, '401 returns the UI to activation while project files remain untouched')
     assert.equal(unauthorized.requiresRevalidation, true)
     assert.equal(canStartLicensedAnalysis().ok, false, '401 blocks new cloud work')
     assert.equal(revealCurrentActivationCode().activationCode, code, '401 must not delete the original activation code')
@@ -923,7 +1016,7 @@ async function testLicenseProtocolV2StrictContract(): Promise<void> {
     assert.equal(refreshed.ok, true)
     assert.equal(activationBody.credential_refresh, true)
     assert.equal(activationBody.current_code_id, 'strict-v2-primary')
-    assert.equal(activationHeaders.get('authorization'), 'Bearer strict-device-session-rotated')
+    assert.equal(activationHeaders.get('authorization'), null, 'a revoked device session must not be reused during revalidation')
     assert.equal(refreshed.status.creditsRemaining, 42, 'credential rotation must not add credits')
 
     mode = 'conflict'
@@ -2883,6 +2976,20 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
   assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary|points-ledger-preview/u)
   assert.equal(appComponent.includes('更换电脑'), false, 'device transfer is not placed in the points dialog')
+  assert.match(appComponent, /AUTHORIZATION_REFRESH_INTERVAL_MS = 60_000/u)
+  assert.match(appComponent, /setInterval\(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS\)/u)
+  assert.match(appComponent, /addEventListener\('focus', handleFocus\)/u)
+  assert.match(appComponent, /addEventListener\('visibilitychange', handleVisibilityChange\)/u)
+  assert.match(
+    appComponent,
+    /autosaveAttempt\.current \+= 1[\s\S]{0,100}setAutosaveError\(''\)[\s\S]{0,120}\[activationStatus\?\.activated, activationStatus\?\.licenseId\]/u,
+    'an authorization change invalidates stale autosave failures from the previous license'
+  )
+  assert.match(
+    appComponent,
+    /if \(!activationStatus\?\.activated \|\| !initialized \|\| !settings \|\| persistencePaused\) return/u,
+    'autosave does not run while the software is unbound or awaiting reactivation'
+  )
   assert.match(
     appComponent,
     /onChange=\{\(event\) => \{[\s\S]{0,180}setActivationCode\([\s\S]{0,100}setActivationError\(''\)/u,
@@ -3585,6 +3692,8 @@ async function run(): Promise<void> {
   await testExplicitZeroServerBalanceDoesNotReissueGrantedCredits()
   console.log('Regression: safe device unbind and original-code rebind')
   await testDeviceUnbindAndRebind()
+  console.log('Regression: remote administrator unbind returns to activation')
+  await testRemoteAdminUnbindReturnsToActivation()
   console.log('Regression: primary activation code remains unchanged after points recharge')
   await testPrimaryActivationAndRechargeCodeSeparation()
   console.log('Regression: strict License Protocol v2 contract and secure credential vault')

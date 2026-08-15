@@ -9,6 +9,7 @@ import ReportReuseModal from './components/ReportReuseModal'
 
 const SOP_GUIDE_URL =
   'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
+const AUTHORIZATION_REFRESH_INTERVAL_MS = 60_000
 
 function friendlyUiError(value: unknown, fallback: string): string {
   const raw = (value instanceof Error ? value.message : String(value || ''))
@@ -113,7 +114,7 @@ export default function App(): JSX.Element {
   const [updateError, setUpdateError] = useState('')
   const [updateCheckNotice, setUpdateCheckNotice] = useState('')
   const autosaveAttempt = useRef(0)
-  const activationRefreshAttempted = useRef(false)
+  const activationRefreshInFlight = useRef(false)
   const updateCheckAttempted = useRef(false)
   const reportForEmergencyCache =
     phase === 'cleaning' || phase === 'analyzing' ? artifacts[9] || '' : reportMarkdown
@@ -150,13 +151,46 @@ export default function App(): JSX.Element {
   useEffect(() => window.api.onPointsWalletChanged(setPointsWallet), [])
 
   useEffect(() => {
-    if ((!activationStatus?.activated && activationStatus?.source !== 'server') || activationRefreshAttempted.current) return
-    activationRefreshAttempted.current = true
-    void window.api
-      .refreshActivationStatus()
-      .then(setActivationStatus)
-      .catch(() => undefined)
-  }, [activationStatus?.activated, activationStatus?.source])
+    // Invalidate a save that started under the previous authorization. A remote
+    // unbind can finish while that save is still awaiting the main process; its
+    // expected "not activated" rejection must not survive a successful rebind.
+    autosaveAttempt.current += 1
+    setAutosaveError('')
+  }, [activationStatus?.activated, activationStatus?.licenseId])
+
+  useEffect(() => {
+    if (!activationStatus?.activated || activationStatus.source !== 'server') return
+    let disposed = false
+    const refreshAuthorization = async (): Promise<void> => {
+      if (activationRefreshInFlight.current) return
+      activationRefreshInFlight.current = true
+      try {
+        const status = await window.api.refreshActivationStatus()
+        if (!disposed) setActivationStatus(status)
+      } catch {
+        // The main process retains the last safe status on a network failure.
+        // Focus, visibility and interval events will retry without blocking UI.
+      } finally {
+        activationRefreshInFlight.current = false
+      }
+    }
+    const handleFocus = (): void => {
+      void refreshAuthorization()
+    }
+    const handleVisibilityChange = (): void => {
+      if (!document.hidden) void refreshAuthorization()
+    }
+    void refreshAuthorization()
+    const timer = window.setInterval(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS)
+    window.addEventListener('focus', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId])
 
   useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
 
@@ -180,7 +214,7 @@ export default function App(): JSX.Element {
   }, [activationStatus?.activated, activationStatus?.licenseId])
 
   useEffect(() => {
-    if (!initialized || !settings || persistencePaused) return
+    if (!activationStatus?.activated || !initialized || !settings || persistencePaused) return
     const handle = window.setTimeout(() => {
       const attempt = ++autosaveAttempt.current
       void window.api
@@ -209,7 +243,7 @@ export default function App(): JSX.Element {
         })
     }, 100)
     return () => window.clearTimeout(handle)
-  }, [initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
+  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
 
   useLayoutEffect(() => {
     if (!initialized || persistencePaused) return
@@ -534,7 +568,7 @@ export default function App(): JSX.Element {
             <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
           </div>
           <div className="activation-note">如果激活遇到问题，把设备码发给管理员即可。</div>
-          {activationStatus.message?.includes('解除绑定') && (
+          {activationStatus.message && (
             <div className="activation-notice" role="status">{activationStatus.message}</div>
           )}
           {activationError && <div className="activation-error">{activationError}</div>}

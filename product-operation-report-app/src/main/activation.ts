@@ -928,6 +928,39 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     return toStatus(updated, deviceId)
   }
   serverValidatedThisRun = false
+  if (result.bindingStatus === 'unbound') {
+    let activationCodeStored = false
+    try {
+      if (vault.activationCode) {
+        // Keep only the original code so the user can explicitly reactivate it.
+        // Revoked device credentials must not survive an administrator unbind.
+        writeLicenseVault({ activationCode: vault.activationCode })
+        activationCodeStored = true
+      } else {
+        clearLicenseVault()
+      }
+    } catch {
+      clearLicenseVault()
+    }
+    const message = result.message || '当前设备已在服务器解除绑定，请重新输入激活码。'
+    const updated: ServerStoredActivation = {
+      ...sanitizedServerRecord(current),
+      bindingStatus: 'unbound',
+      transferCount: result.transferCount ?? current.transferCount,
+      creditsRemaining: result.creditsRemaining ?? current.creditsRemaining,
+      lastValidatedAt: new Date().toISOString(),
+      offlineSince: undefined,
+      requiresRevalidation: true,
+      revokedReason: message,
+      serverMessage: message,
+      activationCodeStored,
+      maskedActivationCode: activationCodeStored && vault.activationCode
+        ? maskActivationCode(vault.activationCode)
+        : undefined
+    }
+    writeStoredActivation(updated)
+    return toStatus(updated, deviceId)
+  }
   if (result.unavailable) {
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
@@ -939,10 +972,29 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     return toStatus(updated, deviceId)
   }
   if (result.unauthorized) {
+    let activationCodeStored = false
+    try {
+      if (vault.activationCode) {
+        // A revoked device token returns to activation, while the original code
+        // remains protected by DPAPI/Keychain for an explicit reactivation.
+        writeLicenseVault({ activationCode: vault.activationCode })
+        activationCodeStored = true
+      } else {
+        clearLicenseVault()
+      }
+    } catch {
+      clearLicenseVault()
+    }
+    const message = '设备凭证已失效，请重新输入原激活码验证。'
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
       requiresRevalidation: true,
-      serverMessage: '设备凭证已失效，请重新输入原激活码验证。'
+      revokedReason: message,
+      serverMessage: message,
+      activationCodeStored,
+      maskedActivationCode: activationCodeStored && vault.activationCode
+        ? maskActivationCode(vault.activationCode)
+        : undefined
     }
     writeStoredActivation(updated)
     return toStatus(updated, deviceId)
