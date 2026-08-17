@@ -17,7 +17,11 @@ async function run() {
     const artifacts = join(root, 'artifacts')
     mkdirSync(artifacts, { recursive: true })
     writeFileSync(join(root, 'package.json'), JSON.stringify({ version }), 'utf8')
-    writeFileSync(join(root, 'release-notes.txt'), '# ignored\n第一条\n第二条\n', 'utf8')
+    writeFileSync(
+      join(root, 'release-notes.txt'),
+      '# 每行一条更新说明\n# v9.8.7\n第一条\n第二条\n# v9.8.6\n旧版本说明不得进入新清单\n',
+      'utf8'
+    )
 
     const payloads = {}
     for (const [key, filename] of Object.entries(artifactDefinitions(version))) {

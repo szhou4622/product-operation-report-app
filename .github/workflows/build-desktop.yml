@@ -148,7 +148,7 @@ jobs:
       - package
       - release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
       UPDATE_SERVER_USER: ${{ secrets.UPDATE_SERVER_USER }}

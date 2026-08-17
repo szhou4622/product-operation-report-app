@@ -49,10 +49,29 @@ function compareVersions(left, right) {
   return left === right ? 0 : left > right ? 1 : -1
 }
 
-function readNotes(path) {
+function readNotes(path, version = '') {
   if (!path || !existsSync(path)) return ['修复问题并提升使用体验。']
-  const notes = readFileSync(path, 'utf8')
-    .split(/\r?\n/)
+  const lines = readFileSync(path, 'utf8').split(/\r?\n/)
+  const normalizedVersion = version ? normalizeVersion(version) : ''
+  let selectedLines = lines
+  if (normalizedVersion) {
+    const headingPattern = /^#\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/i
+    const startIndex = lines.findIndex((line) => {
+      const match = line.trim().match(headingPattern)
+      return match && normalizeVersion(match[1]) === normalizedVersion
+    })
+    if (startIndex >= 0) {
+      let endIndex = lines.length
+      for (let index = startIndex + 1; index < lines.length; index += 1) {
+        if (headingPattern.test(lines[index].trim())) {
+          endIndex = index
+          break
+        }
+      }
+      selectedLines = lines.slice(startIndex + 1, endIndex)
+    }
+  }
+  const notes = selectedLines
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#'))
     .slice(0, 20)
@@ -129,7 +148,7 @@ async function buildManifest(options) {
       Object.entries(files).map(([key, file]) => [key, `${versionRoot}/${encodeURIComponent(file.filename)}`])
     ),
     sha256: Object.fromEntries(Object.entries(files).map(([key, file]) => [key, file.sha256])),
-    notes: readNotes(options.notesFile ? resolve(options.notesFile) : join(projectRoot, 'release-notes.txt')),
+    notes: readNotes(options.notesFile ? resolve(options.notesFile) : join(projectRoot, 'release-notes.txt'), version),
     force: options.force === true
   }
   manifest.signature = signManifest(
