@@ -10,7 +10,8 @@ export interface LicenseVaultContents {
 }
 
 interface DeviceVaultContents {
-  machineSeed: string
+  machineSeed?: string
+  machineCode?: string
 }
 
 const LICENSE_VAULT_FILE = 'license-vault.bin'
@@ -121,9 +122,35 @@ export function getOrCreateFallbackMachineSeed(): string {
   const current = readEncryptedJson<Record<string, unknown>>(DEVICE_VAULT_FILE)
   const existing = cleanSecret(current?.machineSeed, 256)
   if (existing) return existing
-  const created: DeviceVaultContents = { machineSeed: randomBytes(32).toString('base64url') }
+  const machineSeed = randomBytes(32).toString('base64url')
+  const created: DeviceVaultContents = {
+    machineSeed,
+    machineCode: cleanMachineCode(current?.machineCode)
+  }
   writeEncryptedJson(DEVICE_VAULT_FILE, created)
-  return created.machineSeed
+  return machineSeed
+}
+
+function cleanMachineCode(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  return /^[a-f0-9]{32}$/.test(normalized) ? normalized : undefined
+}
+
+export function readStoredMachineCode(): string | null {
+  const current = readEncryptedJson<Record<string, unknown>>(DEVICE_VAULT_FILE)
+  return cleanMachineCode(current?.machineCode) || null
+}
+
+export function writeStoredMachineCode(machineCode: string): void {
+  const normalized = cleanMachineCode(machineCode)
+  if (!normalized) throw new Error('Machine code is invalid.')
+  const current = readEncryptedJson<Record<string, unknown>>(DEVICE_VAULT_FILE)
+  const next: DeviceVaultContents = {
+    machineSeed: cleanSecret(current?.machineSeed, 256),
+    machineCode: normalized
+  }
+  writeEncryptedJson(DEVICE_VAULT_FILE, next)
 }
 
 export function getLicenseVaultPaths(): string[] {

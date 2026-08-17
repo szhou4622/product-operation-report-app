@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import type {
+  ActivationResult,
   AppSettings,
   CostOptimizationEvent,
   ChatMessage,
@@ -42,9 +43,12 @@ import {
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
+  revalidateSavedActivationCode,
   revealCurrentActivationCode,
   redeemPointsWithCode
 } from './activation'
+import { buildActivationDiagnostic } from './activationDiagnostics'
+import { ExclusiveOperationGate } from './exclusiveOperationGate'
 import { readBundledSopRules } from './sopRules'
 import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
 import {
@@ -96,6 +100,7 @@ if (developmentUserDataDir) app.setPath('userData', resolve(developmentUserDataD
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
 let hardExitTimer: ReturnType<typeof setTimeout> | null = null
+const activationOperationGate = new ExclusiveOperationGate()
 const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -386,14 +391,41 @@ ipcMain.handle('activation:refresh', async () => {
   broadcastAuthorization(status)
   return status
 })
-ipcMain.handle('activation:activate', async (_e, code: string) => {
-  const result = await activateWithCode(code)
-  if (result.ok) {
-    clearAiProxySession()
+async function runActivationOperation(operation: () => Promise<ActivationResult>): Promise<ActivationResult> {
+  return activationOperationGate.run(async () => {
+    const result = await operation()
+    if (result.ok) clearAiProxySession()
+    if (!result.status.activated) clearAiProxySession()
     broadcastAuthorization(result.status)
+    return result
+  }, () => ({
+    ok: false,
+    message: '正在处理上一次激活，请稍候。',
+    status: getActivationStatus()
+  }))
+}
+ipcMain.handle('activation:activate', async (_e, code: unknown) => {
+  if (typeof code !== 'string' || code.length > 512) {
+    return { ok: false, message: '激活码格式不正确。', status: getActivationStatus() }
   }
-  return result
+  return runActivationOperation(() => activateWithCode(code))
 })
+ipcMain.handle('activation:revalidate-saved', async () => {
+  return runActivationOperation(() => revalidateSavedActivationCode())
+})
+ipcMain.handle('activation:diagnostics:copy', () => {
+  const diagnostic = buildActivationDiagnostic(
+    getActivationStatus(),
+    app.getVersion(),
+    `${process.platform}-${process.arch}`
+  )
+  clipboard.writeText(diagnostic)
+  return { ok: true, message: '设备诊断信息已复制，可直接发给管理员。' }
+})
+/*
+ * Code reveal/copy remains deliberately separate from diagnostics. The full
+ * activation code only crosses IPC after an explicit user reveal action.
+ */
 ipcMain.handle('activation:code:reveal', () => revealCurrentActivationCode())
 ipcMain.handle('activation:code:copy', () => {
   const result = revealCurrentActivationCode()

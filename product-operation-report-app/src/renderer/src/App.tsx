@@ -93,6 +93,7 @@ export default function App(): JSX.Element {
   const [pointsWallet, setPointsWallet] = useState<PointsWalletStatus | null>(null)
   const [activationCode, setActivationCode] = useState('')
   const [activationError, setActivationError] = useState('')
+  const [activationActionNotice, setActivationActionNotice] = useState('')
   const [activationBusy, setActivationBusy] = useState(false)
   const [privacySaving, setPrivacySaving] = useState(false)
   const [privacyError, setPrivacyError] = useState('')
@@ -122,7 +123,11 @@ export default function App(): JSX.Element {
   const checkActivation = async (): Promise<void> => {
     setActivationLoadError('')
     try {
-      setActivationStatus(await window.api.getActivationStatus())
+      const local = await window.api.getActivationStatus()
+      const status = local.source === 'server'
+        ? await window.api.refreshActivationStatus()
+        : local
+      setActivationStatus(status)
     } catch (error) {
       setActivationLoadError(friendlyUiError(error, '读取激活状态失败，请重试。'))
     }
@@ -147,7 +152,13 @@ export default function App(): JSX.Element {
     }
   }, [])
 
-  useEffect(() => window.api.onActivationStatusChanged(setActivationStatus), [])
+  useEffect(() => window.api.onActivationStatusChanged((status) => {
+    setActivationStatus(status)
+    if (status.activated) {
+      setActivationError('')
+      setActivationActionNotice('')
+    }
+  }), [])
   useEffect(() => window.api.onPointsWalletChanged(setPointsWallet), [])
 
   useEffect(() => {
@@ -159,7 +170,7 @@ export default function App(): JSX.Element {
   }, [activationStatus?.activated, activationStatus?.licenseId])
 
   useEffect(() => {
-    if (!activationStatus?.activated || activationStatus.source !== 'server') return
+    if (activationStatus?.source !== 'server') return
     let disposed = false
     const refreshAuthorization = async (): Promise<void> => {
       if (activationRefreshInFlight.current) return
@@ -190,7 +201,7 @@ export default function App(): JSX.Element {
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId])
+  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId, activationStatus?.bindingStatus])
 
   useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
 
@@ -408,6 +419,7 @@ export default function App(): JSX.Element {
     if (activationBusy) return
     setActivationBusy(true)
     setActivationError('')
+    setActivationActionNotice('')
     try {
       const result = await window.api.activate(activationCode)
       if (!result.ok) {
@@ -418,6 +430,50 @@ export default function App(): JSX.Element {
       setActivationError(friendlyUiError(error, '激活失败，请重试。'))
     } finally {
       setActivationBusy(false)
+    }
+  }
+
+  const revalidateSavedActivation = async (): Promise<void> => {
+    if (activationBusy) return
+    setActivationBusy(true)
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const result = await window.api.revalidateSavedActivationCode()
+      setActivationStatus(result.status)
+      if (!result.ok) setActivationError(result.message)
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '重新验证失败，请检查网络后重试。'))
+    } finally {
+      setActivationBusy(false)
+    }
+  }
+
+  const refreshActivationEntry = async (): Promise<void> => {
+    if (activationBusy) return
+    setActivationBusy(true)
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const status = await window.api.refreshActivationStatus()
+      setActivationStatus(status)
+      if (!status.activated) setActivationActionNotice('已重新检测授权状态。')
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '暂时无法检测授权状态，请稍后重试。'))
+    } finally {
+      setActivationBusy(false)
+    }
+  }
+
+  const copyActivationDiagnostics = async (): Promise<void> => {
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const result = await window.api.copyActivationDiagnostics()
+      if (result.ok) setActivationActionNotice(result.message)
+      else setActivationError(result.message)
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '复制诊断信息失败，请重试。'))
     }
   }
 
@@ -547,8 +603,22 @@ export default function App(): JSX.Element {
             <ProductLogo />
           </div>
           <div className="activation-kicker">产品与内容经营报告系统</div>
-          <h1>首次使用需要激活</h1>
-          <p>请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。</p>
+          <h1>{activationStatus.activationCodeAvailable ? '重新验证授权' : '首次使用需要激活'}</h1>
+          <p>
+            {activationStatus.activationCodeAvailable
+              ? '本机已安全保存原激活码，可以直接重新验证；也可以输入管理员新发的主激活码。'
+              : '请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。'}
+          </p>
+          {activationStatus.activationCodeAvailable && (
+            <button
+              type="button"
+              className="btn activation-saved-code"
+              onClick={() => void revalidateSavedActivation()}
+              disabled={activationBusy}
+            >
+              使用已保存的原激活码{activationStatus.maskedActivationCode ? `（${activationStatus.maskedActivationCode}）` : ''}
+            </button>
+          )}
           <label className="activation-field">
             <span>激活码</span>
             <input
@@ -564,12 +634,25 @@ export default function App(): JSX.Element {
             />
           </label>
           <div className="activation-device">
-            <span>当前设备码</span>
-            <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+            <div className="activation-device-info">
+              <span>当前设备码</span>
+              <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+            </div>
+            <button type="button" className="activation-device-copy" onClick={() => void copyActivationDiagnostics()}>
+              复制诊断信息
+            </button>
           </div>
-          <div className="activation-note">如果激活遇到问题，把设备码发给管理员即可。</div>
-          {activationStatus.message && (
+          <div className="activation-entry-actions">
+            <button type="button" onClick={() => void refreshActivationEntry()} disabled={activationBusy}>
+              重新检测授权状态
+            </button>
+          </div>
+          <div className="activation-note">如果激活遇到问题，复制诊断信息发给管理员即可。</div>
+          {activationStatus.message && !activationError && !activationActionNotice && (
             <div className="activation-notice" role="status">{activationStatus.message}</div>
+          )}
+          {activationActionNotice && !activationError && (
+            <div className="activation-notice" role="status">{activationActionNotice}</div>
           )}
           {activationError && <div className="activation-error">{activationError}</div>}
           <button className="btn primary activation-submit" disabled={activationBusy}>

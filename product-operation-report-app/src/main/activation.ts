@@ -24,7 +24,9 @@ import {
   clearLicenseVault,
   getOrCreateFallbackMachineSeed,
   readLicenseVault,
+  readStoredMachineCode,
   writeLicenseVault,
+  writeStoredMachineCode,
   type LicenseVaultContents
 } from './licenseVault'
 
@@ -32,9 +34,9 @@ const LICENSE_PROTOCOL_VERSION = 2
 const ACTIVATION_FILE = (): string => join(app.getPath('userData'), 'activation.json')
 const ACTIVATION_BACKUP_FILE = (): string => `${ACTIVATION_FILE()}.bak`
 const CODE_NAMESPACE = 'product-operation-report:activation:v1:'
-// Keep the released v0.2.6-v0.3.5 machine-code algorithm stable. Changing this
-// namespace or the system-id kind would make the same computer look like a new
-// device to the license server.
+// v0.3.5 briefly shipped the v2 namespace. Both results are recognized below,
+// then the selected machine code is kept in the OS-encrypted device vault so a
+// restart, upgrade or local authorization reset cannot silently change it.
 const DEVICE_NAMESPACE = 'product-operation-report:device:v1:'
 const TRANSITIONAL_DEVICE_NAMESPACE = 'product-operation-report:device:v2:'
 const OLD_DEVICE_NAMESPACE = DEVICE_NAMESPACE
@@ -91,6 +93,7 @@ interface ServerLicense {
   unavailable: boolean
   unauthorized: boolean
   contractInvalid?: boolean
+  credentialRefreshRequired?: boolean
   message: string
   licenseId?: string
   licenseType: 'credits' | 'unlimited' | 'standard'
@@ -217,7 +220,24 @@ export function getDeviceId(): string {
     getLegacyDeviceId(),
     getTransitionalDeviceId()
   ].filter(Boolean))
-  cachedDeviceId = stored && compatibleIds.has(stored.deviceId) ? stored.deviceId : canonicalDeviceId
+  const vaultedDeviceId = readStoredMachineCode()
+  cachedDeviceId = stored && compatibleIds.has(stored.deviceId)
+    ? stored.deviceId
+    : vaultedDeviceId && compatibleIds.has(vaultedDeviceId)
+      ? vaultedDeviceId
+      : canonicalDeviceId
+
+  // Keep device identity independent from activation credentials. Unbinding
+  // clears license-vault.bin, but deliberately leaves device-vault.bin intact.
+  if (vaultedDeviceId !== cachedDeviceId) {
+    try {
+      writeStoredMachineCode(cachedDeviceId)
+    } catch {
+      // A hardware-derived id remains deterministic even if the operating
+      // system credential store is temporarily unavailable. Credential writes
+      // still fail closed later during activation.
+    }
+  }
   return cachedDeviceId
 }
 
@@ -511,6 +531,36 @@ function maskedStoredActivationCode(record: StoredActivation): string | undefine
   return record.maskedActivationCode
 }
 
+function savedCodeRecoveryStatus(deviceId = getDeviceId(), message?: string): ActivationStatus {
+  const savedCode = readLicenseVault()?.activationCode
+  const base = toStatus(null, deviceId)
+  if (!savedCode) return { ...base, message }
+  return {
+    ...base,
+    activationCodeAvailable: true,
+    maskedActivationCode: maskActivationCode(savedCode),
+    requiresRevalidation: true,
+    message: message || '检测到本机已安全保存的原激活码，可以直接重新验证。'
+  }
+}
+
+function friendlyActivationFailure(message: string): string {
+  const normalized = message.trim()
+  if (/credential_refresh|旧授权首次升级设备凭证/i.test(normalized)) {
+    return '检测到旧版授权，但自动升级没有完成。请检查网络后重试；仍失败时把设备码发给管理员。'
+  }
+  if (/当前电脑已有主激活码|合并积分前必须明确确认|confirm_merge/i.test(normalized)) {
+    return '这台电脑已有主激活码。请使用已保存的原激活码进入；新积分码请进入软件后在积分页面充值。'
+  }
+  if (/device_session|device_credential|设备凭证丢失|不能覆盖已有凭证/i.test(normalized)) {
+    return '本机授权凭证需要重新验证。请使用已保存的原激活码重试，或把设备码发给管理员。'
+  }
+  if (/\/api\/license\//i.test(normalized)) {
+    return '授权服务暂时无法完成当前操作，请稍后重试；仍失败时把设备码发给管理员。'
+  }
+  return normalized || '激活失败，请检查激活码和网络后重试。'
+}
+
 function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): ActivationStatus {
   const common = {
     deviceId,
@@ -586,7 +636,19 @@ function parseServerLicense(
         : `授权校验失败（${httpStatus}）。`
   const message = normalizeMessage(body.message ?? body.error ?? body.detail, fallback)
   if (httpStatus < 200 || httpStatus >= 300 || body.ok !== true) {
-    return { ok: false, unavailable, unauthorized, message, licenseType: 'standard', unlimited: false }
+    const errorCode = asString(body.error_code ?? body.code, 128)?.toLowerCase()
+    const credentialRefreshRequired =
+      errorCode === 'credential_refresh_required' ||
+      /credential_refresh\s*=\s*true/i.test(message)
+    return {
+      ok: false,
+      unavailable,
+      unauthorized,
+      credentialRefreshRequired,
+      message,
+      licenseType: 'standard',
+      unlimited: false
+    }
   }
   const selected = selectServerLicensePayload(body)
   if (selected.conflict || !selected.payload) {
@@ -844,9 +906,19 @@ function entitlementRecord(
 export function getActivationStatus(): ActivationStatus {
   const deviceId = getDeviceId()
   const stored = readStoredActivation()
-  if (!stored || !recordMatchesDevice(stored, deviceId)) return toStatus(null, deviceId)
+  if (!stored || !recordMatchesDevice(stored, deviceId)) return savedCodeRecoveryStatus(deviceId)
   if (stored.version === 1) return toStatus(migrateRecordDevice(stored, deviceId), deviceId)
   return toStatus(prepareServerRecord(stored, deviceId).record, deviceId)
+}
+
+/** Revalidate a securely stored primary code without exposing it to the renderer. */
+export async function revalidateSavedActivationCode(): Promise<ActivationResult> {
+  const code = readLicenseVault()?.activationCode
+  if (!code) {
+    const status = getActivationStatus()
+    return { ok: false, message: '本机没有已保存的原激活码，请手动输入管理员发放的激活码。', status }
+  }
+  return activateWithCode(code)
 }
 
 export function revealCurrentActivationCode(): ActivationCodeAccessResult {
@@ -905,6 +977,13 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     writeStoredActivation(updated)
     serverValidatedThisRun = false
     return toStatus(updated, deviceId)
+  }
+  if ((!vault.deviceCredential || !vault.deviceSession) && (current.bindingStatus === 'unbound' || current.revokedReason)) {
+    // A background status refresh must never rebind a device. Once credentials
+    // are revoked, only the user's explicit saved-code or manual activation
+    // action may call /activate again.
+    serverValidatedThisRun = false
+    return toStatus(current, deviceId)
   }
   const result = vault.deviceCredential && vault.deviceSession
     ? await requestServerDeviceStatus(deviceId, current.licenseId, vault.deviceCredential, vault.deviceSession)
@@ -1030,13 +1109,21 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   if (currentStatus.activated && existing && !samePrimary) {
     return { ok: false, message: '当前电脑已有主激活码；新增积分请使用“充值积分”。', status: currentStatus }
   }
-  const result = await requestServerActivation(enteredCode, deviceId, samePrimary ? {
+  let result = await requestServerActivation(enteredCode, deviceId, samePrimary ? {
     currentCodeId: existing?.record.licenseId,
     credentialRefresh: true,
     deviceCredential: existing?.vault?.deviceCredential,
     deviceSession: existing?.vault?.deviceSession
   } : {})
-  if (!result.ok) return { ok: false, message: result.message, status: currentStatus }
+  if (!result.ok && result.credentialRefreshRequired && !samePrimary) {
+    // A historical server binding can outlive a lost or superseded local
+    // summary. Retry only when the authorization service explicitly requires
+    // the v2 credential-upgrade flag; never opt into balance merging here.
+    result = await requestServerActivation(enteredCode, deviceId, {
+      credentialRefresh: true
+    })
+  }
+  if (!result.ok) return { ok: false, message: friendlyActivationFailure(result.message), status: currentStatus }
   if (result.action === 'balance_merged') {
     return {
       ok: false,
@@ -1052,15 +1139,26 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   if (!credential || !session) {
     return { ok: false, message: '服务器没有返回完整的设备会话和设备凭证，本次未写入授权。', status: currentStatus }
   }
+  let credentialsSaved = false
   try {
     writeLicenseVault({ activationCode: enteredCode, deviceCredential: credential, deviceSession: session })
+    credentialsSaved = true
     const record = entitlementRecord(samePrimary ? existing?.record || null : null, enteredCode, deviceId, result)
     writeStoredActivation(record)
     serverValidatedThisRun = true
     const status = toStatus(record, deviceId)
     return { ok: true, message: result.message, status }
   } catch {
-    return { ok: false, message: '系统安全凭证存储不可用，本次没有保存激活结果。', status: currentStatus }
+    serverValidatedThisRun = false
+    if (credentialsSaved) {
+      const message = '服务器已接受激活，但本机授权状态保存未完成。请点击“使用已保存的原激活码”恢复，不会重复赠送积分。'
+      return { ok: false, message, status: savedCodeRecoveryStatus(deviceId, message) }
+    }
+    return {
+      ok: false,
+      message: '系统安全凭证存储不可用，本次没有保存激活结果。请把设备码发给管理员。',
+      status: currentStatus
+    }
   }
 }
 
@@ -1215,6 +1313,26 @@ export function getActivationFilePath(): string {
 
 export const activationInternals = {
   parseServerLicense,
+  compatibleDeviceIdsForTests(): string[] {
+    const systemId = getSystemMachineId()
+    const stableSeed = systemId || getOrCreateFallbackMachineSeed()
+    const kind = systemId
+      ? process.platform === 'win32'
+        ? 'windows-machine-guid'
+        : `${process.platform}-hardware-id`
+      : 'secure-random-device-seed'
+    return [
+      sha256(`${DEVICE_NAMESPACE}${kind}|${stableSeed}`).slice(0, 32),
+      getLegacyDeviceId(),
+      getTransitionalDeviceId()
+    ].filter(Boolean)
+  },
+  resetDeviceIdentityForTests(): void {
+    cachedSystemMachineId = undefined
+    cachedLegacyDeviceId = ''
+    cachedTransitionalDeviceId = ''
+    cachedDeviceId = ''
+  },
   resetRuntimeValidationForTests(): void {
     serverValidatedThisRun = false
   }

@@ -66,6 +66,11 @@ export interface ActivationCodeAccessResult {
   maskedCode?: string
 }
 
+export interface ActivationDiagnosticResult {
+  ok: boolean
+  message: string
+}
+
 export interface ActivationResult {
   ok: boolean
   message: string

@@ -19,10 +19,15 @@ import {
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
+  getDeviceId,
   LEGACY_ACTIVATION_POINTS,
+  revalidateSavedActivationCode,
   revealCurrentActivationCode,
   redeemPointsWithCode
 } from '../src/main/activation'
+import { writeLicenseVault } from '../src/main/licenseVault'
+import { buildActivationDiagnostic } from '../src/main/activationDiagnostics'
+import { ExclusiveOperationGate } from '../src/main/exclusiveOperationGate'
 import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
   getActiveProfile,
@@ -158,6 +163,245 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   const billingSnapshot = { ...snapshot(6, 'billing-id'), analysisSessionId: 'stable-billing-session' }
   await saveLastProject(billingSnapshot)
   assert.equal(loadLastProject()?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
+}
+
+async function testDeviceIdentityPersistsAcrossAuthorizationReset(): Promise<void> {
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const deviceVault = join(tempUserData, 'device-vault.bin')
+  const deviceVaultBackup = `${deviceVault}.bak`
+  const files = [
+    activationFile,
+    activationBackup,
+    licenseVault,
+    licenseVaultBackup,
+    deviceVault,
+    deviceVaultBackup
+  ]
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+    const compatible = activationInternals.compatibleDeviceIdsForTests()
+    const canonical = compatible[0]
+    const historical = compatible.find((deviceId) => deviceId !== canonical)
+    assert.ok(historical, 'the migration test requires a historical compatible machine code')
+
+    const historicalRecord = {
+      version: 3,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256').update('historical-device-code').digest('hex'),
+      deviceId: historical,
+      activatedAt: new Date().toISOString(),
+      licenseId: 'historical-device-license',
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 100,
+      bindingStatus: 'active'
+    }
+    writeFileSync(activationFile, JSON.stringify(historicalRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(historicalRecord), 'utf8')
+
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(getDeviceId(), historical, 'an existing server binding keeps its historical machine code')
+    assert.equal(existsSync(deviceVault), true, 'the selected machine code is persisted separately from authorization')
+
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(licenseVault, { force: true })
+    rmSync(licenseVaultBackup, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(
+      getDeviceId(),
+      historical,
+      'clearing or unbinding authorization must not change the physical device identity'
+    )
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(getDeviceId(), historical, 'a simulated application restart keeps the same machine code')
+  } finally {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+  }
+}
+
+async function testHistoricalCredentialRefreshRetry(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const files = [activationFile, activationBackup, licenseVault, licenseVaultBackup]
+  const enteredCode = 'HISTORICAL-CREDENTIAL-REFRESH-CODE'
+  const requestBodies: Record<string, unknown>[] = []
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const deviceId = getDeviceId()
+    const staleRecord = {
+      version: 3,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256').update('different-stale-local-code').digest('hex'),
+      deviceId,
+      activatedAt: new Date().toISOString(),
+      licenseId: 'stale-local-license',
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 20,
+      bindingStatus: 'active',
+      requiresRevalidation: true,
+      revokedReason: '设备凭证已失效，请重新输入原激活码验证。',
+      serverMessage: '设备凭证已失效，请重新输入原激活码验证。'
+    }
+    writeFileSync(activationFile, JSON.stringify(staleRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(staleRecord), 'utf8')
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      requestBodies.push(body)
+      if (requestBodies.length === 1) {
+        return new Response(JSON.stringify({
+          ok: false,
+          error_code: 'credential_refresh_required',
+          error: '旧授权首次升级设备凭证时必须设置 credential_refresh=true。'
+        }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'recovered-historical-license',
+        license_type: 'credits',
+        remaining_credits: 100,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: deviceId,
+        device_credential: 'recovered-device-credential',
+        device_session: 'recovered-device-session',
+        message: '历史授权凭证升级成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const recovered = await activateWithCode(enteredCode)
+    assert.equal(recovered.ok, true, 'an explicit server credential-upgrade requirement is retried once')
+    assert.equal(requestBodies.length, 2)
+    assert.equal(requestBodies[0].credential_refresh, undefined)
+    assert.equal(requestBodies[1].credential_refresh, true)
+    assert.equal(requestBodies[1].confirm_merge, undefined, 'credential recovery must never opt into points merging')
+    assert.equal(requestBodies[1].current_code_id, undefined, 'a mismatched stale local id must not be asserted as authority')
+    assert.equal(recovered.status.licenseId, 'recovered-historical-license')
+    assert.equal(revealCurrentActivationCode().activationCode, enteredCode)
+
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    let genericFailureCalls = 0
+    globalThis.fetch = (async () => {
+      genericFailureCalls += 1
+      return new Response(JSON.stringify({ ok: false, error: '激活码无效' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as typeof fetch
+    const rejected = await activateWithCode('INVALID-NON-HISTORICAL-CODE')
+    assert.equal(rejected.ok, false)
+    assert.equal(genericFailureCalls, 1, 'ordinary activation failures must not be retried as credential upgrades')
+
+    let technicalFailureCalls = 0
+    globalThis.fetch = (async () => {
+      technicalFailureCalls += 1
+      return new Response(JSON.stringify({
+        ok: false,
+        error_code: 'credential_refresh_required',
+        error: '旧授权首次升级设备凭证时必须设置 credential_refresh=true。'
+      }), { status: 400, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const friendlyFailure = await activateWithCode('TECHNICAL-ERROR-REDACTION-CODE')
+    assert.equal(friendlyFailure.ok, false)
+    assert.equal(technicalFailureCalls, 2, 'the controlled credential refresh is attempted only once')
+    assert.doesNotMatch(friendlyFailure.message, /credential_refresh|\/api\/license/i)
+    assert.match(friendlyFailure.message, /旧版授权|设备码/)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testSavedActivationRecovery(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const files = [activationFile, activationBackup, licenseVault, licenseVaultBackup]
+  const savedCode = 'SAVED-PRIMARY-RECOVERY-CODE'
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    writeLicenseVault({ activationCode: savedCode })
+    const waiting = getActivationStatus()
+    assert.equal(waiting.activated, false)
+    assert.equal(waiting.activationCodeAvailable, true, 'an orphaned secure code must remain recoverable')
+    assert.equal(waiting.requiresRevalidation, true)
+    assert.equal(waiting.maskedActivationCode?.includes('SAVE'), true)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: true,
+      app_name: 'ProductOperationReport',
+      code_id: 'saved-recovery-primary',
+      license_type: 'credits',
+      remaining_credits: 80,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: getDeviceId(),
+      device_credential: 'saved-recovery-credential',
+      device_session: 'saved-recovery-session',
+      message: '重新验证成功'
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+
+    const recovered = await revalidateSavedActivationCode()
+    assert.equal(recovered.ok, true)
+    assert.equal(recovered.status.activated, true)
+    assert.equal(recovered.status.creditsRemaining, 80)
+    assert.equal('activationCode' in recovered, false, 'the saved code must not be returned to the renderer')
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testActivationAdmissionAndSafeDiagnostics(): Promise<void> {
+  const gate = new ExclusiveOperationGate()
+  let releaseFirst: (() => void) | undefined
+  const first = gate.run(
+    () => new Promise<string>((resolve) => { releaseFirst = () => resolve('first') }),
+    () => 'unexpected-busy'
+  )
+  const duplicate = await gate.run(async () => 'duplicate-ran', () => 'busy')
+  assert.equal(duplicate, 'busy', 'a second activation operation must be rejected before it can run')
+  releaseFirst?.()
+  assert.equal(await first, 'first')
+  assert.equal(await gate.run(async () => 'next', () => 'busy'), 'next', 'the gate releases after completion')
+
+  const diagnostic = buildActivationDiagnostic({
+    activated: false,
+    deviceId: 'b38301cafa771234567890abcdef1234',
+    activationCodeAvailable: true,
+    maskedActivationCode: 'PRO-••••-SECRET',
+    codeCount: 1,
+    appName: 'ProductOperationReport',
+    unlimited: false,
+    offline: false,
+    requiresRevalidation: true,
+    licenseId: 'private-license-id',
+    message: 'server echoed PRO-REAL-ACTIVATION-CODE'
+  }, '0.3.6', 'win32-x64', '2026-08-17T00:00:00.000Z')
+  assert.match(diagnostic, /B38301CAFA77/)
+  assert.doesNotMatch(diagnostic, /SECRET|private-license|REAL-ACTIVATION|PRO-/i)
 }
 
 async function testActivationAndSettingsBackup(): Promise<void> {
@@ -3684,6 +3928,14 @@ async function testHtmlReportRenderer(): Promise<void> {
 async function run(): Promise<void> {
   console.log('Regression: project persistence')
   await testProjectRevisionAndBackup()
+  console.log('Regression: device identity survives restart and authorization reset')
+  await testDeviceIdentityPersistsAcrossAuthorizationReset()
+  console.log('Regression: historical authorization credential-upgrade retry')
+  await testHistoricalCredentialRefreshRetry()
+  console.log('Regression: securely saved activation recovery')
+  await testSavedActivationRecovery()
+  console.log('Regression: activation single-flight and safe diagnostics')
+  await testActivationAdmissionAndSafeDiagnostics()
   console.log('Regression: activation and settings backup')
   await testActivationAndSettingsBackup()
   console.log('Regression: server activation, offline grace and idempotent credits')

@@ -5,6 +5,7 @@ import type {
   ActivationResult,
   ActivationDeactivationResult,
   ActivationCodeAccessResult,
+  ActivationDiagnosticResult,
   ActivationStatus,
   ChatMessage,
   ChatStreamEvent,
@@ -65,6 +66,12 @@ const api = {
 
   copyActivationCode: (): Promise<ActivationCodeAccessResult> =>
     ipcRenderer.invoke('activation:code:copy'),
+
+  revalidateSavedActivationCode: (): Promise<ActivationResult> =>
+    ipcRenderer.invoke('activation:revalidate-saved'),
+
+  copyActivationDiagnostics: (): Promise<ActivationDiagnosticResult> =>
+    ipcRenderer.invoke('activation:diagnostics:copy'),
 
   deactivateCurrentDevice: (): Promise<ActivationDeactivationResult> =>
     ipcRenderer.invoke('activation:deactivate'),

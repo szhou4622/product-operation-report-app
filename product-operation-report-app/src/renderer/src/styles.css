@@ -2874,9 +2874,44 @@ body.resizing .pane-resizer {
   font-size: 12px;
 }
 
+.activation-device-info {
+  display: grid;
+  gap: 3px;
+}
+
 .activation-device b {
   color: #0f172a;
   font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+}
+
+.activation-device-copy,
+.activation-entry-actions button {
+  border: 0;
+  background: transparent;
+  color: #2563eb;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.activation-device-copy:hover,
+.activation-entry-actions button:hover {
+  text-decoration: underline;
+}
+
+.activation-entry-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.activation-saved-code {
+  width: 100%;
+  min-height: 42px;
+  margin-bottom: 16px;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
 }
 
 .activation-error {
