@@ -10,7 +10,8 @@ import type {
 } from '../shared/types'
 
 const SETTINGS_REQUEST_TIMEOUT_MS = 20_000
-const STREAM_REQUEST_TIMEOUT_MS = 180_000
+const STREAM_IDLE_TIMEOUT_MS = 90_000
+const STREAM_ABSOLUTE_TIMEOUT_MS = 15 * 60_000
 const MAX_SETTINGS_RESPONSE_BYTES = 2 * 1024 * 1024
 const MAX_ERROR_RESPONSE_BYTES = 16 * 1024
 const MAX_MODEL_OUTPUT_CHARS = 2_000_000
@@ -276,6 +277,24 @@ export async function chatStream(
 ): Promise<void> {
   let full = ''
   let latestUsage: ModelTokenUsage | undefined
+  let timeoutReason: 'idle' | 'absolute' | undefined
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  const requestController = new AbortController()
+  const armIdleTimeout = (): void => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      timeoutReason = 'idle'
+      requestController.abort()
+    }, STREAM_IDLE_TIMEOUT_MS)
+  }
+  const absoluteTimer = setTimeout(() => {
+    timeoutReason = 'absolute'
+    requestController.abort()
+  }, STREAM_ABSOLUTE_TIMEOUT_MS)
+  const abortFromCaller = (): void => requestController.abort(signal?.reason)
+  if (signal?.aborted) abortFromCaller()
+  else signal?.addEventListener('abort', abortFromCaller, { once: true })
+  armIdleTimeout()
   const finalUsage = (): ModelTokenUsage => latestUsage || missingUsage(profile.model)
   const emitUsage = (raw: unknown, responseModel?: unknown): void => {
     const model = typeof responseModel === 'string' && responseModel ? responseModel : profile.model
@@ -287,8 +306,6 @@ export async function chatStream(
   const emitError = (message: string): void => onEvent({ type: 'error', message, usage: finalUsage() })
   const emitDone = (): void => onEvent({ type: 'done', full, usage: finalUsage() })
   try {
-    const timeoutSignal = AbortSignal.timeout(STREAM_REQUEST_TIMEOUT_MS)
-    const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
     const request = (withReasoningEffort: boolean): Promise<Response> => fetch(endpoint(profile.baseURL), {
       method: 'POST',
       headers: {
@@ -306,12 +323,15 @@ export async function chatStream(
           ? { reasoning_effort: policy.reasoningEffort }
           : {})
       }),
-      signal: requestSignal
+      signal: requestController.signal
     })
     let res = await request(Boolean(policy?.reasoningEffort))
+    armIdleTimeout()
     if (!res.ok && policy?.reasoningEffort && (res.status === 400 || res.status === 422)) {
       await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
+      armIdleTimeout()
       res = await request(false)
+      armIdleTimeout()
     }
 
     if (!res.ok) {
@@ -434,6 +454,7 @@ export async function chatStream(
     }
     // Node fetch 的 body 是异步可迭代的字节流
     for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      armIdleTimeout()
       buffer += decoder.decode(chunk, { stream: true })
       if (buffer.length > MAX_SSE_EVENT_CHARS) {
         emitError('模型返回的单段数据异常过长，本次结果未保存。请重试。')
@@ -462,13 +483,19 @@ export async function chatStream(
       return
     }
     const msg = e instanceof Error ? e.message : String(e)
-    if (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
-      emitError('模型长时间没有响应，已自动停止。请检查网络后重试。')
+    if (timeoutReason || (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError'))) {
+      emitError(timeoutReason === 'absolute'
+        ? '本次模型任务已运行超过15分钟，为保护资料和费用已自动停止。请重试未完成的步骤。'
+        : '模型连续90秒没有返回数据，已自动停止。请检查网络后重试。')
       return
     }
     const hint = /fetch failed|ECONNRESET|socket|terminated|network/i.test(msg)
       ? '（连接中断，常见原因是请求过大——截图太多/太大。截图已自动压缩，可减少截图数量或重试；也可能是中转端点不稳定。）'
       : ''
     emitError(msg + hint)
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer)
+    clearTimeout(absoluteTimer)
+    signal?.removeEventListener('abort', abortFromCaller)
   }
 }

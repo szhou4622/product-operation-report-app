@@ -1,5 +1,6 @@
 import Papa from 'papaparse'
 import type { SourceCleanCacheInput } from '../../shared/types'
+import { sourceEvidenceId, sourceEvidenceScope } from './sourceCleanBatches'
 
 const TABLE_PREPROCESS_THRESHOLD = 15_000
 const LOCAL_TABLE_MAX_CHARS = 12_000
@@ -31,9 +32,10 @@ const fallbackResult = (text: string, originalRows = 0): TablePreprocessResult =
 })
 
 function cleanCell(value: unknown, header = ''): string {
-  const raw = String(value ?? '').replace(/\u0000/gu, '').trim()
-  const limit = /文案|脚本|内容|备注/u.test(header) ? 2_000 : 1_200
-  return raw.length > limit ? `${raw.slice(0, limit)}…（单元格已截断）` : raw
+  void header
+  // 单元格长度无法预先假定：链接、脚本、评价、JSON 等都可能很长。
+  // 这里只清除 NUL 和首尾空白，不截断；后续统一由动态分批控制请求大小。
+  return String(value ?? '').replace(/\u0000/gu, '').trim()
 }
 
 function numericValue(value: string): number | null {
@@ -77,15 +79,9 @@ function parsedRows(text: string): string[][] | null {
     rows.some((row) => Boolean(row[index]?.trim()))
   )
   const compact = rows.map((row) => activeColumns.map((index) => row[index] || ''))
-  const [header, ...body] = compact
-  const seen = new Set<string>()
-  const uniqueBody = body.filter((row) => {
-    const key = JSON.stringify(row)
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
-  return [header, ...uniqueBody]
+  // 两行内容完全相同也可能代表两次成交、两条素材或两次评价，不能仅凭相同文本判定为重复。
+  // 保留全部非空数据行，把是否重复交给后续分析显式说明。
+  return compact
 }
 
 function uselessGeneratedColumn(header: string): boolean {
@@ -318,16 +314,25 @@ export function buildLocalTableCleanDetail(
   const platform = metadataValue(source.platform, '需补充')
   const purpose = metadataValue(source.purpose, '结构化表格数据')
   const note = source.note?.trim() ? `\n用户补充：${source.note.trim()}` : ''
+  const rows = parsedRows(result.text)
+  if (!rows || rows.length < 2) return null
+  const [headers, ...body] = rows
+  const scope = sourceEvidenceScope(source)
+  const evidenceTable = Papa.unparse([
+    ['__证据ID', ...headers],
+    ...body.map((row, index) => [sourceEvidenceId('R', scope, index + 1), ...row])
+  ], { newline: '\n' })
   const detail = [
-    `分类：${attribution} | ${platform} | ${purpose} | 需从表格字段确认 | 表格 | 已在本机完成空行、空列与重复行清理，共 ${result.retainedRows} 条有效记录`,
+    `分类：${attribution} | ${platform} | ${purpose} | 需从表格字段确认 | 表格 | 已在本机完成空白行列整理，共 ${result.retainedRows} 条有效记录`,
     '',
     '## 清洗后内容',
     `来源文件：${source.name}`,
     '处理方式：本机高可信结构化清洗（未调用模型）',
     `来源归属：${attribution}；平台/来源：${platform}；信息类型：${purpose}${note}`,
+    `完整性核对：程序已逐行生成并核对 ${body.length} 个唯一证据ID。`,
     '以下内容只来自原表格；未出现的信息不得推测：',
     '',
-    result.text
+    evidenceTable
   ].join('\n')
   return detail.length <= LOCAL_TABLE_MAX_CHARS ? detail : null
 }

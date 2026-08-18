@@ -1,4 +1,5 @@
 import { app } from 'electron'
+import { createHash } from 'crypto'
 import {
   copyFileSync,
   existsSync,
@@ -7,15 +8,18 @@ import {
   renameSync,
   rmSync,
   statSync,
+  statfsSync,
   writeFileSync
 } from 'fs'
-import { copyFile, rename, rm, writeFile } from 'fs/promises'
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import type {
   ProjectCleanDetailSnapshot,
   ProjectMessageSnapshot,
   ProjectPhase,
+  ProjectStoragePreflight,
   ProjectSourceSnapshot,
+  ProjectTaskSnapshot,
   SavedProject
 } from '../shared/types'
 
@@ -39,6 +43,26 @@ const MESSAGE_KINDS = new Set<NonNullable<ProjectMessageSnapshot['kind']>>([
   'error'
 ])
 const MAX_PROJECT_FILE_BYTES = 200 * 1024 * 1024
+const MAX_PROJECT_MANIFEST_BYTES = 24 * 1024 * 1024
+const EXTERNAL_STRING_THRESHOLD = 64 * 1024
+const PROJECT_STORAGE_VERSION = 2
+
+interface ProjectBlobRef {
+  $blob: string
+  bytes: number
+}
+
+interface StoredProjectV2 extends PlainRecord {
+  storageVersion: 2
+  project: unknown
+}
+
+interface ProjectMetadata {
+  revision: number
+  updatedAt: string
+}
+
+const blobReferenceCache = new Map<string, { value: string; ref: ProjectBlobRef }>()
 
 function projectPath(): string {
   return join(app.getPath('userData'), PROJECT_FILE_NAME)
@@ -50,6 +74,202 @@ function backupPath(): string {
 
 function previousProjectPath(): string {
   return join(app.getPath('userData'), 'previous-project.json')
+}
+
+function blobDirectory(): string {
+  return join(app.getPath('userData'), 'project-data', 'blobs')
+}
+
+function blobPath(hash: string): string {
+  return join(blobDirectory(), `${hash}.txt`)
+}
+
+function isBlobRef(value: unknown): value is ProjectBlobRef {
+  if (!isPlainObject(value)) return false
+  return typeof value.$blob === 'string' && /^[a-f0-9]{64}$/u.test(value.$blob) &&
+    typeof value.bytes === 'number' && Number.isSafeInteger(value.bytes) && value.bytes >= 0
+}
+
+function stringBlobRef(value: string): ProjectBlobRef {
+  return {
+    $blob: createHash('sha256').update(value, 'utf8').digest('hex'),
+    bytes: Buffer.byteLength(value, 'utf8')
+  }
+}
+
+async function storeStringBlob(value: string, cacheKey: string, usedKeys: Set<string>): Promise<ProjectBlobRef> {
+  usedKeys.add(cacheKey)
+  const cached = blobReferenceCache.get(cacheKey)
+  const ref = cached?.value === value ? cached.ref : stringBlobRef(value)
+  const file = blobPath(ref.$blob)
+  if (!existsSync(file)) {
+    await mkdir(blobDirectory(), { recursive: true })
+    const temp = `${file}.tmp-${process.pid}-${Date.now()}`
+    try {
+      await writeFile(temp, value, { encoding: 'utf8', mode: 0o600 })
+      try {
+        await rename(temp, file)
+      } catch (error) {
+        if (!existsSync(file)) throw error
+      }
+    } finally {
+      if (existsSync(temp)) await rm(temp, { force: true })
+    }
+  }
+  blobReferenceCache.set(cacheKey, { value, ref })
+  return ref
+}
+
+function storeStringBlobSync(value: string, cacheKey: string, usedKeys: Set<string>): ProjectBlobRef {
+  usedKeys.add(cacheKey)
+  const cached = blobReferenceCache.get(cacheKey)
+  const ref = cached?.value === value ? cached.ref : stringBlobRef(value)
+  const file = blobPath(ref.$blob)
+  if (!existsSync(file)) {
+    mkdirSync(blobDirectory(), { recursive: true })
+    const temp = `${file}.sync-${process.pid}-${Date.now()}`
+    try {
+      writeFileSync(temp, value, { encoding: 'utf8', mode: 0o600 })
+      try {
+        renameSync(temp, file)
+      } catch (error) {
+        if (!existsSync(file)) throw error
+      }
+    } finally {
+      if (existsSync(temp)) rmSync(temp, { force: true })
+    }
+  }
+  blobReferenceCache.set(cacheKey, { value, ref })
+  return ref
+}
+
+function childCacheKey(parent: string, key: string | number, value: unknown): string {
+  if (isPlainObject(value) && typeof value.id === 'string' && value.id) return `${parent}/${key}:${value.id}`
+  return `${parent}/${key}`
+}
+
+async function externalizeValue(value: unknown, path: string, usedKeys: Set<string>): Promise<unknown> {
+  if (typeof value === 'string') {
+    return Buffer.byteLength(value, 'utf8') >= EXTERNAL_STRING_THRESHOLD
+      ? storeStringBlob(value, path, usedKeys)
+      : value
+  }
+  if (Array.isArray(value)) {
+    return Promise.all(value.map((item, index) => externalizeValue(item, childCacheKey(path, index, item), usedKeys)))
+  }
+  if (isPlainObject(value)) {
+    const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [
+      key,
+      await externalizeValue(item, childCacheKey(path, key, item), usedKeys)
+    ] as const))
+    return Object.fromEntries(entries)
+  }
+  return value
+}
+
+function externalizeValueSync(value: unknown, path: string, usedKeys: Set<string>): unknown {
+  if (typeof value === 'string') {
+    return Buffer.byteLength(value, 'utf8') >= EXTERNAL_STRING_THRESHOLD
+      ? storeStringBlobSync(value, path, usedKeys)
+      : value
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => externalizeValueSync(item, childCacheKey(path, index, item), usedKeys))
+  }
+  if (isPlainObject(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      externalizeValueSync(item, childCacheKey(path, key, item), usedKeys)
+    ]))
+  }
+  return value
+}
+
+async function hydrateValueAsync(value: unknown): Promise<unknown> {
+  if (isBlobRef(value)) {
+    const file = blobPath(value.$blob)
+    const info = await stat(file)
+    if (info.size !== value.bytes) throw new Error('项目资料块缺失或不完整。')
+    return readFile(file, 'utf8')
+  }
+  if (Array.isArray(value)) return Promise.all(value.map(hydrateValueAsync))
+  if (isPlainObject(value)) {
+    const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [
+      key,
+      await hydrateValueAsync(item)
+    ] as const))
+    return Object.fromEntries(entries)
+  }
+  return value
+}
+
+function pruneBlobReferenceCache(usedKeys: Set<string>): void {
+  for (const key of blobReferenceCache.keys()) {
+    if (!usedKeys.has(key)) blobReferenceCache.delete(key)
+  }
+}
+
+async function storedProject(snapshot: SavedProject): Promise<StoredProjectV2> {
+  const usedKeys = new Set<string>()
+  const project = await externalizeValue(snapshot, 'project', usedKeys)
+  pruneBlobReferenceCache(usedKeys)
+  return { storageVersion: PROJECT_STORAGE_VERSION, project }
+}
+
+function storedProjectSync(snapshot: SavedProject): StoredProjectV2 {
+  const usedKeys = new Set<string>()
+  const project = externalizeValueSync(snapshot, 'project', usedKeys)
+  pruneBlobReferenceCache(usedKeys)
+  return { storageVersion: PROJECT_STORAGE_VERSION, project }
+}
+
+function serializeManifest(value: StoredProjectV2): string {
+  const serialized = JSON.stringify(value, null, 2)
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_PROJECT_MANIFEST_BYTES) {
+    throw new Error('项目索引过大，无法安全保存。请把资料拆成两份分析后重试。')
+  }
+  return serialized
+}
+
+function estimatedSnapshotBytes(value: unknown): number {
+  if (typeof value === 'string') return Buffer.byteLength(value, 'utf8')
+  if (typeof value === 'number' || typeof value === 'boolean') return 16
+  if (Array.isArray(value)) return value.reduce((sum, item) => sum + estimatedSnapshotBytes(item), 0)
+  if (isPlainObject(value)) {
+    return Object.entries(value).reduce(
+      (sum, [key, item]) => sum + Buffer.byteLength(key, 'utf8') + estimatedSnapshotBytes(item),
+      0
+    )
+  }
+  return 0
+}
+
+export function preflightProjectStorage(project: SavedProject): ProjectStoragePreflight {
+  const snapshot = sanitizeProject(project)
+  const estimatedBytes = estimatedSnapshotBytes(snapshot)
+  try {
+    mkdirSync(app.getPath('userData'), { recursive: true })
+    const stats = statfsSync(app.getPath('userData'))
+    const availableBytes = Number(stats.bavail) * Number(stats.bsize)
+    const safetyReserve = Math.max(256 * 1024 * 1024, Math.ceil(estimatedBytes * 0.35))
+    const ok = Number.isFinite(availableBytes) && availableBytes >= estimatedBytes + safetyReserve
+    return {
+      ok,
+      message: ok
+        ? '项目可以安全保存和恢复。'
+        : '当前磁盘剩余空间不足以安全保存这批资料。请先清理磁盘空间，避免分析完成后无法恢复。',
+      estimatedBytes,
+      availableBytes
+    }
+  } catch {
+    return {
+      ok: estimatedBytes <= 512 * 1024 * 1024,
+      message: estimatedBytes <= 512 * 1024 * 1024
+        ? '项目容量检查完成。'
+        : '无法确认磁盘剩余空间，且本次资料较大。请先确保磁盘至少有1GB可用空间。',
+      estimatedBytes
+    }
+  }
 }
 
 function isPlainObject(value: unknown): value is PlainRecord {
@@ -95,7 +315,11 @@ function sanitizeSource(value: unknown): ProjectSourceSnapshot | null {
     platform: optionalString(value.platform),
     purpose: optionalString(value.purpose),
     note: optionalString(value.note),
-    size: optionalNumber(value.size)
+    size: optionalNumber(value.size),
+    topLevelId: optionalString(value.topLevelId),
+    derivedKind: ['archive-entry', 'embedded-image', 'rendered-page', 'converted-page'].includes(asString(value.derivedKind))
+      ? value.derivedKind as ProjectSourceSnapshot['derivedKind']
+      : undefined
   }
 }
 
@@ -135,6 +359,25 @@ function sanitizeArtifactRecord(value: unknown): Record<number, string> {
   return result
 }
 
+function sanitizeTaskJournal(value: unknown): Record<string, ProjectTaskSnapshot> {
+  if (!isPlainObject(value)) return {}
+  const allowedKinds = new Set<ProjectTaskSnapshot['kind']>(['parse', 'source_clean', 'summary', 'analysis_step', 'final_part'])
+  const allowedStatuses = new Set<ProjectTaskSnapshot['status']>(['complete', 'failed', 'interrupted'])
+  const result: Record<string, ProjectTaskSnapshot> = {}
+  for (const [key, raw] of Object.entries(value)) {
+    if (!/^[\w.:@/+-]{1,300}$/u.test(key) || !isPlainObject(raw)) continue
+    if (!allowedKinds.has(raw.kind as ProjectTaskSnapshot['kind'])) continue
+    if (!allowedStatuses.has(raw.status as ProjectTaskSnapshot['status'])) continue
+    result[key] = {
+      kind: raw.kind as ProjectTaskSnapshot['kind'],
+      status: raw.status as ProjectTaskSnapshot['status'],
+      output: optionalString(raw.output),
+      updatedAt: optionalString(raw.updatedAt) || new Date().toISOString()
+    }
+  }
+  return result
+}
+
 function sanitizeProject(value: unknown): SavedProject {
   const input = isPlainObject(value) ? value : {}
   return {
@@ -159,6 +402,7 @@ function sanitizeProject(value: unknown): SavedProject {
           .filter((detail): detail is ProjectCleanDetailSnapshot => Boolean(detail))
       : [],
     artifacts: sanitizeArtifactRecord(input.artifacts),
+    taskJournal: sanitizeTaskJournal(input.taskJournal),
     reportMarkdown: asString(input.reportMarkdown),
     reportStale: Boolean(input.reportStale),
     phase: sanitizePhase(input.phase),
@@ -181,20 +425,60 @@ function hasProjectShape(value: unknown): value is PlainRecord {
   )
 }
 
-function loadProjectFile(file: string): SavedProject | null {
+function projectRoot(value: unknown): unknown {
+  return isPlainObject(value) && value.storageVersion === PROJECT_STORAGE_VERSION && 'project' in value
+    ? value.project
+    : value
+}
+
+function metadataFromParsed(value: unknown): ProjectMetadata | null {
+  const root = projectRoot(value)
+  if (!isPlainObject(root)) return null
+  const revision = typeof root.revision === 'number' && Number.isSafeInteger(root.revision) && root.revision >= 0
+    ? root.revision
+    : 0
+  const updatedAt = typeof root.updatedAt === 'string' ? root.updatedAt : ''
+  return { revision, updatedAt }
+}
+
+function loadProjectMetadataSync(file: string): ProjectMetadata | null {
   if (!existsSync(file)) return null
 
   try {
     if (statSync(file).size > MAX_PROJECT_FILE_BYTES) return null
-    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
-    return hasProjectShape(parsed) ? sanitizeProject(parsed) : null
+    return metadataFromParsed(JSON.parse(readFileSync(file, 'utf8')) as unknown)
   } catch {
     return null
   }
 }
 
-export function loadLastProject(): SavedProject | null {
-  const candidates = [loadProjectFile(projectPath()), loadProjectFile(backupPath())].filter(
+async function loadProjectMetadata(file: string): Promise<ProjectMetadata | null> {
+  try {
+    const info = await stat(file)
+    if (info.size > MAX_PROJECT_FILE_BYTES) return null
+    return metadataFromParsed(JSON.parse(await readFile(file, 'utf8')) as unknown)
+  } catch {
+    return null
+  }
+}
+
+async function loadProjectFile(file: string): Promise<SavedProject | null> {
+  try {
+    const info = await stat(file)
+    if (info.size > MAX_PROJECT_FILE_BYTES) return null
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as unknown
+    const root = projectRoot(parsed)
+    const hydrated = isPlainObject(parsed) && parsed.storageVersion === PROJECT_STORAGE_VERSION
+      ? await hydrateValueAsync(root)
+      : root
+    return hasProjectShape(hydrated) ? sanitizeProject(hydrated) : null
+  } catch {
+    return null
+  }
+}
+
+export async function loadLastProject(): Promise<SavedProject | null> {
+  const candidates = (await Promise.all([loadProjectFile(projectPath()), loadProjectFile(backupPath())])).filter(
     (project): project is SavedProject => Boolean(project)
   )
   candidates.sort((a, b) => {
@@ -204,21 +488,13 @@ export function loadLastProject(): SavedProject | null {
   return candidates[0] ?? null
 }
 
-export function loadPreviousProject(): SavedProject | null {
+export function loadPreviousProject(): Promise<SavedProject | null> {
   return loadProjectFile(previousProjectPath())
 }
 
 let saveQueue: Promise<void> = Promise.resolve()
 
-function serializedProject(snapshot: SavedProject): string {
-  const serialized = JSON.stringify(snapshot, null, 2)
-  if (Buffer.byteLength(serialized, 'utf8') > MAX_PROJECT_FILE_BYTES) {
-    throw new Error('当前资料过多，项目无法安全保存。请删除部分大图片或拆成两份分析后重试。')
-  }
-  return serialized
-}
-
-function currentIsNewer(current: SavedProject | null, snapshot: SavedProject): current is SavedProject {
+function currentIsNewer(current: ProjectMetadata | null, snapshot: SavedProject): boolean {
   if (!current) return false
   if (current.revision !== snapshot.revision) return current.revision > snapshot.revision
   return Date.parse(current.updatedAt) > Date.parse(snapshot.updatedAt)
@@ -239,15 +515,15 @@ async function writeProjectSnapshot(snapshot: SavedProject): Promise<SavedProjec
   const backup = backupPath()
   const temp = `${file}.tmp-${process.pid}-${Date.now()}`
   mkdirSync(dirname(file), { recursive: true })
-  const serialized = serializedProject(snapshot)
+  const serialized = serializeManifest(await storedProject(snapshot))
 
-  const current = loadProjectFile(file) ?? loadProjectFile(backup)
-  if (currentIsNewer(current, snapshot)) return current
+  const current = (await loadProjectMetadata(file)) ?? (await loadProjectMetadata(backup))
+  if (currentIsNewer(current, snapshot)) return snapshot
 
   try {
     await writeFile(temp, serialized, 'utf8')
-    const latest = loadProjectFile(file) ?? loadProjectFile(backup)
-    if (currentIsNewer(latest, snapshot)) return latest
+    const latest = (await loadProjectMetadata(file)) ?? (await loadProjectMetadata(backup))
+    if (currentIsNewer(latest, snapshot)) return snapshot
     await rename(temp, file)
     try {
       await refreshBackupAtomically(file, backup)
@@ -272,14 +548,14 @@ export function saveLastProject(project: SavedProject): Promise<SavedProject> {
 
 export function saveLastProjectSync(project: SavedProject): SavedProject {
   const snapshot = sanitizeProject(project)
-  const serialized = serializedProject(snapshot)
+  const serialized = serializeManifest(storedProjectSync(snapshot))
   const file = projectPath()
   const backup = backupPath()
   const temp = `${file}.sync-${process.pid}-${Date.now()}`
   const backupTemp = `${backup}.sync-${process.pid}-${Date.now()}`
   mkdirSync(dirname(file), { recursive: true })
-  const current = loadProjectFile(file) ?? loadProjectFile(backup)
-  if (currentIsNewer(current, snapshot)) return current
+  const current = loadProjectMetadataSync(file) ?? loadProjectMetadataSync(backup)
+  if (currentIsNewer(current, snapshot)) return snapshot
 
   try {
     writeFileSync(temp, serialized, 'utf8')
@@ -299,13 +575,12 @@ export function saveLastProjectSync(project: SavedProject): SavedProject {
 
 export function archiveProject(project: SavedProject): Promise<SavedProject> {
   const snapshot = sanitizeProject(project)
-  serializedProject(snapshot)
   const task = saveQueue.then(async () => {
     const file = previousProjectPath()
     const temp = `${file}.tmp`
     mkdirSync(dirname(file), { recursive: true })
     try {
-      await writeFile(temp, JSON.stringify(snapshot, null, 2), 'utf8')
+      await writeFile(temp, serializeManifest(await storedProject(snapshot)), 'utf8')
       await rename(temp, file)
     } finally {
       if (existsSync(temp)) await rm(temp, { force: true })

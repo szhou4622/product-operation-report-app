@@ -415,6 +415,9 @@ export interface ProjectSourceSnapshot {
   purpose?: string
   note?: string
   size?: number
+  /** Root upload selected by the user. Derived pages/images/ZIP entries share this id. */
+  topLevelId?: string
+  derivedKind?: 'archive-entry' | 'embedded-image' | 'rendered-page' | 'converted-page'
 }
 
 export interface ProjectMessageSnapshot {
@@ -430,6 +433,13 @@ export interface ProjectCleanDetailSnapshot {
   text: string
 }
 
+export interface ProjectTaskSnapshot {
+  kind: 'parse' | 'source_clean' | 'summary' | 'analysis_step' | 'final_part'
+  status: 'complete' | 'failed' | 'interrupted'
+  output?: string
+  updatedAt: string
+}
+
 export interface SavedProject {
   revision: number
   /** Stable billing namespace retained across crash recovery and project restore. */
@@ -439,11 +449,20 @@ export interface SavedProject {
   cleanedData: string
   cleanDetails: ProjectCleanDetailSnapshot[]
   artifacts: Record<number, string>
+  /** Incremental checkpoints used to resume only unfinished model batches after a crash. */
+  taskJournal?: Record<string, ProjectTaskSnapshot>
   reportMarkdown: string
   reportStale: boolean
   phase: ProjectPhase
   steering: string
   updatedAt: string
+}
+
+export interface ProjectStoragePreflight {
+  ok: boolean
+  message: string
+  estimatedBytes: number
+  availableBytes?: number
 }
 
 /** 测试连通的入参/结果 */
@@ -486,11 +505,13 @@ export interface ExportResult {
   error?: string
 }
 
-/** 文件解析结果（PDF/Word/Markdown/CSV/XLSX 抽取） */
+/** 文件解析结果（图片、Office/ODS、分隔表格、PDF、文本/Markdown、JSON/YAML、网页导出文件） */
 export interface ParsedFile {
   name: string
   kind: 'table' | 'doc' | 'other'
   text: string // 抽取出的文本（表格转 CSV）
+  /** Word/PPT 中能安全提取的内嵌图片，渲染层会将它们作为独立资料走读图清洗。 */
+  attachments?: ArchiveItem[]
   ok: boolean
   error?: string
   warning?: string

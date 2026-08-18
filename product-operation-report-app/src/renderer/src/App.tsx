@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { ActivationStatus, PointsWalletStatus, UpdateDownloadProgress, UpdateInfo } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
@@ -81,6 +81,7 @@ export default function App(): JSX.Element {
   const cleanedData = useStore((s) => s.cleanedData)
   const cleanDetails = useStore((s) => s.cleanDetails)
   const artifacts = useStore((s) => s.artifacts)
+  const taskJournal = useStore((s) => s.taskJournal)
   const reportMarkdown = useStore((s) => s.reportMarkdown)
   const reportStale = useStore((s) => s.reportStale)
   const steering = useStore((s) => s.steering)
@@ -117,9 +118,6 @@ export default function App(): JSX.Element {
   const autosaveAttempt = useRef(0)
   const activationRefreshInFlight = useRef(false)
   const updateCheckAttempted = useRef(false)
-  const reportForEmergencyCache =
-    phase === 'cleaning' || phase === 'analyzing' ? artifacts[9] || '' : reportMarkdown
-
   const checkActivation = async (): Promise<void> => {
     setActivationLoadError('')
     try {
@@ -238,6 +236,7 @@ export default function App(): JSX.Element {
             cleanedData,
             cleanDetails,
             artifacts,
+            taskJournal,
             reportMarkdown,
             reportStale,
             phase,
@@ -252,28 +251,9 @@ export default function App(): JSX.Element {
             setAutosaveError(friendlyUiError(error, '自动保存失败，请检查磁盘空间后重试。'))
           }
         })
-    }, 100)
+    }, 900)
     return () => window.clearTimeout(handle)
-  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
-
-  useLayoutEffect(() => {
-    if (!initialized || persistencePaused) return
-    window.api.cacheProjectSnapshot(
-      buildProjectSnapshot({
-        projectRevision,
-        analysisSessionId,
-        sources,
-        messages,
-        cleanedData,
-        cleanDetails,
-        artifacts,
-        reportMarkdown: reportForEmergencyCache,
-        reportStale,
-        phase,
-        steering
-      })
-    )
-  }, [initialized, persistencePaused, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, reportForEmergencyCache, reportStale, phase, steering])
+  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, taskJournal, reportMarkdown, reportStale, phase, steering])
 
   useEffect(() => {
     if (newAnalysisState !== 'success' && newAnalysisState !== 'error') return

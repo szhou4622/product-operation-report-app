@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "产品与内容经营报告系统 — 专业的产品经营与内容分析报告系统",
   "main": "./out/main/index.js",
   "author": "",
@@ -27,6 +27,7 @@
     "dist:win": "electron-vite build && electron-builder --win"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.80",
     "docx": "^9.7.1",
     "iconv-lite": "^0.7.3",
     "jszip": "^3.10.1",
@@ -36,6 +37,8 @@
     "pdfjs-dist": "^4.7.76",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "sharp": "^0.35.3",
+    "word-extractor": "^1.0.4",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {

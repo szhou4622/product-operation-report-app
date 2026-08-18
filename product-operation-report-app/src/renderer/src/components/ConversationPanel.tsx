@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { useStore } from '../store'
+import { derivedSourceCount, evidenceScopeStats, topLevelSourceCount, useStore } from '../store'
 
 export default function ConversationPanel(): JSX.Element {
   const sources = useStore((s) => s.sources)
   const phase = useStore((s) => s.phase)
   const messages = useStore((s) => s.messages)
   const cleaningProgress = useStore((s) => s.cleaningProgress)
+  const cleanDetails = useStore((s) => s.cleanDetails)
   const addSources = useStore((s) => s.addSources)
   const removeSource = useStore((s) => s.removeSource)
   const setSourceAttribution = useStore((s) => s.setSourceAttribution)
@@ -56,6 +57,9 @@ export default function ConversationPanel(): JSX.Element {
     (s) => (s.dataUrl || s.text) && Boolean(s.attribution)
   ).length
   const competitorSources = sources.filter((s) => /竞品|竞对|对标|对手/.test(s.attribution ?? ''))
+  const uploadedFileCount = topLevelSourceCount(sources)
+  const derivedCount = derivedSourceCount(sources)
+  const scopeStats = evidenceScopeStats(sources, cleanDetails)
   const parsePercent = sources.length ? Math.round((processedCount / sources.length) * 100) : 0
   const cleanPercent = cleaningProgress.total
     ? Math.round(((cleaningProgress.done + cleaningProgress.failed) / cleaningProgress.total) * 100)
@@ -176,7 +180,7 @@ export default function ConversationPanel(): JSX.Element {
           multiple
           disabled={importLocked}
           style={{ display: 'none' }}
-          accept=".png,.jpg,.jpeg,.webp,.gif,.xlsx,.xls,.csv,.pdf,.docx,.pptx,.md,.markdown,.txt,.zip"
+          accept=".png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.avif,.heic,.heif,.xlsx,.xls,.xlsm,.xlsb,.ods,.csv,.tsv,.pdf,.doc,.docx,.pptx,.md,.markdown,.txt,.log,.yaml,.yml,.rtf,.json,.jsonl,.ndjson,.html,.htm,.xml,.zip"
           onChange={(e) => {
             if (e.target.files?.length) void addSources(e.target.files)
             e.target.value = ''
@@ -211,7 +215,8 @@ export default function ConversationPanel(): JSX.Element {
             <div className="welcome-file-note">
               <strong>最多上传 50 份，资料总量不超过 350MB</strong>
               <span>图片：单张不超过 25MB</span>
-              <span>Excel/CSV、PDF、DOCX、PPTX、Markdown/TXT、ZIP：单个不超过 40MB</span>
+              <span>Excel/ODS/CSV/TSV、PDF、DOC/DOCX、PPTX、Markdown/TXT/RTF、JSON/YAML、HTML/XML、ZIP：单个不超过 40MB</span>
+              <span>TIFF/AVIF/HEIC 会在软件内自动转成图片；扫描 PDF 会自动逐页转图，不用用户手动转换</span>
             </div>
             <section className="source-guide" aria-labelledby="source-guide-title">
               <div className="source-guide-heading">
@@ -259,7 +264,14 @@ export default function ConversationPanel(): JSX.Element {
           </div>
         ) : (
           <div className="src-strip-head">
-            <span>资料源（{sources.length}）</span>
+            <span>
+              资料源（{uploadedFileCount} 个文件
+              {scopeStats.worksheets ? `，${scopeStats.worksheets} 个工作表` : ''}
+              {scopeStats.pages ? `，${scopeStats.pages} 页` : ''}
+              {scopeStats.images ? `，${scopeStats.images} 张图片` : ''}
+              {scopeStats.records ? `，${scopeStats.records} 条记录` : ''}
+              {derivedCount ? `，${derivedCount} 项派生证据` : ''}）
+            </span>
             <button className="btn xs" disabled={importLocked} onClick={() => fileRef.current?.click()}>
               ＋ 文件
             </button>

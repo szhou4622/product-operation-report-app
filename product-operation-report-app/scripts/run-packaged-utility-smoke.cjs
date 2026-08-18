@@ -5,7 +5,10 @@ const path = require('node:path')
 
 const projectDir = path.resolve(__dirname, '..')
 const output = path.join(projectDir, '.tmp-packaged-utility-smoke.cjs')
-const asarPath = path.join(projectDir, 'dist', 'win-unpacked', 'resources', 'app.asar')
+const packagedRoot = process.env.PRODUCT_REPORT_PACKAGED_DIR
+  ? path.resolve(projectDir, process.env.PRODUCT_REPORT_PACKAGED_DIR)
+  : path.join(projectDir, 'dist')
+const asarPath = path.join(packagedRoot, 'win-unpacked', 'resources', 'app.asar')
 const packagedPackagePath = path.join(asarPath, 'package.json')
 const expectedVersion = JSON.parse(
   readFileSync(path.join(projectDir, 'package.json'), 'utf8')
@@ -18,8 +21,7 @@ const parseModulePath = path.join(
 )
 const htmlModulePath = path.join(asarPath, 'out', 'main', 'html-report-utility.js')
 const skillPath = path.join(
-  projectDir,
-  'dist',
+  packagedRoot,
   'win-unpacked',
   'resources',
   'app.asar.unpacked',
@@ -38,7 +40,7 @@ try {
     bundle: true,
     platform: 'node',
     format: 'cjs',
-    external: ['electron', 'jszip', 'xlsx'],
+    external: ['electron', 'jszip', 'xlsx', 'sharp'],
     outfile: output,
     logLevel: 'warning'
   })

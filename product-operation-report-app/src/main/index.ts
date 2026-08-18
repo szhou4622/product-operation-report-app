@@ -33,6 +33,7 @@ import {
   archiveProject,
   loadLastProject,
   loadPreviousProject,
+  preflightProjectStorage,
   saveLastProject,
   saveLastProjectSync
 } from './project'
@@ -347,35 +348,35 @@ ipcMain.handle('token-usage:open-location', () => {
 
 ipcMain.handle('source-clean-cache:stats', () => getSourceCleanCacheStats())
 ipcMain.handle('source-clean-cache:clear', () => clearSourceCleanCache())
-ipcMain.handle('source-clean-cache:lookup', (_event, input: SourceCleanCacheInput) => {
+ipcMain.handle('source-clean-cache:lookup', async (_event, input: SourceCleanCacheInput) => {
   ensureActivated()
   const profile = getActiveProfile()
-  if (!profile) return { hit: false, cacheKey: '', stats: getSourceCleanCacheStats() }
+  if (!profile) return { hit: false, cacheKey: '', stats: await getSourceCleanCacheStats() }
   return lookupSourceCleanCache(input, profile.model)
 })
 ipcMain.handle(
   'source-clean-cache:store',
-  (_event, payload: { input: SourceCleanCacheInput; text: string }) => {
+  async (_event, payload: { input: SourceCleanCacheInput; text: string }) => {
     ensureActivated()
     const profile = getActiveProfile()
-    if (!profile) return { stored: false, cacheKey: '', stats: getSourceCleanCacheStats() }
+    if (!profile) return { stored: false, cacheKey: '', stats: await getSourceCleanCacheStats() }
     return storeSourceCleanCache(payload.input, profile.model, payload.text)
   }
 )
 ipcMain.handle('report-result-cache:stats', () => getReportResultCacheStats())
 ipcMain.handle('report-result-cache:clear', () => clearReportResultCache())
-ipcMain.handle('report-result-cache:lookup', (_event, input: ReportResultCacheInput) => {
+ipcMain.handle('report-result-cache:lookup', async (_event, input: ReportResultCacheInput) => {
   ensureActivated()
   const profile = getActiveProfile()
-  if (!profile) return { hit: false, cacheKey: '', stats: getReportResultCacheStats() }
+  if (!profile) return { hit: false, cacheKey: '', stats: await getReportResultCacheStats() }
   return lookupReportResultCache(input, profile.model)
 })
 ipcMain.handle(
   'report-result-cache:store',
-  (_event, payload: { input: ReportResultCacheInput; snapshot: ReportResultCacheSnapshot }) => {
+  async (_event, payload: { input: ReportResultCacheInput; snapshot: ReportResultCacheSnapshot }) => {
     ensureActivated()
     const profile = getActiveProfile()
-    if (!profile) return { stored: false, cacheKey: '', stats: getReportResultCacheStats() }
+    if (!profile) return { stored: false, cacheKey: '', stats: await getReportResultCacheStats() }
     return storeReportResultCache(payload.input, profile.model, payload.snapshot)
   }
 )
@@ -558,6 +559,10 @@ ipcMain.handle('project:saveLast', (_e, project: SavedProject) => {
   ensureActivated()
   latestProjectSnapshot = project
   return saveLastProject(project)
+})
+ipcMain.handle('project:preflight', (_e, project: SavedProject) => {
+  ensureActivated()
+  return preflightProjectStorage(project)
 })
 ipcMain.on('project:cacheSnapshot', (_e, project: SavedProject) => {
   if (getActivationStatus().activated) latestProjectSnapshot = project

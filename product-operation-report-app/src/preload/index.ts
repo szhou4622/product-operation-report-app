@@ -20,6 +20,7 @@ import type {
   PointsAccessResult,
   PointsRedeemResult,
   PointsWalletStatus,
+  ProjectStoragePreflight,
   ReportResultCacheInput,
   ReportResultCacheLookupResult,
   ReportResultCacheSnapshot,
@@ -122,6 +123,9 @@ const api = {
 
   saveLastProject: (project: SavedProject): Promise<SavedProject> =>
     ipcRenderer.invoke('project:saveLast', project),
+
+  preflightProjectStorage: (project: SavedProject): Promise<ProjectStoragePreflight> =>
+    ipcRenderer.invoke('project:preflight', project),
 
   cacheProjectSnapshot: (project: SavedProject): void =>
     ipcRenderer.send('project:cacheSnapshot', project),

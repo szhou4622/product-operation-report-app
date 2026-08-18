@@ -1,6 +1,6 @@
 import { app, shell } from 'electron'
 import { createHash } from 'crypto'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 'fs'
+import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { once } from 'events'
 import type { UpdateActionResult, UpdateDownloadProgress, UpdateInfo } from '../shared/types'
@@ -125,23 +125,24 @@ function artifactPath(config: UpdateConfig): string {
   return join(updateRoot(), config.version.replace(/[^0-9A-Za-z._-]/g, '_'), safeArtifactName(config.downloadUrl))
 }
 
-function sha256File(path: string): string {
+async function sha256File(path: string): Promise<string> {
   const hash = createHash('sha256')
-  hash.update(readFileSync(path))
+  const reader = createReadStream(path)
+  for await (const chunk of reader) hash.update(chunk)
   return hash.digest('hex')
 }
 
-function isDownloaded(config: UpdateConfig): boolean {
+async function isDownloaded(config: UpdateConfig): Promise<boolean> {
   const path = artifactPath(config)
   if (!existsSync(path)) return false
   try {
-    return sha256File(path).toLowerCase() === config.sha256.toLowerCase()
+    return (await sha256File(path)).toLowerCase() === config.sha256.toLowerCase()
   } catch {
     return false
   }
 }
 
-function toInfo(config: UpdateConfig | null, available: boolean): UpdateInfo {
+async function toInfo(config: UpdateConfig | null, available: boolean): Promise<UpdateInfo> {
   const currentVersion = app.getVersion()
   if (!config) {
     return {
@@ -153,7 +154,7 @@ function toInfo(config: UpdateConfig | null, available: boolean): UpdateInfo {
       downloaded: false
     }
   }
-  const downloaded = available && isDownloaded(config)
+  const downloaded = available && await isDownloaded(config)
   return {
     available,
     appName: LICENSE_APP_NAME,
@@ -171,7 +172,7 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
   const key = platformKey()
   if (!key) {
     cachedConfig = null
-    return toInfo(null, false)
+    return await toInfo(null, false)
   }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS)
@@ -185,7 +186,7 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
     })
     if (response.status === 404) {
       cachedConfig = null
-      return toInfo(null, false)
+      return await toInfo(null, false)
     }
     if (!response.ok) throw new Error(`更新服务暂时不可用（${response.status}）。`)
     const body = asRecord(await response.json())
@@ -218,7 +219,7 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
       notes: parseNotes(body.notes ?? body.release_notes ?? body.changelog),
       force: body.force === true || forceByMinimum
     }
-    return toInfo(cachedConfig, compareVersions(version, app.getVersion()) > 0)
+    return await toInfo(cachedConfig, compareVersions(version, app.getVersion()) > 0)
   } finally {
     clearTimeout(timer)
   }
@@ -267,7 +268,9 @@ async function writeResponseToFile(
 export async function downloadUpdate(
   onProgress?: (progress: UpdateDownloadProgress) => void
 ): Promise<UpdateActionResult> {
-  const info = cachedConfig ? toInfo(cachedConfig, compareVersions(cachedConfig.version, app.getVersion()) > 0) : await checkForUpdates()
+  const info = cachedConfig
+    ? await toInfo(cachedConfig, compareVersions(cachedConfig.version, app.getVersion()) > 0)
+    : await checkForUpdates()
   if (!info.available || !cachedConfig) return { ok: false, message: '当前已经是最新版本。', info }
   if (info.downloaded) return { ok: true, message: '更新包已经下载并校验完成。', info }
 
@@ -291,7 +294,7 @@ export async function downloadUpdate(
     }
     rmSync(destination, { force: true })
     renameSync(partial, destination)
-    const completed = toInfo(cachedConfig, true)
+    const completed = await toInfo(cachedConfig, true)
     return { ok: true, message: '下载完成并已通过安全校验。', info: completed }
   } catch (error) {
     rmSync(partial, { force: true })
@@ -300,7 +303,7 @@ export async function downloadUpdate(
       message: error instanceof Error && error.name === 'AbortError'
         ? '更新下载超时，请稍后重试。旧版本仍可继续使用。'
         : `${error instanceof Error ? error.message : '更新下载失败。'} 旧版本仍可继续使用。`,
-      info: toInfo(cachedConfig, true)
+      info: await toInfo(cachedConfig, true)
     }
   } finally {
     clearTimeout(timer)
@@ -310,15 +313,17 @@ export async function downloadUpdate(
 export async function installDownloadedUpdate(): Promise<UpdateActionResult> {
   if (!cachedConfig) return { ok: false, message: '请先检查并下载更新。' }
   const path = artifactPath(cachedConfig)
-  if (!existsSync(path)) return { ok: false, message: '没有找到已下载的更新包，请重新下载。', info: toInfo(cachedConfig, true) }
-  if (sha256File(path).toLowerCase() !== cachedConfig.sha256.toLowerCase()) {
+  if (!existsSync(path)) {
+    return { ok: false, message: '没有找到已下载的更新包，请重新下载。', info: await toInfo(cachedConfig, true) }
+  }
+  if ((await sha256File(path)).toLowerCase() !== cachedConfig.sha256.toLowerCase()) {
     rmSync(path, { force: true })
-    return { ok: false, message: '安装前校验失败，已删除损坏的更新包，请重新下载。', info: toInfo(cachedConfig, true) }
+    return { ok: false, message: '安装前校验失败，已删除损坏的更新包，请重新下载。', info: await toInfo(cachedConfig, true) }
   }
   const error = await shell.openPath(path)
-  if (error) return { ok: false, message: `无法启动安装程序：${error}`, info: toInfo(cachedConfig, true) }
+  if (error) return { ok: false, message: `无法启动安装程序：${error}`, info: await toInfo(cachedConfig, true) }
   setTimeout(() => app.quit(), 800)
-  return { ok: true, message: '安装程序已启动，软件即将关闭。', info: toInfo(cachedConfig, true) }
+  return { ok: true, message: '安装程序已启动，软件即将关闭。', info: await toInfo(cachedConfig, true) }
 }
 
 export function getUpdateDownloadDirectory(): string {

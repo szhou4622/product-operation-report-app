@@ -7,10 +7,11 @@ import { app, BrowserWindow } from 'electron'
 import JSZip from 'jszip'
 import Papa from 'papaparse'
 import iconv from 'iconv-lite'
+import * as XLSX from 'xlsx'
 import type { SavedProject } from '../src/shared/types'
 import { parseArchive, parseFile } from '../src/main/ingest'
 import { chatStream, listModels, normalizeProviderUsage, testModel } from '../src/main/model'
-import { loadLastProject, saveLastProject } from '../src/main/project'
+import { loadLastProject, preflightProjectStorage, saveLastProject } from '../src/main/project'
 import {
   activateWithCode,
   activationInternals,
@@ -107,9 +108,23 @@ import {
   selectRevisionParts,
   useStore
 } from '../src/renderer/src/store'
-import { buildFinalReportPartMessages, buildStepMessages, COMPACT_RUNTIME_RULES } from '../src/renderer/src/sop'
+import {
+  buildExtractMessages,
+  buildFinalReportPartMessages,
+  buildSummaryGroupMessages,
+  buildSummaryMergeMessages,
+  buildStepMessages,
+  buildSummaryMessages,
+  COMPACT_RUNTIME_RULES,
+  planSummaryDetailGroups
+} from '../src/renderer/src/sop'
 import { FINAL_REPORT_PARTS } from '../src/renderer/src/reportTemplate'
 import { buildLocalTableCleanDetail, preprocessTableForModel } from '../src/renderer/src/tablePreprocess'
+import {
+  buildSourceCleanBatchPlan,
+  combineSourceCleanBatchOutputs,
+  sourceCleanBatchInternals
+} from '../src/renderer/src/sourceCleanBatches'
 import type { ChatStreamEvent, ModelProfile, TokenUsageRecord } from '../src/shared/types'
 
 function encryptV032StoredCode(code: string, deviceId: string): string {
@@ -146,23 +161,46 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   await saveLastProject(snapshot(1, '旧报告'))
   await saveLastProject(snapshot(2, ''))
   await saveLastProject(snapshot(1, '迟到的旧快照'))
-  assert.equal(loadLastProject()?.revision, 2)
-  assert.equal(loadLastProject()?.reportMarkdown, '')
+  assert.equal((await loadLastProject())?.revision, 2)
+  assert.equal((await loadLastProject())?.reportMarkdown, '')
 
   writeFileSync(join(tempUserData, 'last-project.json'), '{broken', 'utf8')
-  assert.equal(loadLastProject()?.revision, 2)
-  assert.equal(loadLastProject()?.reportMarkdown, '')
+  assert.equal((await loadLastProject())?.revision, 2)
+  assert.equal((await loadLastProject())?.reportMarkdown, '')
 
   writeFileSync(join(tempUserData, 'last-project.json'), '{}', 'utf8')
-  assert.equal(loadLastProject()?.revision, 2)
+  assert.equal((await loadLastProject())?.revision, 2)
 
   writeFileSync(join(tempUserData, 'last-project.json'), JSON.stringify(snapshot(3, '主文件')), 'utf8')
   writeFileSync(join(tempUserData, 'last-project.json.bak'), JSON.stringify(snapshot(5, '更新备份')), 'utf8')
-  assert.equal(loadLastProject()?.revision, 5)
-  assert.equal(loadLastProject()?.reportMarkdown, '更新备份')
+  assert.equal((await loadLastProject())?.revision, 5)
+  assert.equal((await loadLastProject())?.reportMarkdown, '更新备份')
   const billingSnapshot = { ...snapshot(6, 'billing-id'), analysisSessionId: 'stable-billing-session' }
   await saveLastProject(billingSnapshot)
-  assert.equal(loadLastProject()?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
+  assert.equal((await loadLastProject())?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
+
+  const largeText = `中段唯一证据-${'资料'.repeat(50_000)}-最后唯一证据`
+  const chunkedSnapshot: SavedProject = {
+    ...snapshot(7, ''),
+    sources: [{ id: 'large-source', name: '大项目资料.md', kind: 'doc', text: largeText, topLevelId: 'large-source' }],
+    taskJournal: {
+      'session:source_clean:large-source:1': {
+        kind: 'source_clean',
+        status: 'complete',
+        output: `POR-T-12345678-000001\n${largeText}`,
+        updatedAt: new Date().toISOString()
+      }
+    }
+  }
+  const preflight = preflightProjectStorage(chunkedSnapshot)
+  assert.equal(preflight.ok, true, preflight.message)
+  await saveLastProject(chunkedSnapshot)
+  const manifest = readFileSync(join(tempUserData, 'last-project.json'), 'utf8')
+  assert.match(manifest, /"storageVersion": 2/u)
+  assert.doesNotMatch(manifest, /中段唯一证据/u, 'large project content is externalized from the small manifest')
+  const restoredChunked = await loadLastProject()
+  assert.equal(restoredChunked?.sources[0]?.text, largeText)
+  assert.equal(restoredChunked?.taskJournal?.['session:source_clean:large-source:1']?.output?.endsWith(largeText), true)
 }
 
 async function testDeviceIdentityPersistsAcrossAuthorizationReset(): Promise<void> {
@@ -1920,10 +1958,30 @@ async function testFeedbackArrivingDuringRevision(): Promise<void> {
       ) => {
         taskContexts.push(context)
         const call = ++calls
+        const part = FINAL_REPORT_PARTS.find((candidate) => candidate.id === context.partId)
+        assert.ok(part)
+        const fixtureLines = HTML_REPORT_FIXTURE.split(/\r?\n/u)
+        const selected: string[] = []
+        if (part.includeTitle) {
+          const firstSection = fixtureLines.findIndex((line) => /^##\s+0[.、：:\s]/u.test(line.trim()))
+          selected.push(...fixtureLines.slice(0, firstSection))
+        }
+        for (const section of part.sections) {
+          const start = fixtureLines.findIndex((line) => new RegExp(`^##\\s+${section}(?:[.、：:\\s]|$)`, 'u').test(line.trim()))
+          assert.ok(start >= 0)
+          const relativeEnd = fixtureLines.slice(start + 1).findIndex((line) => /^##\s+(?:10|11|[0-9])(?:[.、：:\s]|$)/u.test(line.trim()))
+          const end = relativeEnd >= 0 ? start + 1 + relativeEnd : fixtureLines.length
+          selected.push(...fixtureLines.slice(start, end))
+        }
+        if (part.includeFooter && !selected.some((line) => line.includes('内容由 AI 生成'))) {
+          const footer = fixtureLines.find((line) => line.includes('内容由 AI 生成'))
+          if (footer) selected.push(footer)
+        }
+        const output = `${selected.join('\n').trim()}\n\n修订批次${call}`
         queueMicrotask(() => {
-          handlers.onChunk?.(`第${call}段`)
+          handlers.onChunk?.(output)
           if (call === 1) useStore.setState({ steering: '第一条要求\n修订期间的新要求' })
-          handlers.onDone?.(`第${call}段`)
+          handlers.onDone?.(output)
         })
         return { abort: () => undefined }
       }
@@ -1957,7 +2015,7 @@ async function testFeedbackArrivingDuringRevision(): Promise<void> {
     String(taskContexts[4].taskKey).split(':').slice(0, -1).join(':')
   )
   assert.equal(useStore.getState().phase, 'checkpoint2')
-  assert.match(useStore.getState().reportMarkdown, /第5段/)
+  assert.match(useStore.getState().reportMarkdown, /修订批次5/u)
   assert.equal(useStore.getState().artifacts[9], useStore.getState().reportMarkdown)
 }
 
@@ -2423,8 +2481,8 @@ async function testRealTokenPointsBilling(): Promise<void> {
 }
 
 async function testCostOptimizationPrimitives(): Promise<void> {
-  clearSourceCleanCache()
-  sourceCleanCacheInternals.resetForTests()
+  await clearSourceCleanCache()
+  await sourceCleanCacheInternals.resetForTests()
   const source = {
     name: '画像.csv',
     kind: 'table' as const,
@@ -2438,23 +2496,24 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(key.length, 64)
   assert.notEqual(sourceCleanCacheKey({ ...source, note: '近7天' }, 'gpt-5.5'), key)
   assert.notEqual(sourceCleanCacheKey({ ...source, text: `${source.text}\n年龄,40-49,20%` }, 'gpt-5.5'), key)
-  const stored = storeSourceCleanCache(source, 'gpt-5.5', '清洗结果')
+  const stored = await storeSourceCleanCache(source, 'gpt-5.5', '清洗结果')
   assert.equal(stored.stored, true, 'cache store')
-  const hit = lookupSourceCleanCache(source, 'gpt-5.5')
+  const hit = await lookupSourceCleanCache(source, 'gpt-5.5')
   assert.equal(hit.hit, true, 'cache hit')
   assert.equal(hit.text, '清洗结果')
   assert.equal(hit.stats.totalHits, 1)
-  assert.equal(lookupSourceCleanCache({ ...source, platform: '抖音' }, 'gpt-5.5').hit, false)
+  assert.equal((await lookupSourceCleanCache({ ...source, platform: '抖音' }, 'gpt-5.5')).hit, false)
   assert.notEqual(sourceCleanCacheKey(source, 'gpt-5.4'), key)
   const warmSources = Array.from({ length: 7 }, (_, index) => ({
     ...source,
     name: `复用资料-${index + 1}.csv`,
     text: `${source.text}\n序号,${index + 1},${index + 1}%`
   }))
-  warmSources.forEach((item, index) => {
-    assert.equal(storeSourceCleanCache(item, 'gpt-5.5', `清洗结果-${index + 1}`).stored, true)
-  })
-  assert.equal(warmSources.filter((item) => lookupSourceCleanCache(item, 'gpt-5.5').hit).length, 7)
+  for (const [index, item] of warmSources.entries()) {
+    assert.equal((await storeSourceCleanCache(item, 'gpt-5.5', `清洗结果-${index + 1}`)).stored, true)
+  }
+  const warmHits = await Promise.all(warmSources.map((item) => lookupSourceCleanCache(item, 'gpt-5.5')))
+  assert.equal(warmHits.filter((item) => item.hit).length, 7)
 
   const now = new Date('2026-08-09T00:00:00.000Z')
   const entries = Array.from({ length: 205 }, (_, index) => ({
@@ -2463,15 +2522,14 @@ async function testCostOptimizationPrimitives(): Promise<void> {
     lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
     expiresAt: index === 204 ? '2026-08-08T00:00:00.000Z' : '2026-09-01T00:00:00.000Z',
     model: 'gpt-5.5',
-    text: '结果'
+    bytes: 6
   }))
-  const pruned = sourceCleanCacheInternals.pruneCache({ version: 1, totalHits: 3, entries }, now)
+  const pruned = sourceCleanCacheInternals.pruneCache({ version: 2, totalHits: 3, entries }, now)
   assert.equal(pruned.entries.length, 200)
   assert.equal(pruned.entries.some((entry) => entry.expiresAt < now.toISOString()), false)
 
-  const largeText = 'x'.repeat(2_000_000)
   const oversized = sourceCleanCacheInternals.pruneCache({
-    version: 1,
+    version: 2,
     totalHits: 0,
     entries: Array.from({ length: 30 }, (_, index) => ({
       key: (index + 1).toString(16).padStart(64, '0'),
@@ -2479,11 +2537,14 @@ async function testCostOptimizationPrimitives(): Promise<void> {
       lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
       expiresAt: '2026-09-01T00:00:00.000Z',
       model: 'gpt-5.5',
-      text: largeText
+      bytes: 2_000_000
     }))
   }, now)
   assert.ok(oversized.entries.length < 30, 'cache byte-cap evicts LRU entries')
-  assert.ok(Buffer.byteLength(JSON.stringify(oversized), 'utf8') <= sourceCleanCacheInternals.MAX_CACHE_BYTES)
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversized), 'utf8') + oversized.entries.reduce((sum, entry) => sum + entry.bytes, 0) <=
+      sourceCleanCacheInternals.MAX_CACHE_BYTES
+  )
 
   const profileText = [
     '标签类型,标签,占比',
@@ -2509,6 +2570,115 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(material.mode, 'material')
   assert.doesNotMatch(material.text, /秘密推理|思考过程|输出结果/u)
   assert.match(material.text, /开头199/u)
+
+  for (const recordCount of [2, 59, 121, 437]) {
+    const rows = [
+      ['原视频', '3秒开头原文', '完整文案', '素材类型', '产品'],
+      ...Array.from({ length: recordCount }, (_, index) => [
+        `video-${index + 1}.mp4`,
+        `开头${index + 1}`,
+        `第${index + 1}条完整文案\n${'长文案'.repeat(90)}`,
+        index % 2 ? '口播' : '场景展示',
+        index % 3 ? '产品A' : '产品B'
+      ])
+    ]
+    const source = {
+      name: `浮动条数-${recordCount}.xlsx`,
+      kind: 'table' as const,
+      text: `### 工作表：素材\n${Papa.unparse(rows, { newline: '\n' })}`,
+      attribution: '竞品数据'
+    }
+    const plan = buildSourceCleanBatchPlan(source)
+    assert.equal(plan.mode, 'table_rows')
+    assert.equal(plan.originalRecordCount, recordCount)
+    assert.equal(plan.scheduledRecordCount, recordCount)
+    assert.equal(plan.isMaterialTable, true)
+    const sentText = plan.batches.map((batch) => batch.source.text || '').join('\n')
+    for (let index = 0; index < recordCount; index++) {
+      assert.equal(
+        sentText.split(`video-${index + 1}.mp4`).length - 1,
+        1,
+        `record ${index + 1}/${recordCount} must enter exactly one cleaning batch`
+      )
+    }
+    assert.ok(
+      plan.batches.every((batch) => (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT),
+      `normal table batches stay within the model-safe limit for ${recordCount} rows`
+    )
+    const combined = combineSourceCleanBatchOutputs(
+      plan,
+      plan.batches.map((batch, index) =>
+        `分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 第${index + 1}批\n\n## 清洗后内容\n` +
+          batch.context.evidenceIds.map((id) => `${id} 已处理`).join('\n')
+      )
+    )
+    assert.match(combined, new RegExp(`已覆盖素材数量：${recordCount} 条`, 'u'))
+    assert.match(combined, /全部有效记录均已送入清洗|未做抽样/u)
+  }
+
+  const longDocument = `文档开头-${'A'.repeat(70_000)}-文档中段-${'B'.repeat(70_000)}-文档结尾`
+  const documentPlan = buildSourceCleanBatchPlan({ name: '长文档.md', kind: 'doc', text: longDocument })
+  assert.ok(documentPlan.batches.length > 1)
+  assert.equal(
+    documentPlan.batches
+      .map((batch) => (batch.source.text || '').replace(/^【证据片段ID】POR-T-[A-F0-9]{8}-\d{6}\n/u, ''))
+      .join(''),
+    longDocument
+  )
+  assert.match(documentPlan.batches[0].source.text || '', /文档开头/u)
+  assert.match(documentPlan.batches[documentPlan.batches.length - 1].source.text || '', /文档结尾/u)
+  assert.throws(
+    () => combineSourceCleanBatchOutputs(documentPlan, ['只完成一批']),
+    /清洗批次不完整/u,
+    'partial batch output must never be marked complete'
+  )
+
+  const flexiblePrompt = buildExtractMessages(
+    { name: '不规则资料.json', kind: 'doc', text: '{"未知字段":"必须保留"}' },
+    documentPlan.batches[0].context
+  )
+  assert.match(String(flexiblePrompt[1].content), /不要硬套同一种模板|保留原有层级和字段|不得.*抽样/u)
+  assert.match(String(flexiblePrompt[1].content), /未知字段/u)
+
+  const summarySource = [
+    '分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 多批资料',
+    '## 系统完整性核对\n- 动态清洗批次：4 批',
+    ...Array.from({ length: 4 }, (_, index) =>
+      `### 清洗批次 ${index + 1}/4\n批次标记-${index + 1}\n${String(index + 1).repeat(5_000)}`
+    )
+  ].join('\n\n')
+  const summaryMessages = buildSummaryMessages([{ name: '多批素材.csv', text: summarySource }])
+  const summaryPayload = String(summaryMessages[1].content)
+  assert.match(summaryPayload, /批次标记-1/u)
+  assert.match(summaryPayload, /批次标记-4/u)
+  assert.match(summaryPayload, /完整结果仍保存在来源清洗明细/u)
+  assert.doesNotMatch(summaryPayload, /本文件清洗结果过长，已截断/u)
+
+  const allCoverageText = [
+    `超大资料开头-${'甲'.repeat(90_000)}`,
+    `超大资料中段-${'乙'.repeat(90_000)}`,
+    `超大资料结尾-${'丙'.repeat(90_000)}`
+  ].join('\n')
+  const summaryGroups = planSummaryDetailGroups([
+    { name: '超大经营资料.txt', text: allCoverageText },
+    { name: '小型补充资料.md', text: '补充证据-必须进入汇总' }
+  ])
+  assert.ok(summaryGroups.length > 1, 'oversized clean details use hierarchical summary groups')
+  const reconstructed = summaryGroups
+    .flatMap((group) => group.parts)
+    .filter((part) => part.sourceName === '超大经营资料.txt')
+    .map((part) => part.text)
+    .join('')
+  assert.equal(reconstructed, allCoverageText, 'every character enters exactly one hierarchical summary group')
+  const groupPayloads = summaryGroups.map((group, index) =>
+    String(buildSummaryGroupMessages(group, index + 1, summaryGroups.length)[1].content)
+  )
+  assert.match(groupPayloads.join('\n'), /超大资料开头/u)
+  assert.match(groupPayloads.join('\n'), /超大资料中段/u)
+  assert.match(groupPayloads.join('\n'), /超大资料结尾/u)
+  assert.match(groupPayloads.join('\n'), /补充证据-必须进入汇总/u)
+  const mergedSummaryPrompt = String(buildSummaryMergeMessages(['中间汇总A', '中间汇总B'])[1].content)
+  assert.match(mergedSummaryPrompt, /中间汇总A[\s\S]*中间汇总B/u)
 
   const unknownText = ['甲列,乙列', ...Array.from({ length: 800 }, (_, index) => `${index},${'未知'.repeat(20)}`)].join('\n')
   const unknown = preprocessTableForModel(unknownText)
@@ -2544,10 +2714,11 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   const localTable = preprocessTableForModel(localTableSource.text)
   assert.equal(localTable.confidence, 'high')
   assert.equal(localTable.canSkipModel, true)
-  assert.equal(localTable.retainedRows, 2, 'blank and duplicate rows are removed locally')
+  assert.equal(localTable.retainedRows, 3, 'identical rows are preserved because they may represent separate records')
   const localDetail = buildLocalTableCleanDetail(localTableSource, localTable)
   assert.ok(localDetail)
   assert.match(localDetail!, /未调用模型|以下内容只来自原表格|产品A/u)
+  assert.equal((localDetail!.match(/产品B,800,8/gu) || []).length, 2)
   assert.ok(localDetail!.length <= 12_000)
   const semanticTable = preprocessTableForModel('标题,脚本文案,成交金额\n测试,这是一段内容,100')
   assert.equal(semanticTable.canSkipModel, false, 'semantic narrative columns require model cleaning')
@@ -2590,8 +2761,8 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.deepEqual(selectRevisionParts('把人群和风险建议一起调整').map((part) => part.id), ['part-5-8', 'part-10-11'])
   assert.equal(selectRevisionParts('整体再专业一点').length, FINAL_REPORT_PARTS.length)
 
-  clearReportResultCache()
-  reportResultCacheInternals.resetForTests()
+  await clearReportResultCache()
+  await reportResultCacheInternals.resetForTests()
   const reportInput = {
     sources: [localTableSource, { ...source, name: '画像.csv' }],
     userRequirements: '经营建议更具体'
@@ -2610,22 +2781,21 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(reportKey.length, 64)
   assert.notEqual(reportResultCacheKey({ ...reportInput, sources: [...reportInput.sources].reverse() }, 'gpt-5.5'), reportKey)
   assert.notEqual(reportResultCacheKey({ ...reportInput, userRequirements: '换一个要求' }, 'gpt-5.5'), reportKey)
-  assert.equal(storeReportResultCache(reportInput, 'gpt-5.5', reportSnapshot).stored, true)
-  const reportHit = lookupReportResultCache(reportInput, 'gpt-5.5')
+  assert.equal((await storeReportResultCache(reportInput, 'gpt-5.5', reportSnapshot)).stored, true)
+  const reportHit = await lookupReportResultCache(reportInput, 'gpt-5.5')
   assert.equal(reportHit.hit, true)
   assert.equal(reportHit.snapshot?.reportMarkdown, completeReport)
   assert.equal(reportHit.stats.totalHits, 1)
   for (let index = 0; index < 24; index++) {
-    storeReportResultCache(
+    await storeReportResultCache(
       { ...reportInput, userRequirements: `要求-${index}` },
       'gpt-5.5',
       reportSnapshot
     )
   }
-  assert.equal(getReportResultCacheStats().entryCount, 20, 'report cache uses the 20-entry LRU cap')
-  const largeReportText = 'x'.repeat(6_000_000)
+  assert.equal((await getReportResultCacheStats()).entryCount, 20, 'report cache uses the 20-entry LRU cap')
   const oversizedReportCache = reportResultCacheInternals.pruneCache({
-    version: 1,
+    version: 2,
     totalHits: 0,
     entries: Array.from({ length: 4 }, (_, index) => ({
       key: (index + 100).toString(16).padStart(64, '0'),
@@ -2633,15 +2803,14 @@ async function testCostOptimizationPrimitives(): Promise<void> {
       lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
       expiresAt: '2026-09-01T00:00:00.000Z',
       model: 'gpt-5.5',
-      snapshot: {
-        cleanedData: '归一',
-        cleanDetails: [{ name: '资料.csv', text: '明细' }],
-        artifacts: { 1: '步骤' },
-        reportMarkdown: largeReportText
-      }
+      bytes: 6_000_000
     }))
   }, now)
-  assert.ok(Buffer.byteLength(JSON.stringify(oversizedReportCache), 'utf8') <= reportResultCacheInternals.MAX_CACHE_BYTES)
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversizedReportCache), 'utf8') +
+      oversizedReportCache.entries.reduce((sum, entry) => sum + entry.bytes, 0) <=
+      reportResultCacheInternals.MAX_CACHE_BYTES
+  )
 
   await costOptimizationInternals.resetForTests()
   await appendCostOptimizationEvent({
@@ -2680,6 +2849,13 @@ async function testCostOptimizationPrimitives(): Promise<void> {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     api: {
+      preflightProjectStorage: async () => ({
+        ok: true,
+        estimatedBytes: 1,
+        freeBytes: 1024 * 1024 * 1024,
+        requiredBytes: 2,
+        message: '可安全保存'
+      }),
       lookupReportResultCache: async () => reportHit,
       canStartPointsReport: async () => {
         modelOrBillingCalls++
@@ -2723,18 +2899,18 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.match(reuseModalSource, /重新生成一份/u)
   assert.doesNotMatch(reuseModalSource, /Token|扣积分|毛利|每百万/u)
 
-  clearReportResultCache()
+  await clearReportResultCache()
   writeFileSync(join(tempUserData, 'report-result-cache.json'), '{broken', 'utf8')
   writeFileSync(join(tempUserData, 'report-result-cache.json.bak'), 'also broken', 'utf8')
-  assert.equal(getReportResultCacheStats().entryCount, 0, 'corrupt report cache is ignored')
+  assert.equal((await getReportResultCacheStats()).entryCount, 0, 'corrupt report cache is ignored')
 
-  clearSourceCleanCache()
-  assert.equal(getSourceCleanCacheStats().entryCount, 0)
+  await clearSourceCleanCache()
+  assert.equal((await getSourceCleanCacheStats()).entryCount, 0)
   writeFileSync(join(tempUserData, 'source-clean-cache.json'), '{broken', 'utf8')
   writeFileSync(join(tempUserData, 'source-clean-cache.json.bak'), 'also broken', 'utf8')
-  assert.equal(getSourceCleanCacheStats().entryCount, 0, 'corrupt cache is ignored')
-  clearSourceCleanCache()
-  clearReportResultCache()
+  assert.equal((await getSourceCleanCacheStats()).entryCount, 0, 'corrupt cache is ignored')
+  await clearSourceCleanCache()
+  await clearReportResultCache()
   await costOptimizationInternals.resetForTests()
 }
 
@@ -2816,13 +2992,180 @@ async function testCsvAndArchiveGuards(): Promise<void> {
   assert.equal(utf16MarkdownParsed.ok, true)
   assert.match(utf16MarkdownParsed.text, /已育女性为核心人群/)
 
+  const tsv = Buffer.from('字段\t数值\n成交金额\t1234\n素材数\t59\n', 'utf8')
+  const tsvParsed = await parseFile(
+    '经营数据.tsv',
+    tsv.buffer.slice(tsv.byteOffset, tsv.byteOffset + tsv.byteLength) as ArrayBuffer
+  )
+  assert.equal(tsvParsed.ok, true)
+  assert.equal(tsvParsed.kind, 'table')
+  assert.match(tsvParsed.text, /成交金额,1234/u)
+
+  const yaml = Buffer.from('产品: 酸菜\n经营指标:\n  成交金额: 1234\n', 'utf8')
+  const yamlParsed = await parseFile(
+    '经营资料.yaml',
+    yaml.buffer.slice(yaml.byteOffset, yaml.byteOffset + yaml.byteLength) as ArrayBuffer
+  )
+  assert.equal(yamlParsed.ok, true)
+  assert.match(yamlParsed.text, /成交金额: 1234/u)
+
+  const log = Buffer.from('[2026-08-18] 直播成交金额=1234，退款=12\n', 'utf8')
+  const logParsed = await parseFile(
+    '经营记录.log',
+    log.buffer.slice(log.byteOffset, log.byteOffset + log.byteLength) as ArrayBuffer
+  )
+  assert.equal(logParsed.ok, true)
+  assert.match(logParsed.text, /退款=12/u)
+
+  const rtf = Buffer.from('{\\rtf1\\ansi\\ansicpg936 Product benefit: \\u37240?\\u40092?\\par GMV 1234}', 'latin1')
+  const rtfParsed = await parseFile(
+    '产品说明.rtf',
+    rtf.buffer.slice(rtf.byteOffset, rtf.byteOffset + rtf.byteLength) as ArrayBuffer
+  )
+  assert.equal(rtfParsed.ok, true)
+  assert.doesNotMatch(rtfParsed.text, /\\rtf1|\\par/u)
+  assert.match(rtfParsed.text, /Product benefit:[\s\S]*GMV 1234/u)
+
+  const json = Buffer.from(JSON.stringify({ 产品: '酸菜', 指标: { 成交金额: 1234 }, 素材: [1, 2, 3] }), 'utf8')
+  const jsonParsed = await parseFile(
+    '经营资料.json',
+    json.buffer.slice(json.byteOffset, json.byteOffset + json.byteLength) as ArrayBuffer
+  )
+  assert.equal(jsonParsed.ok, true)
+  assert.match(jsonParsed.text, /"成交金额": 1234/u)
+
+  const malformedJson = Buffer.from('{"产品":"酸菜", trailing-data', 'utf8')
+  const malformedJsonParsed = await parseFile(
+    '不规则导出.json',
+    malformedJson.buffer.slice(
+      malformedJson.byteOffset,
+      malformedJson.byteOffset + malformedJson.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(malformedJsonParsed.ok, true)
+  assert.match(malformedJsonParsed.warning || '', /完整原文继续清洗/u)
+  assert.match(malformedJsonParsed.text, /trailing-data/u)
+
+  const html = Buffer.from(
+    '<html><body><h1>商品经营数据</h1><table><tr><th>成交金额</th><th>订单</th></tr><tr><td>1234</td><td>12</td></tr></table><script>steal-secret()</script></body></html>',
+    'utf8'
+  )
+  const htmlParsed = await parseFile(
+    '平台网页导出.html',
+    html.buffer.slice(html.byteOffset, html.byteOffset + html.byteLength) as ArrayBuffer
+  )
+  assert.equal(htmlParsed.ok, true)
+  assert.match(htmlParsed.text, /商品经营数据|成交金额|1234/u)
+  assert.doesNotMatch(htmlParsed.text, /steal-secret/u)
+  assert.match(htmlParsed.warning || '', /不会执行/u)
+
+  const xml = Buffer.from('<report><product>酸菜</product><gmv>1234</gmv></report>', 'utf8')
+  const xmlParsed = await parseFile(
+    '平台数据.xml',
+    xml.buffer.slice(xml.byteOffset, xml.byteOffset + xml.byteLength) as ArrayBuffer
+  )
+  assert.equal(xmlParsed.ok, true)
+  assert.match(xmlParsed.text, /<gmv>1234<\/gmv>/u)
+
+  const sparseWorkbook = XLSX.utils.book_new()
+  const sparseSheet = XLSX.utils.aoa_to_sheet([['商品', '成交金额'], ['酸菜', 1234]])
+  sparseSheet.B2.f = 'SUM(1200,34)'
+  sparseSheet.B2.l = { Target: 'https://example.com/source-row' }
+  sparseSheet.B2.c = [{ a: '运营', t: '这是退款后成交金额' }]
+  XLSX.utils.book_append_sheet(sparseWorkbook, sparseSheet, '格式刷过大的工作表')
+  const sparseBase = XLSX.write(sparseWorkbook, { type: 'buffer', bookType: 'xlsx' }) as Buffer
+  const sparseZip = await JSZip.loadAsync(sparseBase)
+  const sparseXmlPath = 'xl/worksheets/sheet1.xml'
+  const sparseXml = await sparseZip.file(sparseXmlPath)!.async('string')
+  sparseZip.file(sparseXmlPath, sparseXml.replace(/<dimension ref="[^"]+"\/>/u, '<dimension ref="A1:XFD1048576"/>'))
+  sparseZip.file('xl/media/image1.png', makePng(12, 12))
+  const sparseBytes = await sparseZip.generateAsync({ type: 'nodebuffer' })
+  const sparseParsed = await parseFile(
+    '平台格式刷.xlsx',
+    sparseBytes.buffer.slice(sparseBytes.byteOffset, sparseBytes.byteOffset + sparseBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(sparseParsed.ok, true, sparseParsed.error)
+  assert.match(sparseParsed.text, /酸菜,1234/u)
+  assert.match(sparseParsed.text, /SUM\(1200,34\)/u)
+  assert.match(sparseParsed.text, /https:\/\/example\.com\/source-row/u)
+  assert.match(sparseParsed.text, /这是退款后成交金额/u)
+  assert.equal(sparseParsed.attachments?.length, 1)
+  assert.match(sparseParsed.warning || '', /内嵌图片/u)
+
+  for (const bookType of ['xlsm', 'xlsb', 'ods'] as const) {
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['商品', '成交金额'], ['酸菜', 1234]]), '经营数据')
+    const workbookBytes = XLSX.write(workbook, { type: 'buffer', bookType }) as Buffer
+    const parsedWorkbook = await parseFile(
+      `经营数据.${bookType}`,
+      workbookBytes.buffer.slice(
+        workbookBytes.byteOffset,
+        workbookBytes.byteOffset + workbookBytes.byteLength
+      ) as ArrayBuffer
+    )
+    assert.equal(parsedWorkbook.ok, true, `${bookType}: ${parsedWorkbook.error || ''}`)
+    assert.match(parsedWorkbook.text, /酸菜,1234/u)
+  }
+
+  const sharp = (await import('sharp')).default
+  const tiffBytes = await sharp({
+    create: { width: 24, height: 18, channels: 3, background: { r: 20, g: 120, b: 220 } }
+  }).tiff().toBuffer()
+  const tiffParsed = await parseFile(
+    '扫描图片.tiff',
+    tiffBytes.buffer.slice(tiffBytes.byteOffset, tiffBytes.byteOffset + tiffBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(tiffParsed.ok, true, tiffParsed.error)
+  assert.equal(tiffParsed.attachments?.length, 1)
+  assert.match(tiffParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+  assert.match(tiffParsed.warning || '', /自动/u)
+
+  const gifBytes = await sharp({
+    create: { width: 18, height: 18, channels: 4, background: { r: 240, g: 120, b: 20, alpha: 1 } }
+  }).gif().toBuffer()
+  const gifParsed = await parseFile(
+    '素材动图.gif',
+    gifBytes.buffer.slice(gifBytes.byteOffset, gifBytes.byteOffset + gifBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(gifParsed.ok, true, gifParsed.error)
+  assert.equal(gifParsed.attachments?.length, 1)
+  assert.match(gifParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+
+  const pptx = new JSZip()
+  pptx.file('[Content_Types].xml', '<Types/>')
+  pptx.file(
+    'ppt/slides/slide1.xml',
+    '<p:sld xmlns:p="p" xmlns:a="a"><a:t xml:space="preserve">保留空格的产品卖点</a:t></p:sld>'
+  )
+  pptx.file('ppt/slides/slide2.xml', '<p:sld xmlns:p="p" xmlns:a="a"></p:sld>')
+  pptx.file('ppt/media/image1.png', makePng(10, 10))
+  const pptxBytes = await pptx.generateAsync({ type: 'arraybuffer' })
+  const pptxParsed = await parseFile('产品手卡.pptx', pptxBytes)
+  assert.equal(pptxParsed.ok, true, pptxParsed.error)
+  assert.match(pptxParsed.text, /保留空格的产品卖点/u)
+  assert.match(pptxParsed.warning || '', /第 2 页没有可提取文字/u)
+  assert.match(pptxParsed.warning || '', /1 张内嵌图片/u)
+  assert.equal(pptxParsed.attachments?.length, 1)
+  assert.match(pptxParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+
+  const imageOnlyPptx = new JSZip()
+  imageOnlyPptx.file('[Content_Types].xml', '<Types/>')
+  imageOnlyPptx.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="p" xmlns:a="a"></p:sld>')
+  imageOnlyPptx.file('ppt/media/only.png', makePng(20, 20))
+  const imageOnlyBytes = await imageOnlyPptx.generateAsync({ type: 'arraybuffer' })
+  const imageOnlyParsed = await parseFile('纯图产品手卡.pptx', imageOnlyBytes)
+  assert.equal(imageOnlyParsed.ok, true, imageOnlyParsed.error)
+  assert.equal(imageOnlyParsed.text, '')
+  assert.equal(imageOnlyParsed.attachments?.length, 1)
+
   const malformed = Buffer.from('name,comment\nA,"没有结束\n', 'utf8')
   const malformedParsed = await parseFile(
     'malformed.csv',
     malformed.buffer.slice(malformed.byteOffset, malformed.byteOffset + malformed.byteLength) as ArrayBuffer
   )
-  assert.equal(malformedParsed.ok, false)
-  assert.match(malformedParsed.error || '', /CSV/)
+  assert.equal(malformedParsed.ok, true, 'malformed CSV falls back to complete raw text instead of failing the file')
+  assert.match(malformedParsed.warning || '', /完整原文继续清洗/u)
+  assert.equal(malformedParsed.text, malformed.toString('utf8').trim())
 
   const wrongColumns = Buffer.from('a,b\n1,2,3\n', 'utf8')
   const wrongColumnsParsed = await parseFile(
@@ -2833,6 +3176,40 @@ async function testCsvAndArchiveGuards(): Promise<void> {
   assert.match(wrongColumnsParsed.warning || '', /自动兼容/)
   const preservedWrongColumns = Papa.parse<string[]>(wrongColumnsParsed.text).data as string[][]
   assert.deepEqual(preservedWrongColumns[1], ['1', '2', '3'])
+
+  const oversizedExtract = Buffer.from(`name,content\nA,${'x'.repeat(1_000_100)}`, 'utf8')
+  const oversizedExtractParsed = await parseFile(
+    'oversized-extract.csv',
+    oversizedExtract.buffer.slice(
+      oversizedExtract.byteOffset,
+      oversizedExtract.byteOffset + oversizedExtract.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(oversizedExtractParsed.ok, true, 'dynamic cleaning accepts content above the former one-million-character cap')
+  assert.equal(oversizedExtractParsed.text.length, oversizedExtract.toString('utf8').trim().length)
+  const oversizedPlan = buildSourceCleanBatchPlan({
+    name: oversizedExtractParsed.name,
+    kind: 'table',
+    text: oversizedExtractParsed.text
+  })
+  assert.ok(oversizedPlan.batches.length > 1)
+  const oversizedSentText = oversizedPlan.batches.map((batch) => batch.source.text || '').join('\n')
+  assert.equal(
+    (oversizedSentText.match(/x/gu) || []).length,
+    1_000_100,
+    'every character from an oversized table cell enters exactly one cleaning batch'
+  )
+  const beyondSafetyLimit = Buffer.from('z'.repeat(4_000_100), 'utf8')
+  const beyondSafetyParsed = await parseFile(
+    '超过稳定性上限.txt',
+    beyondSafetyLimit.buffer.slice(
+      beyondSafetyLimit.byteOffset,
+      beyondSafetyLimit.byteOffset + beyondSafetyLimit.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(beyondSafetyParsed.ok, false)
+  assert.equal(beyondSafetyParsed.text, '')
+  assert.match(beyondSafetyParsed.error || '', /4,000,000|未做截断/u)
 
   const line678Rows = ['a,b']
   for (let index = 2; index <= 677; index++) line678Rows.push(`${index},正常`)
@@ -2876,6 +3253,36 @@ async function testCsvAndArchiveGuards(): Promise<void> {
     ['文件夹A/同名.txt', '文件夹B/同名.txt']
   )
 
+  const mixedArchive = new JSZip()
+  mixedArchive.file('数据/成交.tsv', '字段\t数值\nGMV\t1234')
+  mixedArchive.file('数据/画像.json', JSON.stringify({ 人群: '家庭用户' }))
+  mixedArchive.file('说明/网页.html', '<p>用户反馈：包装方便</p>')
+  const mixedBytes = await mixedArchive.generateAsync({ type: 'arraybuffer' })
+  const mixedItems = await parseArchive('混合资料.zip', mixedBytes)
+  assert.equal(mixedItems.length, 3)
+  assert.ok(mixedItems.every((item) => item.ok), JSON.stringify(mixedItems))
+  assert.match(mixedItems.find((item) => item.name.endsWith('成交.tsv'))?.text || '', /GMV,1234/u)
+  assert.match(mixedItems.find((item) => item.name.endsWith('画像.json'))?.text || '', /家庭用户/u)
+  assert.match(mixedItems.find((item) => item.name.endsWith('网页.html'))?.text || '', /包装方便/u)
+
+  const officeArchive = new JSZip()
+  officeArchive.file('手卡/产品手卡.pptx', pptxBytes)
+  const officeArchiveBytes = await officeArchive.generateAsync({ type: 'arraybuffer' })
+  const officeArchiveItems = await parseArchive('Office资料.zip', officeArchiveBytes)
+  assert.match(officeArchiveItems.find((item) => item.name.endsWith('产品手卡.pptx'))?.text || '', /保留空格的产品卖点/u)
+  assert.ok(
+    officeArchiveItems.some((item) => item.kind === 'image' && item.name.includes('产品手卡.pptx/内嵌图片')),
+    JSON.stringify(officeArchiveItems)
+  )
+
+  const crowdedArchive = new JSZip()
+  for (let index = 0; index < 121; index++) crowdedArchive.file(`无关视频-${index}.mp4`, 'x')
+  crowdedArchive.file('zzz-关键产品资料.txt', '这份有效资料必须优先解析')
+  const crowdedBytes = await crowdedArchive.generateAsync({ type: 'arraybuffer' })
+  const crowdedItems = await parseArchive('条目较多.zip', crowdedBytes)
+  assert.match(crowdedItems.find((item) => item.name === 'zzz-关键产品资料.txt')?.text || '', /必须优先解析/u)
+  assert.ok(crowdedItems.some((item) => /数量提示/u.test(item.name)))
+
   const officeBomb = new JSZip()
   officeBomb.file('xl/worksheets/sheet1.xml', '0'.repeat(2 * 1024 * 1024))
   const officeBytes = await officeBomb.generateAsync({
@@ -2918,6 +3325,34 @@ async function testFileCountGuard(): Promise<void> {
   await useStore.getState().addSources(files)
   assert.equal(useStore.getState().sources.length, 50)
   assert.match(useStore.getState().messages[0]?.text || '', /最多保留 50/)
+
+  useStore.setState({
+    phase: 'idle',
+    sources: [],
+    messages: [],
+    artifacts: {},
+    reportMarkdown: '',
+    cleanedData: '',
+    cleanDetails: [],
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+  const mixedFiles = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      name: `系统附件-${index}.mp4`,
+      size: 2,
+      arrayBuffer: async () => new ArrayBuffer(2)
+    })),
+    ...Array.from({ length: 50 }, (_, index) => ({
+      name: `有效资料-${index}.txt`,
+      size: 2,
+      arrayBuffer: async () => new TextEncoder().encode('ok').buffer
+    }))
+  ] as unknown as File[]
+  await useStore.getState().addSources(mixedFiles)
+  assert.equal(useStore.getState().sources.length, 50)
+  assert.ok(useStore.getState().sources.every((source) => source.name.startsWith('有效资料-')))
+  assert.ok(useStore.getState().sources.every((source) => source.text === 'ok'))
 }
 
 async function testZipExpansionGlobalCountGuard(): Promise<void> {
@@ -2952,8 +3387,149 @@ async function testZipExpansionGlobalCountGuard(): Promise<void> {
     arrayBuffer: async () => new ArrayBuffer(8)
   })) as unknown as File[]
   await useStore.getState().addSources(zips)
-  assert.equal(useStore.getState().sources.length, 50)
-  assert.equal(useStore.getState().sources.filter((source) => /数量提示/.test(source.name)).length, 1)
+  assert.equal(useStore.getState().sources.length, 240)
+  assert.equal(new Set(useStore.getState().sources.map((source) => source.topLevelId)).size, 2)
+  assert.equal(useStore.getState().sources.every((source) => source.derivedKind === 'archive-entry'), true)
+  assert.equal(useStore.getState().sources.filter((source) => /数量提示/.test(source.name)).length, 0)
+
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      parseArchive: async () => [
+        ...Array.from({ length: 49 }, (_, index) => ({
+          name: `不支持-${index}.mp4`,
+          kind: 'other' as const,
+          size: 100_000,
+          ok: false,
+          error: '暂不支持'
+        })),
+        { name: '关键经营数据.tsv', kind: 'table' as const, size: 20, text: '字段,数值\nGMV,1234', ok: true },
+        { name: '关键产品手卡.json', kind: 'doc' as const, size: 20, text: '{"产品":"酸菜"}', ok: true }
+      ]
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [],
+    messages: [],
+    artifacts: {},
+    reportMarkdown: '',
+    cleanedData: '',
+    cleanDetails: [],
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+  await useStore.getState().addSources([
+    { name: '混合资料.zip', size: 10, arrayBuffer: async () => new ArrayBuffer(8) } as unknown as File
+  ])
+  assert.ok(useStore.getState().sources.some((source) => source.name === '关键经营数据.tsv'))
+  assert.ok(useStore.getState().sources.some((source) => source.name === '关键产品手卡.json'))
+}
+
+async function testSourceCleaningFailureIsolation(): Promise<void> {
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      lookupSourceCleanCache: async () => {
+        throw new Error('模拟缓存不可用')
+      },
+      storeSourceCleanCache: async () => {
+        throw new Error('模拟缓存写入失败')
+      },
+      saveLastProject: async (project: SavedProject) => project,
+      recordCostOptimization: async () => true,
+      sendChat: (
+        messages: unknown,
+        context: { sourceId?: string },
+        handlers: { onDone?: (value: string) => void; onError?: (value: string) => void }
+      ) => {
+        queueMicrotask(() => {
+          if (context.sourceId === 'broken-source') {
+            // 供应商偶发返回“成功但空内容”时，合并函数会抛错；也必须只影响当前文件。
+            handlers.onDone?.('')
+          } else {
+            const evidenceIds = context.sourceId === 'good-source'
+              ? buildSourceCleanBatchPlan({ name: '可正常处理的资料.json', kind: 'doc', text: '{"产品":"酸菜"}' })
+                  .batches.flatMap((batch) => batch.context.evidenceIds)
+              : [...new Set(JSON.stringify(messages).match(/POR-[RTI]-[A-F0-9]{8}-\d{6}/gu) || [])]
+            handlers.onDone?.(`成功资料的完整清洗结果\n${evidenceIds.join('\n')}`)
+          }
+        })
+        return { abort: () => undefined }
+      }
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [
+      {
+        id: 'broken-source',
+        name: '暂时失败的资料.md',
+        kind: 'doc',
+        text: '# 暂时失败',
+        attribution: '自有数据'
+      },
+      {
+        id: 'good-source',
+        name: '可正常处理的资料.json',
+        kind: 'doc',
+        text: '{"产品":"酸菜"}',
+        attribution: '自有数据'
+      }
+    ],
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    abortFn: null,
+    analysisSessionId: crypto.randomUUID()
+  })
+
+  await useStore.getState()._runCleaning(false)
+
+  assert.deepEqual(useStore.getState().cleanDetails.map((detail) => detail.id), ['good-source'])
+  assert.equal(useStore.getState().cleaningProgress.done, 1)
+  assert.equal(useStore.getState().cleaningProgress.failed, 1)
+  assert.equal(useStore.getState().phase, 'idle')
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /其他资料已继续清洗并保留/u)
+}
+
+async function testParseFailureBlocksGeneration(): Promise<void> {
+  let chatCalls = 0
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      sendChat: () => {
+        chatCalls++
+        return { abort: () => undefined }
+      }
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [
+      { id: 'good', name: '已解析.txt', kind: 'doc', text: '有效资料', attribution: '自有数据' },
+      { id: 'bad', name: '扫描件.pdf', kind: 'doc', error: 'PDF 没有可提取的文本层' }
+    ],
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+
+  await useStore.getState().startGeneration()
+
+  assert.equal(chatCalls, 0)
+  assert.equal(useStore.getState().phase, 'idle')
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /为避免报告漏掉资料，本次没有开始分析/u)
 }
 
 async function testPrivacyMustMatchEndpoint(): Promise<void> {
@@ -3995,6 +4571,10 @@ async function run(): Promise<void> {
   await testFileCountGuard()
   console.log('Regression: ZIP expansion global count guard')
   await testZipExpansionGlobalCountGuard()
+  console.log('Regression: one source cleaning failure does not block other files')
+  await testSourceCleaningFailureIsolation()
+  console.log('Regression: parse failures cannot be silently omitted from a report')
+  await testParseFailureBlocksGeneration()
   console.log('Regression: privacy endpoint guard')
   await testPrivacyMustMatchEndpoint()
   console.log('Regression: image header guards')

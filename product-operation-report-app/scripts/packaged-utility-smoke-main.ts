@@ -33,6 +33,17 @@ function makePdf(): Uint8Array {
   return new TextEncoder().encode(pdf)
 }
 
+function makePng(width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(33)
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const view = new DataView(bytes.buffer)
+  view.setUint32(8, 13)
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12)
+  view.setUint32(16, width)
+  view.setUint32(20, height)
+  return bytes
+}
+
 async function waitForReady(child: UtilityProcess): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Packaged parse utility ready timeout')), 8_000)
@@ -105,6 +116,33 @@ async function run(): Promise<void> {
   assert.equal(markdownResult.result?.ok, true, JSON.stringify(markdownResult))
   assert.match(markdownResult.result?.text || '', /安装版 Markdown 可解析/)
 
+  const tsv = new TextEncoder().encode('字段\t数值\n成交金额\t1234')
+  const tsvResult = await request(child, 'tsv', 'file', '经营数据.tsv', exactBuffer(tsv))
+  assert.equal(tsvResult.result?.ok, true, JSON.stringify(tsvResult))
+  assert.match(tsvResult.result?.text || '', /成交金额,1234/)
+
+  const json = new TextEncoder().encode('{"产品":"酸菜","成交金额":1234}')
+  const jsonResult = await request(child, 'json', 'file', '经营数据.json', exactBuffer(json))
+  assert.equal(jsonResult.result?.ok, true, JSON.stringify(jsonResult))
+  assert.match(jsonResult.result?.text || '', /"成交金额": 1234/)
+
+  const yaml = new TextEncoder().encode('产品: 酸菜\n成交金额: 1234')
+  const yamlResult = await request(child, 'yaml', 'file', '经营数据.yaml', exactBuffer(yaml))
+  assert.equal(yamlResult.result?.ok, true, JSON.stringify(yamlResult))
+  assert.match(yamlResult.result?.text || '', /成交金额: 1234/)
+
+  const rtf = new TextEncoder().encode('{\\rtf1\\ansi Product benefit\\par GMV 1234}')
+  const rtfResult = await request(child, 'rtf', 'file', '产品说明.rtf', exactBuffer(rtf))
+  assert.equal(rtfResult.result?.ok, true, JSON.stringify(rtfResult))
+  assert.match(rtfResult.result?.text || '', /Product benefit[\s\S]*GMV 1234/)
+  assert.doesNotMatch(rtfResult.result?.text || '', /\\rtf1|\\par/)
+
+  const html = new TextEncoder().encode('<h1>经营摘要</h1><p>成交金额 1234</p><script>bad()</script>')
+  const parsedHtmlResult = await request(child, 'html', 'file', '网页导出.html', exactBuffer(html))
+  assert.equal(parsedHtmlResult.result?.ok, true, JSON.stringify(parsedHtmlResult))
+  assert.match(parsedHtmlResult.result?.text || '', /经营摘要[\s\S]*成交金额 1234/)
+  assert.doesNotMatch(parsedHtmlResult.result?.text || '', /bad\(\)/)
+
   const raggedCsv = new TextEncoder().encode('name,value\nalpha,1,extra')
   const raggedResult = await request(
     child,
@@ -124,9 +162,28 @@ async function run(): Promise<void> {
   assert.equal(xlsxResult.result?.ok, true, JSON.stringify(xlsxResult))
   assert.match(xlsxResult.result?.text || '', /beta/)
 
+  const pptx = new JSZip()
+  pptx.file('[Content_Types].xml', '<Types/>')
+  pptx.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="p" xmlns:a="a"><a:t>产品图片说明</a:t></p:sld>')
+  pptx.file('ppt/media/image1.png', makePng(10, 10))
+  const pptxBytes = await pptx.generateAsync({ type: 'arraybuffer' })
+  const pptxResult = await request(child, 'pptx', 'file', '产品手卡.pptx', pptxBytes)
+  assert.equal(pptxResult.result?.ok, true, JSON.stringify(pptxResult))
+  assert.match(pptxResult.result?.text || '', /产品图片说明/u)
+  assert.equal(pptxResult.result?.attachments?.length, 1)
+
   const pdfResult = await request(child, 'pdf', 'file', 'sample.pdf', exactBuffer(makePdf()))
   assert.equal(pdfResult.result?.ok, true, JSON.stringify(pdfResult))
   assert.match(pdfResult.result?.text || '', /Hello PDF/)
+
+  const sharp = (await import('sharp')).default
+  const tiffBytes = await sharp({
+    create: { width: 16, height: 12, channels: 3, background: { r: 20, g: 120, b: 220 } }
+  }).tiff().toBuffer()
+  const tiffResult = await request(child, 'tiff', 'file', '扫描图片.tiff', exactBuffer(tiffBytes))
+  assert.equal(tiffResult.result?.ok, true, JSON.stringify(tiffResult))
+  assert.equal(tiffResult.result?.attachments?.length, 1)
+  assert.match(tiffResult.result?.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
 
   const zip = new JSZip()
   zip.file('inside.csv', 'name,value\ngamma,3')
@@ -203,7 +260,7 @@ evidence-confidence: confirmed
 void app.whenReady().then(async () => {
   try {
     await run()
-    console.log('Packaged ASAR checks passed: Markdown, CSV, XLSX, PDF, ZIP, offline HTML renderer and bundled Skill.')
+    console.log('Packaged ASAR checks passed: Markdown, CSV/TSV, JSON/YAML, RTF, HTML, XLSX, PDF, TIFF conversion, ZIP, offline HTML renderer and bundled Skill.')
     app.exit(0)
   } catch (error) {
     console.error(error)

@@ -9,6 +9,9 @@ files:
   - package.json
 asarUnpack:
   - assets/**/*
+  - node_modules/@napi-rs/canvas-*/**/*
+  - node_modules/@img/**/*
+  - node_modules/sharp/**/*
 # 正式安装包只连接业务代理；模型供应商密钥绝不进入构建产物。
 afterPack: build/afterPack.cjs
 electronFuses:

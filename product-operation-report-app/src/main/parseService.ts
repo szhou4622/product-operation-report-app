@@ -183,6 +183,8 @@ function isValidParsedFile(value: unknown): value is ParsedFile {
     (value.kind === 'table' || value.kind === 'doc' || value.kind === 'other') &&
     typeof value.text === 'string' &&
     typeof value.ok === 'boolean' &&
+    (value.attachments === undefined ||
+      (Array.isArray(value.attachments) && value.attachments.length <= 50 && value.attachments.every(isValidArchiveItem))) &&
     (value.error === undefined || typeof value.error === 'string') &&
     (value.warning === undefined || typeof value.warning === 'string')
   )
@@ -197,7 +199,10 @@ function isValidArchiveItem(value: unknown): value is ArchiveItem {
     typeof value.ok === 'boolean' &&
     (value.size === undefined || (typeof value.size === 'number' && value.size >= 0)) &&
     (value.text === undefined || typeof value.text === 'string') &&
-    (value.dataUrl === undefined || typeof value.dataUrl === 'string') &&
+    (value.dataUrl === undefined ||
+      (typeof value.dataUrl === 'string' &&
+        value.dataUrl.length <= 14_000_000 &&
+        /^data:image\/(?:png|jpeg|webp|gif);base64,/u.test(value.dataUrl))) &&
     (value.error === undefined || typeof value.error === 'string') &&
     (value.warning === undefined || typeof value.warning === 'string')
   )
