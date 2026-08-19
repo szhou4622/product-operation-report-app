@@ -1421,7 +1421,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
   const originalFetch = globalThis.fetch
   const payload = Buffer.from('verified-update-payload', 'utf8')
   const correctChecksum = createHash('sha256').update(payload).digest('hex')
-  const assetKey = process.platform === 'win32' ? 'windows_x64' : process.arch === 'arm64' ? 'macos_arm64' : 'macos_x64'
+  const assetKey = process.platform === 'win32' ? 'windows_x64' : process.arch === 'arm64' ? 'mac_arm64' : 'mac_x64'
   const assetUrl = process.platform === 'win32'
     ? 'https://update.dadaozixun.com/POR-test-update.exe'
     : `https://update.dadaozixun.com/POR-test-update-${process.arch}.dmg`
