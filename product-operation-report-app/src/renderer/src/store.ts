@@ -34,7 +34,7 @@ import { validateReportEvidenceLinks, validateReportStructure } from './validate
 import { friendlyError } from './store/errors'
 import { buildProjectSnapshot } from './store/persistence'
 import { mergeRevisionParts, runFinalReportInParts, runModelRetry, selectRevisionParts } from './store/analysis'
-import { planCleaningConcurrency } from './store/cleaning'
+import { isTemporaryReservationContention, planCleaningConcurrency } from './store/cleaning'
 
 export { friendlyError } from './store/errors'
 export { buildProjectSnapshot } from './store/persistence'
@@ -1639,7 +1639,19 @@ export const useStore = create<StoreState>((set, get) => ({
               get()._post('assistant', `⚠️ ${s.name}：${warning}`, 'narration')
             }
             const batchOutputs: Array<string | undefined> = new Array(batchPlan.batches.length)
+            const perSourceBatchConcurrency = Math.min(
+              batchPlan.batches.length,
+              concurrencyPlan.batchWorkersPerSource
+            )
+            if (batchPlan.batches.length > 1 && perSourceBatchConcurrency > 1) {
+              get()._post(
+                'assistant',
+                `「${s.name}」共 ${batchPlan.batches.length} 批，将同时处理 ${perSourceBatchConcurrency} 批以缩短等待时间。`,
+                'narration'
+              )
+            }
             let sourceFailed = false
+            let activeBatchRequests = 0
             const markSourceFailure = (error: string): void => {
               if (sourceFailed) return
               sourceFailed = true
@@ -1651,6 +1663,37 @@ export const useStore = create<StoreState>((set, get) => ({
                   failed: state.cleaningProgress.failed + 1
                 }
               }))
+            }
+            const runWithReservationBackpressure = async (
+              label: string,
+              run: () => ReturnType<typeof runModelRetry>
+            ): Promise<Awaited<ReturnType<typeof runModelRetry>>> => {
+              let reservationRetry = 0
+              while (!cancelled && isCurrentSession()) {
+                activeBatchRequests += 1
+                let result: Awaited<ReturnType<typeof runModelRetry>>
+                try {
+                  result = await run()
+                } finally {
+                  activeBatchRequests = Math.max(0, activeBatchRequests - 1)
+                }
+                if (
+                  result.ok || reservationRetry >= perSourceBatchConcurrency ||
+                  !isTemporaryReservationContention(result.error, activeBatchRequests)
+                ) return result
+                reservationRetry += 1
+                get()._post(
+                  'assistant',
+                  `${label}正在等待其他批次释放预留积分，释放后会自动继续，不会重复扣费。`,
+                  'narration'
+                )
+                let waits = 0
+                while (activeBatchRequests > 0 && !cancelled && isCurrentSession() && waits < 360) {
+                  await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
+                  waits += 1
+                }
+              }
+              return { ok: false, text: '', error: '已停止' }
             }
             let nextBatch = 0
             const batchWorker = async (): Promise<void> => {
@@ -1671,25 +1714,28 @@ export const useStore = create<StoreState>((set, get) => ({
                   batchOutputs[batchPosition] = savedBatch.output
                   continue
                 }
-                const res = await runModelRetry(
-                  buildExtractMessages(batch.source, batch.context),
-                  () => {},
-                  (fn) => {
-                    if (fn) aborts.add(fn)
-                  },
-                  undefined,
-                  1,
-                  {
-                    reportSessionId: sessionId,
-                    taskType: 'source_clean',
-                    taskKey: batchTaskId,
-                    billingRequestId: batchTaskId,
-                    isVision: s.kind === 'image',
-                    sourceCount,
-                    imageCount,
-                    sourceId: s.id,
-                    stepId: `batch-${batch.context.batchIndex}-of-${batch.context.batchCount}`
-                  }
+                const res = await runWithReservationBackpressure(
+                  `「${s.name}」第 ${batch.context.batchIndex} 批`,
+                  () => runModelRetry(
+                    buildExtractMessages(batch.source, batch.context),
+                    () => {},
+                    (fn) => {
+                      if (fn) aborts.add(fn)
+                    },
+                    undefined,
+                    1,
+                    {
+                      reportSessionId: sessionId,
+                      taskType: 'source_clean',
+                      taskKey: batchTaskId,
+                      billingRequestId: batchTaskId,
+                      isVision: s.kind === 'image',
+                      sourceCount,
+                      imageCount,
+                      sourceId: s.id,
+                      stepId: `batch-${batch.context.batchIndex}-of-${batch.context.batchCount}`
+                    }
+                  )
                 )
                 if (!isCurrentSession()) return
                 if (!res.ok) {
@@ -1708,25 +1754,28 @@ export const useStore = create<StoreState>((set, get) => ({
                     'narration'
                   )
                   const repairTaskId = `${batchTaskId}:coverage-repair-v1`
-                  const repair = await runModelRetry(
-                    buildExtractMessages(batch.source, batch.context),
-                    () => {},
-                    (fn) => {
-                      if (fn) aborts.add(fn)
-                    },
-                    undefined,
-                    0,
-                    {
-                      reportSessionId: sessionId,
-                      taskType: 'source_clean',
-                      taskKey: repairTaskId,
-                      billingRequestId: repairTaskId,
-                      isVision: s.kind === 'image',
-                      sourceCount,
-                      imageCount,
-                      sourceId: s.id,
-                      stepId: `batch-${batch.context.batchIndex}-coverage-repair`
-                    }
+                  const repair = await runWithReservationBackpressure(
+                    `「${s.name}」第 ${batch.context.batchIndex} 批补做`,
+                    () => runModelRetry(
+                      buildExtractMessages(batch.source, batch.context),
+                      () => {},
+                      (fn) => {
+                        if (fn) aborts.add(fn)
+                      },
+                      undefined,
+                      0,
+                      {
+                        reportSessionId: sessionId,
+                        taskType: 'source_clean',
+                        taskKey: repairTaskId,
+                        billingRequestId: repairTaskId,
+                        isVision: s.kind === 'image',
+                        sourceCount,
+                        imageCount,
+                        sourceId: s.id,
+                        stepId: `batch-${batch.context.batchIndex}-coverage-repair`
+                      }
+                    )
                   )
                   if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
                     markSourceFailure(`第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`)
@@ -1748,17 +1797,6 @@ export const useStore = create<StoreState>((set, get) => ({
                 }))
                 scheduleCleaningCheckpointSave(get)
               }
-            }
-            const perSourceBatchConcurrency = Math.min(
-              batchPlan.batches.length,
-              concurrencyPlan.batchWorkersPerSource
-            )
-            if (batchPlan.batches.length > 1 && perSourceBatchConcurrency > 1) {
-              get()._post(
-                'assistant',
-                `「${s.name}」共 ${batchPlan.batches.length} 批，将同时处理 ${perSourceBatchConcurrency} 批以缩短等待时间。`,
-                'narration'
-              )
             }
             await Promise.all(Array.from({ length: perSourceBatchConcurrency }, () => batchWorker()))
             if (!isCurrentSession()) return

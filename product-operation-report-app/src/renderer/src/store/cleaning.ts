@@ -19,3 +19,8 @@ export function planCleaningConcurrency(sourceCount: number, maxReportConcurrenc
     maximumActiveRequests: sourceWorkers * batchWorkersPerSource
   }
 }
+
+export function isTemporaryReservationContention(error: unknown, otherActiveRequests: number): boolean {
+  if (otherActiveRequests <= 0) return false
+  return /(?:HTTP\s*)?402|Payment Required|积分不足|预留积分/u.test(String(error || ''))
+}

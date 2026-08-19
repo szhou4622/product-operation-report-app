@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { cleaningBatchConcurrency, planCleaningConcurrency } from './cleaning'
+import {
+  cleaningBatchConcurrency,
+  isTemporaryReservationContention,
+  planCleaningConcurrency
+} from './cleaning'
 
 describe('cleaning batch concurrency', () => {
   it('uses spare report slots without exceeding the server-wide limit', () => {
@@ -23,5 +27,12 @@ describe('cleaning batch concurrency', () => {
     const minimumWaves = Math.ceil(totalBatches / plan.maximumActiveRequests)
     expect(totalBatches).toBe(600)
     expect(minimumWaves).toBe(150)
+  })
+
+  it('waits for concurrent reservations but reports a real exhausted balance', () => {
+    expect(isTemporaryReservationContention('HTTP 402 Payment Required：积分不足', 2)).toBe(true)
+    expect(isTemporaryReservationContention('积分不足，本批需要预留积分', 1)).toBe(true)
+    expect(isTemporaryReservationContention('积分不足，本批需要预留积分', 0)).toBe(false)
+    expect(isTemporaryReservationContention('模型线路不可用', 3)).toBe(false)
   })
 })
