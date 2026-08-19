@@ -124,6 +124,8 @@ export interface PointsWalletStatus {
   unbilledUsageCount: number
   pricing: PointsPricingInfo
   ledger: PointsLedgerEntry[]
+  stale?: boolean
+  warning?: string
 }
 
 export interface PointsAccessResult {
@@ -456,6 +458,8 @@ export interface SavedProject {
   phase: ProjectPhase
   steering: string
   updatedAt: string
+  /** Missing external data chunks encountered during recovery; unaffected project content remains usable. */
+  missingBlobs?: string[]
 }
 
 export interface ProjectStoragePreflight {

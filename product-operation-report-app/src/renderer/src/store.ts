@@ -63,6 +63,19 @@ const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
 const MAX_SOURCE_FILES = 50
+let cleaningCheckpointSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+function formatPointsValue(value: number): string {
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
+}
+
+function scheduleCleaningCheckpointSave(getState: () => StoreState): void {
+  if (cleaningCheckpointSaveTimer) clearTimeout(cleaningCheckpointSaveTimer)
+  cleaningCheckpointSaveTimer = setTimeout(() => {
+    cleaningCheckpointSaveTimer = null
+    void window.api.saveLastProject(buildProjectSnapshot(getState())).catch(() => undefined)
+  }, 500)
+}
 
 export function topLevelSourceCount(sources: Pick<Source, 'id' | 'topLevelId'>[]): number {
   return new Set(sources.map((source) => source.topLevelId || source.id)).size
@@ -1117,6 +1130,14 @@ export const useStore = create<StoreState>((set, get) => ({
         text: '上次任务在执行过程中退出了，已恢复保存好的资料和完整结果。请检查后重新开始。'
       })
     }
+    if (lastProject?.missingBlobs?.length) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `恢复项目时发现 ${lastProject.missingBlobs.length} 个资料块丢失。其他内容已正常恢复，请重新上传：${lastProject.missingBlobs.join('、')}`
+      })
+    }
     set({
       initialized: true,
       persistencePaused: false,
@@ -1269,6 +1290,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'narration',
         text: '上一份分析在执行过程中退出了，已恢复已保存的内容。请检查资料后重新开始。'
+      })
+    }
+    if (previous.missingBlobs?.length) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `上一份项目有 ${previous.missingBlobs.length} 个资料块丢失，其他内容已恢复，请重新上传：${previous.missingBlobs.join('、')}`
       })
     }
 
@@ -1956,6 +1985,18 @@ export const useStore = create<StoreState>((set, get) => ({
               }
             }
             const batchPlan = buildSourceCleanBatchPlan(cacheInput)
+            if (batchPlan.degradedReason) {
+              const reason = batchPlan.degradedReason === 'quotes'
+                ? '引号未闭合'
+                : batchPlan.degradedReason === 'too_wide'
+                  ? '列数超过200'
+                  : '有效行列不足，无法识别为规则表格'
+              const warning = `该表格结构不规则（${reason}），已按整篇文本清洗；逐行核对不可用，请在资料确认页重点检查这份文件。`
+              set((state) => ({
+                sources: state.sources.map((source) => source.id === s.id ? { ...source, warning } : source)
+              }))
+              get()._post('assistant', `⚠️ ${s.name}：${warning}`, 'narration')
+            }
             const batchOutputs: string[] = []
             for (const batch of batchPlan.batches) {
               if (cancelled || !isCurrentSession()) return
@@ -1966,7 +2007,7 @@ export const useStore = create<StoreState>((set, get) => ({
                   'narration'
                 )
               }
-              const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v2-evidence:${batch.context.batchIndex}`
+              const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v3-row-anchored:${batch.context.batchIndex}`
               const savedBatch = get().taskJournal[batchTaskId]
               if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
                 batchOutputs.push(savedBatch.output)
@@ -2008,7 +2049,7 @@ export const useStore = create<StoreState>((set, get) => ({
                 break
               }
               let verifiedText = res.text
-              const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText)
+              const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batchPlan.mode)
               if (missingEvidence.length) {
                 get()._post(
                   'assistant',
@@ -2036,7 +2077,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     stepId: `batch-${batch.context.batchIndex}-coverage-repair`
                   }
                 )
-                if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text).length) {
+                if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
                   failures.push({
                     name: s.name,
                     error: `第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`
@@ -2064,7 +2105,7 @@ export const useStore = create<StoreState>((set, get) => ({
                   }
                 }
               }))
-              await window.api.saveLastProject(buildProjectSnapshot(get()))
+              scheduleCleaningCheckpointSave(get)
             }
             if (batchOutputs.length !== batchPlan.batches.length) continue
             const cleanText = combineSourceCleanBatchOutputs(batchPlan, batchOutputs)
@@ -2277,6 +2318,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
     const { sopRules, cleanedData } = get()
+    const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)
     for (const step of SOP_STEPS) {
       if (get().phase !== 'analyzing') return
       const isReportStep = step.id === REPORT_STEP_ID
@@ -2378,7 +2420,7 @@ export const useStore = create<StoreState>((set, get) => ({
         }))
       } else {
         get()._post('assistant', `⏳ 正在：${step.title}…`, 'narration')
-        const evidenceGroups = planAnalysisEvidenceGroups(cleanedData)
+        const evidenceGroups = analysisEvidenceGroups
         let res: { ok: boolean; text: string; error?: string }
         if (evidenceGroups.length === 1) {
           res = await runModelRetry(
@@ -2589,11 +2631,12 @@ export const useStore = create<StoreState>((set, get) => ({
       // 完整报告已生成；缓存失败不能影响本次结果和积分结算。
     }
     try {
-      await window.api.getReportPointsCharge(sessionId)
+      const charge = await window.api.getReportPointsCharge(sessionId)
+      const wallet = await window.api.getPointsWallet()
       if (!isCurrentSession()) return
       get()._post(
         'assistant',
-        '报告已完成，剩余积分可在页面顶部查看。',
+        `报告已完成，本次消耗 ${formatPointsValue(charge.chargedPoints)} 积分，剩余 ${formatPointsValue(wallet.balancePoints)} 积分。`,
         'narration'
       )
     } catch {
@@ -2704,11 +2747,12 @@ export const useStore = create<StoreState>((set, get) => ({
       // 修订结果已保存到项目；复用缓存失败不影响本次报告。
     }
     try {
-      await window.api.getReportPointsCharge(sessionId)
+      const charge = await window.api.getReportPointsCharge(sessionId)
+      const wallet = await window.api.getPointsWallet()
       if (!isCurrentSession()) return
       get()._post(
         'assistant',
-        '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。剩余积分可在页面顶部查看。',
+        `✅ 已完成修订，本次会话累计消耗 ${formatPointsValue(charge.chargedPoints)} 积分，剩余 ${formatPointsValue(wallet.balancePoints)} 积分。还要改可以继续说。`,
         'checkpoint'
       )
     } catch {

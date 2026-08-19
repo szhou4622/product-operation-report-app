@@ -1,5 +1,5 @@
 import type { ChatMessage, ContentPart } from '../../shared/types'
-import { MODEL_RUNTIME_RULES_VERSION } from '../../shared/reportVersions'
+import { MODEL_RUNTIME_RULES_VERSION, SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 import type { SourceCleanBatchContext } from './sourceCleanBatches'
 import {
   finalReportFormatGuide,
@@ -83,7 +83,6 @@ export const COMPACT_RUNTIME_RULES = [
   '食品、健康、功效和安全相关表达必须克制，只复述证据，不能把推测写成承诺。'
 ].join('\n')
 
-const SOURCE_TEXT_LIMIT = 70000
 const SOURCE_LINE_LIMIT = 140
 const SOURCE_LINE_CHAR_LIMIT = 1200
 const SUMMARY_TOTAL_LIMIT = 180000
@@ -271,68 +270,6 @@ function todayDateString(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-// 阶段一：资料清洗 / 归一（用原始素材 + 截图）
-export function buildCleanMessages(
-  sopRules: string,
-  sources: SourceLike[],
-  feedback?: string
-): ChatMessage[] {
-  const system =
-    (sopRules ? sopRules + '\n\n---\n\n' : '') +
-    '你正在执行《产品经营报告》的「资料清洗 / 归一」阶段。' +
-    BASE_RULES
-
-  const kindLabel = (k: string): string =>
-    k === 'image' ? '截图' : k === 'table' ? '表格' : k === 'doc' ? '文档' : '文件'
-  const uploadList = sources.map((s) => `- ${s.name}（${kindLabel(s.kind)}）`).join('\n')
-
-  const docBlock = sources
-    .filter((s) => s.kind !== 'image' && s.text)
-    .map((s) => `【文件：${s.name}】\n${compactSourceText(s.name, s.text || '')}`)
-    .join('\n\n')
-  const imgCount = sources.filter((s) => s.kind === 'image').length
-
-  const instruction = [
-    '请把我上传的资料洗成干净、结构化的数据，并且务必让我一眼就能看清每份资料被怎么分类。',
-    '1.【最重要，先做】输出「① 资料分类总览」表，必须覆盖「上传文件清单」里的每一个文件，一个都不能漏：' +
-      '文件名 | 归属(自有数据/竞品数据) | 平台/来源 | 信息类型 | 时间范围 | 数据类型 | 一句话关键内容。' +
-      '归属只能在「自有数据」和「竞品数据」二选一；素材、手卡、人群画像、交易数据等不要写进归属，放到「信息类型」。',
-    '2. 然后逐个来源做清洗归一，并按资料原本结构灵活处理：图片逐区域读取；表格保留全部有数据的行列、原字段、单位以及合计/小计身份；文档保留标题、正文、引用、表格、日期、链接和页序；半结构化资料保留层级和未知字段。只删除完全空白和明确重复的界面噪音，不抽样、不强行套表，素材的 3 秒开头保留原文。',
-    '3. 不同平台人群不要合并，保留差异并标平台；相同行去重，冲突显式标注。',
-    '4. 竞品情况（严防幻觉）：先按归属判断是否已有竞品资料。' +
-      '若有：只列资料里真实出现的竞品（名称/SKU/价格）。' +
-      '若没有：按 8 类方向（直接竞品/同类目/跨类目替代/同卖点/同痛点/同场景/同人群/同情绪）给一张「候选竞品推荐表」，' +
-      '每行必须含：方向 | 候选竞品或筛选标准 | 推荐理由（必须落到用户已有的某条数据/产品属性，如同价格带¥X、同痛点Y、同场景Z、同人群W） | 去哪找（平台+搜索关键词，如 有米云/抖音/罗盘/蝉妈妈/小红书） | 建议采集的数据 | 可信度。' +
-      '【硬约束】不要编造具体竞品的品牌名/SKU/价格/销量并当成事实；你没有实时联网数据，凡是凭通用知识提到的品牌，必须标注「凭印象·需核实·可能过时」。' +
-      '你给的是"竞品筛选标准+去哪找+推荐理由"，供用户去平台核实，不是已验证结论。',
-    '5. 末尾给一段「初步人群方向」(2-4 句)：谁在买、在什么场景、可能的主力/承接/拓展方向。',
-    '输出 Markdown，顺序固定：先「① 资料分类总览」表 → 再按来源的归一表 → 「竞品情况」小节 → 「初步人群方向」。只用资料里真实存在的信息，不要编造。'
-  ].join('\n')
-
-  const userText = [
-    '## 上传文件清单',
-    uploadList || '（无）',
-    '## 已读取的文档/表格内容',
-    docBlock || '（无文档/表格，可能只有截图）',
-    imgCount ? `（另附 ${imgCount} 张截图，请直接读图抽取数据；截图的文件名见上方清单，请逐个归类）` : '',
-    '## 本阶段任务',
-    instruction,
-    feedback ? `## 用户的纠偏要求（优先满足）\n${feedback}` : ''
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-
-  const parts: ContentPart[] = [{ type: 'text', text: userText }]
-  for (const s of sources) {
-    if (s.kind === 'image' && s.dataUrl) parts.push({ type: 'image', dataUrl: s.dataUrl })
-  }
-
-  return [
-    { role: 'system', content: system },
-    { role: 'user', content: parts.length === 1 ? userText : parts }
-  ]
-}
-
 // 阶段一（分批版）：单个文件的抽取归一 —— 每次只发一份资料，文件内容完整不截断
 // 注意：清洗阶段不带整份 SKILL.md（省体积，给文件内容腾空间），只用精简规则
 export function buildExtractMessages(
@@ -374,15 +311,16 @@ export function buildExtractMessages(
         batch.isMaterialTable
           ? '素材数量必须按“原视频/有效数据行”统计，不能按 SKU、产品种类或人群数量统计。原视频文件名和3秒开头原文必须保留。'
           : '',
-        `【完整性回执】本批必须在清洗结果中原样保留以下每一个证据ID：${batch.evidenceIds.join('、')}。` +
-          '表格的每条记录都要带上对应证据ID；文档或图片至少在对应内容段落中保留证据ID。缺少任一ID时，软件会只重试本批，不能标记为完成。'
+        batch.mode === 'table_rows'
+          ? '【完整性规则】清洗后内容必须输出为 CSV 表格，第一列固定为 __证据ID；逐行原样回填输入首列中的证据ID，不得改写、合并、集中抄写或跳行。每个ID只能对应一条有实际内容的数据行。'
+          : `【完整性回执】本批必须在对应内容段落中原样保留证据ID：${batch.evidenceIds.join('、')}。缺少时软件会只重试本批，不能标记为完成。`
       ].filter(Boolean).join('\n')
     : ''
 
   const instruction =
     ctxLine +
     [
-      `这是用户上传的一个文件。文件名：${source.name}（${kindLabel}）。请完成两件事，输出简洁 Markdown：`,
+      `这是用户上传的一个文件。文件名：${source.name}（${kindLabel}）。请完成两件事，${batch?.mode === 'table_rows' ? '第一行输出分类，随后直接输出CSV表格' : '输出简洁 Markdown'}：`,
       batchInstruction,
       '1. 第一行给「分类：归属(自有数据/竞品数据) | 平台/来源 | 信息类型 | 时间范围 | 数据类型 | 一句话关键内容」。' +
         '若用户已指定归属/平台/信息类型，直接采用用户的标注；未指定归属时只能在「自有数据」和「竞品数据」里判断；素材、手卡、人群画像、交易数据等放到「信息类型」。',
@@ -405,7 +343,8 @@ export function buildExtractMessages(
       }
     ]
   }
-  const userText = source.text ? `${instruction}\n\n## 文件内容\n${compactSourceText(source.name, source.text)}` : instruction
+  const sourceText = batch ? source.text : compactSourceText(source.name, source.text || '')
+  const userText = source.text ? `${instruction}\n\n## 文件内容\n${sourceText}` : instruction
   return [
     { role: 'system', content: system },
     { role: 'user', content: userText }

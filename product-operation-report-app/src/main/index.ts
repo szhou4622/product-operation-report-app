@@ -4,6 +4,7 @@ import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import type {
   ActivationResult,
+  ActivationStatus,
   AppSettings,
   CostOptimizationEvent,
   ChatMessage,
@@ -34,13 +35,13 @@ import {
   loadLastProject,
   loadPreviousProject,
   preflightProjectStorage,
+  pruneOrphanBlobs,
   saveLastProject,
   saveLastProjectSync
 } from './project'
 import {
   activateWithCode,
   canStartLicensedAnalysis,
-  consumeAnalysisCredit,
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
@@ -89,6 +90,8 @@ import { ChatRequestRegistry, validateChatStartPayload } from './chatAdmission'
 import {
   authorizeProxyProfiles,
   clearAiProxySession,
+  clearProxyWalletSnapshot,
+  fetchProxyWallet,
   testProxyHealth
 } from './aiProxy'
 
@@ -102,6 +105,8 @@ let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
 let hardExitTimer: ReturnType<typeof setTimeout> | null = null
 const activationOperationGate = new ExclusiveOperationGate()
+const ACTIVATION_REFRESH_MIN_INTERVAL_MS = 60_000
+let lastActivationRefreshStartedAt = 0
 const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -160,29 +165,25 @@ function ensureActivated(): void {
   if (!getActivationStatus().activated) throw new Error('软件未激活，请先输入激活码。')
 }
 
-function authorizationWallet(status = getActivationStatus()) {
-  const localShape = getPointsWalletStatus()
-  return {
-    ...localShape,
-    balancePoints: status.creditsRemaining ?? 0,
-    unlimited: status.unlimited,
-    totalTopupPoints: 0,
-    totalCostPoints: 0,
-    totalChargedPoints: 0,
-    unbilledUsageCount: 0,
-    ledger: []
-  }
-}
-
-function broadcastAuthorization(status = getActivationStatus()): void {
+async function broadcastAuthorization(status = getActivationStatus()): Promise<void> {
   const wallet = getManagedModelState().mode === 'proxy'
-    ? authorizationWallet(status)
+    ? await fetchProxyWallet().catch(() => undefined)
     : applyActivationPoints(status).wallet
   for (const window of BrowserWindow.getAllWindows()) {
     if (window.isDestroyed()) continue
     window.webContents.send('activation:changed', status)
-    window.webContents.send('points:changed', wallet)
+    if (wallet) window.webContents.send('points:changed', wallet)
   }
+}
+
+async function refreshActivationStatusThrottled(): Promise<ActivationStatus> {
+  return activationOperationGate.run(async () => {
+    if (Date.now() - lastActivationRefreshStartedAt < ACTIVATION_REFRESH_MIN_INTERVAL_MS) {
+      return getActivationStatus()
+    }
+    lastActivationRefreshStartedAt = Date.now()
+    return getActivationStatusWithServerCheck()
+  }, () => getActivationStatus())
 }
 
 function createWindow(): void {
@@ -387,17 +388,20 @@ ipcMain.handle('cost-optimization:record', (_event, event: CostOptimizationEvent
 ipcMain.handle('app:version', () => app.getVersion())
 ipcMain.handle('activation:status', () => getActivationStatus())
 ipcMain.handle('activation:refresh', async () => {
-  const status = await getActivationStatusWithServerCheck()
+  const status = await refreshActivationStatusThrottled()
   if (!status.activated) clearAiProxySession()
-  broadcastAuthorization(status)
+  await broadcastAuthorization(status)
   return status
 })
 async function runActivationOperation(operation: () => Promise<ActivationResult>): Promise<ActivationResult> {
   return activationOperationGate.run(async () => {
     const result = await operation()
-    if (result.ok) clearAiProxySession()
+    if (result.ok) {
+      clearAiProxySession()
+      lastActivationRefreshStartedAt = Date.now()
+    }
     if (!result.status.activated) clearAiProxySession()
-    broadcastAuthorization(result.status)
+    await broadcastAuthorization(result.status)
     return result
   }, () => ({
     ok: false,
@@ -436,11 +440,12 @@ ipcMain.handle('activation:code:copy', () => {
 })
 ipcMain.handle('activation:deactivate', async () => {
   const proxyMode = getManagedModelState().mode === 'proxy'
-  const before = proxyMode ? authorizationWallet() : getPointsWalletStatus()
+  const before = proxyMode ? await fetchProxyWallet().catch(() => undefined) : getPointsWalletStatus()
   const result = await deactivateCurrentDevice()
-  let wallet = proxyMode ? authorizationWallet(result.status) : before
+  let wallet = before
   if (result.ok && result.unbindId) {
     clearAiProxySession()
+    clearProxyWalletSnapshot()
     if (!proxyMode) {
       try {
         wallet = clearLocalPointsAfterUnbind(result.unbindId)
@@ -452,38 +457,31 @@ ipcMain.handle('activation:deactivate', async () => {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) {
       window.webContents.send('activation:changed', result.status)
-      window.webContents.send('points:changed', wallet)
+      if (wallet) window.webContents.send('points:changed', wallet)
     }
-  }
-  return result
-})
-ipcMain.handle('license:canStartAnalysis', () => canStartLicensedAnalysis())
-ipcMain.handle('license:consumeAnalysisCredit', (_e, operationId: string) => {
-  const result = consumeAnalysisCredit(operationId)
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send('activation:changed', result.status)
   }
   return result
 })
 ipcMain.handle('points:get', async () => {
   ensureActivated()
-  if (getManagedModelState().mode === 'proxy') return authorizationWallet()
+  if (getManagedModelState().mode === 'proxy') return fetchProxyWallet()
   applyActivationPoints(getActivationStatus())
   return reconcileTokenUsage(await readTokenUsageRecords())
 })
-ipcMain.handle('points:canStartReport', () => (
-  getManagedModelState().mode === 'proxy'
-    ? (() => {
-        const access = canStartLicensedAnalysis()
-        return { ok: access.ok, message: access.message, wallet: authorizationWallet(access.status) }
-      })()
-    : canStartPointsReport(getActivationStatus())
-))
-ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => ({
-  chargedPoints: getManagedModelState().mode === 'proxy'
-    ? 0
-    : getReportChargedPoints(reportSessionId)
-}))
+ipcMain.handle('points:canStartReport', async () => {
+  if (getManagedModelState().mode !== 'proxy') return canStartPointsReport(getActivationStatus())
+  const access = canStartLicensedAnalysis()
+  const wallet = await fetchProxyWallet()
+  return { ok: access.ok, message: access.message, wallet }
+})
+ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => {
+  if (getManagedModelState().mode !== 'proxy') return { chargedPoints: getReportChargedPoints(reportSessionId) }
+  const wallet = await fetchProxyWallet()
+  const chargedPoints = wallet.ledger
+    .filter((entry) => entry.reportSessionId === reportSessionId && entry.pointsDelta < 0)
+    .reduce((sum, entry) => sum + Math.abs(entry.pointsDelta), 0)
+  return { chargedPoints }
+})
 ipcMain.handle('points:grantDevelopment', () => {
   ensureActivated()
   const wallet = grantDevelopmentPoints(10_000, randomUUID())
@@ -494,9 +492,14 @@ ipcMain.handle('points:grantDevelopment', () => {
 })
 ipcMain.handle('points:redeem', async (_e, code: string) => {
   if (getManagedModelState().mode === 'proxy') {
+    const before = await fetchProxyWallet()
     const merged = await redeemPointsWithCode(code)
-    const wallet = authorizationWallet(merged.status)
-    if (merged.ok) broadcastAuthorization(merged.status)
+    if (merged.ok) {
+      clearAiProxySession()
+      clearProxyWalletSnapshot()
+    }
+    const wallet = merged.ok ? await fetchProxyWallet() : before
+    if (merged.ok) await broadcastAuthorization(merged.status)
     return {
       ok: merged.ok,
       message: merged.message,
@@ -874,12 +877,7 @@ ipcMain.on(
           ? undefined
           : settleTokenUsage(finalRecord)
         if (managedState.mode === 'proxy' && terminal.type === 'done') {
-          const refreshed = await getActivationStatusWithServerCheck().catch(() => getActivationStatus())
-          if (!refreshed.activated) clearAiProxySession()
-          wallet = authorizationWallet(refreshed)
-          for (const window of BrowserWindow.getAllWindows()) {
-            if (!window.isDestroyed()) window.webContents.send('activation:changed', refreshed)
-          }
+          wallet = await fetchProxyWallet().catch(() => undefined)
         }
         for (const window of BrowserWindow.getAllWindows()) {
           if (!window.isDestroyed() && wallet) window.webContents.send('points:changed', wallet)
@@ -927,6 +925,10 @@ if (hasSingleInstanceLock) {
   app.whenReady().then(() => {
     setupMenu()
     createWindow()
+    const blobPruneTimer = setTimeout(() => {
+      void pruneOrphanBlobs().catch(() => undefined)
+    }, 30_000)
+    blobPruneTimer.unref()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })

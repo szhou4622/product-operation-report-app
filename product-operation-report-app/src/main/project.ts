@@ -11,7 +11,7 @@ import {
   statfsSync,
   writeFileSync
 } from 'fs'
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises'
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import type {
   ProjectCleanDetailSnapshot,
@@ -185,18 +185,25 @@ function externalizeValueSync(value: unknown, path: string, usedKeys: Set<string
   return value
 }
 
-async function hydrateValueAsync(value: unknown): Promise<unknown> {
+async function hydrateValueAsync(value: unknown, missing: string[], path = 'project'): Promise<unknown> {
   if (isBlobRef(value)) {
     const file = blobPath(value.$blob)
-    const info = await stat(file)
-    if (info.size !== value.bytes) throw new Error('项目资料块缺失或不完整。')
-    return readFile(file, 'utf8')
+    try {
+      const info = await stat(file)
+      if (info.size !== value.bytes) throw new Error('size mismatch')
+      return await readFile(file, 'utf8')
+    } catch {
+      missing.push(path)
+      return '[资料块丢失，请重新上传该文件]'
+    }
   }
-  if (Array.isArray(value)) return Promise.all(value.map(hydrateValueAsync))
+  if (Array.isArray(value)) {
+    return Promise.all(value.map((item, index) => hydrateValueAsync(item, missing, `${path}.${index}`)))
+  }
   if (isPlainObject(value)) {
     const entries = await Promise.all(Object.entries(value).map(async ([key, item]) => [
       key,
-      await hydrateValueAsync(item)
+      await hydrateValueAsync(item, missing, `${path}.${key}`)
     ] as const))
     return Object.fromEntries(entries)
   }
@@ -311,6 +318,7 @@ function sanitizeSource(value: unknown): ProjectSourceSnapshot | null {
     text: optionalString(value.text),
     dataUrl: optionalString(value.dataUrl),
     error: optionalString(value.error),
+    warning: optionalString(value.warning),
     attribution: optionalString(value.attribution),
     platform: optionalString(value.platform),
     purpose: optionalString(value.purpose),
@@ -407,7 +415,10 @@ function sanitizeProject(value: unknown): SavedProject {
     reportStale: Boolean(input.reportStale),
     phase: sanitizePhase(input.phase),
     steering: asString(input.steering),
-    updatedAt: optionalString(input.updatedAt) || new Date().toISOString()
+    updatedAt: optionalString(input.updatedAt) || new Date().toISOString(),
+    missingBlobs: Array.isArray(input.missingBlobs)
+      ? input.missingBlobs.filter((item): item is string => typeof item === 'string').slice(0, 200)
+      : undefined
   }
 }
 
@@ -429,6 +440,56 @@ function projectRoot(value: unknown): unknown {
   return isPlainObject(value) && value.storageVersion === PROJECT_STORAGE_VERSION && 'project' in value
     ? value.project
     : value
+}
+
+function collectBlobHashes(value: unknown, hashes: Set<string>): void {
+  if (isBlobRef(value)) {
+    hashes.add(value.$blob)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectBlobHashes(item, hashes)
+    return
+  }
+  if (isPlainObject(value)) {
+    for (const item of Object.values(value)) collectBlobHashes(item, hashes)
+  }
+}
+
+async function manifestBlobHashes(file: string): Promise<Set<string> | null> {
+  try {
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as unknown
+    if (!isPlainObject(parsed) || parsed.storageVersion !== PROJECT_STORAGE_VERSION || !('project' in parsed)) return null
+    const hashes = new Set<string>()
+    collectBlobHashes(parsed.project, hashes)
+    return hashes
+  } catch {
+    return null
+  }
+}
+
+export async function pruneOrphanBlobs(): Promise<{ skipped: boolean; deleted: number }> {
+  const [last, previous] = await Promise.all([
+    manifestBlobHashes(projectPath()),
+    manifestBlobHashes(previousProjectPath())
+  ])
+  if (!last || !previous) return { skipped: true, deleted: 0 }
+  const referenced = new Set([...last, ...previous])
+  let entries
+  try {
+    entries = await readdir(blobDirectory(), { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { skipped: false, deleted: 0 }
+    return { skipped: true, deleted: 0 }
+  }
+  let deleted = 0
+  for (const entry of entries) {
+    const match = /^([a-f0-9]{64})\.txt$/u.exec(entry.name)
+    if (!entry.isFile() || !match || referenced.has(match[1])) continue
+    await rm(join(blobDirectory(), entry.name), { force: true })
+    deleted += 1
+  }
+  return { skipped: false, deleted }
 }
 
 function metadataFromParsed(value: unknown): ProjectMetadata | null {
@@ -468,10 +529,20 @@ async function loadProjectFile(file: string): Promise<SavedProject | null> {
     if (info.size > MAX_PROJECT_FILE_BYTES) return null
     const parsed = JSON.parse(await readFile(file, 'utf8')) as unknown
     const root = projectRoot(parsed)
+    const missing: string[] = []
     const hydrated = isPlainObject(parsed) && parsed.storageVersion === PROJECT_STORAGE_VERSION
-      ? await hydrateValueAsync(root)
+      ? await hydrateValueAsync(root, missing)
       : root
-    return hasProjectShape(hydrated) ? sanitizeProject(hydrated) : null
+    if (!hasProjectShape(hydrated)) return null
+    const project = sanitizeProject(hydrated)
+    if (missing.length) {
+      project.missingBlobs = Array.from(new Set(missing.map((path) => {
+        const match = /^project\.sources\.(\d+)\./u.exec(path)
+        if (!match) return path
+        return project.sources[Number(match[1])]?.name || path
+      })))
+    }
+    return project
   } catch {
     return null
   }

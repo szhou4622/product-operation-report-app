@@ -23,7 +23,7 @@ const CACHE_DIRECTORY_NAME = 'report-result-cache-v2'
 const CACHE_VERSION = 2
 const CACHE_RETENTION_DAYS = 30
 const MAX_CACHE_ENTRIES = 20
-const MAX_CACHE_BYTES = 20 * 1024 * 1024
+const MAX_CACHE_BYTES = 100 * 1024 * 1024
 const MAX_SNAPSHOT_TEXT_CHARS = 8_000_000
 
 interface StoredReportEntry {

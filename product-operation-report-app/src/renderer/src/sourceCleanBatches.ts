@@ -1,8 +1,10 @@
 import Papa from 'papaparse'
 import type { SourceCleanCacheInput } from '../../shared/types'
+import { SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 
 const CLEAN_BATCH_CHAR_LIMIT = 55_000
 const MIN_TEXT_SPLIT_AT = 20_000
+console.assert(CLEAN_BATCH_CHAR_LIMIT < SOURCE_TEXT_LIMIT, 'cleaning batch limit must remain below source text limit')
 
 export interface SourceCleanBatchContext {
   batchIndex: number
@@ -16,6 +18,7 @@ export interface SourceCleanBatchContext {
   originalTextChars: number
   /** Deterministic IDs that must be echoed by the cleaning result. */
   evidenceIds: string[]
+  mode: SourceCleanBatchPlan['mode']
 }
 
 export interface SourceCleanBatch {
@@ -30,7 +33,14 @@ export interface SourceCleanBatchPlan {
   scheduledRecordCount?: number
   isMaterialTable: boolean
   originalTextChars: number
+  degradedReason?: TableDegradedReason
 }
+
+export type TableDegradedReason = 'quotes' | 'too_few_rows' | 'too_wide'
+
+type NormalizedTableRowsResult =
+  | { ok: true; rows: string[][] }
+  | { ok: false; reason: TableDegradedReason }
 
 interface WorkbookBlock {
   sheetName?: string
@@ -103,7 +113,7 @@ function workbookBlocks(text: string): WorkbookBlock[] {
   return blocks.length ? blocks : [{ text }]
 }
 
-function normalizedTableRows(text: string): string[][] | null {
+function normalizedTableRows(text: string): NormalizedTableRowsResult {
   const firstLine = text.split(/\r?\n/u).find((line) => line.trim()) || ''
   const delimiter = firstLine.includes('\t') ? '\t' : firstLine.includes(',') ? ',' : undefined
   const parsed = Papa.parse<string[]>(text, {
@@ -111,22 +121,26 @@ function normalizedTableRows(text: string): string[][] | null {
     dynamicTyping: false,
     ...(delimiter ? { delimiter } : {})
   })
-  if (parsed.errors.some((error) => error.type === 'Quotes')) return null
+  if (parsed.errors.some((error) => error.type === 'Quotes')) return { ok: false, reason: 'quotes' }
   const rows = parsed.data
     .map((row) => row.map((cell) => String(cell ?? '').replace(/\u0000/gu, '').trim()))
     .filter((row) => row.some(Boolean))
-  if (rows.length < 2) return null
+  if (rows.length < 2) return { ok: false, reason: 'too_few_rows' }
   const width = Math.max(...rows.map((row) => row.length))
-  if (width < 2 || width > 200) return null
+  if (width < 2) return { ok: false, reason: 'too_few_rows' }
+  if (width > 200) return { ok: false, reason: 'too_wide' }
   const activeColumns = Array.from({ length: width }, (_, column) => column).filter((column) =>
     rows.some((row) => Boolean(row[column]?.trim()))
   )
-  return rows.map((row) => activeColumns.map((column) => row[column] || ''))
+  return { ok: true, rows: rows.map((row) => activeColumns.map((column) => row[column] || '')) }
 }
 
-function tablePieces(block: WorkbookBlock, globalRecordOffset: number, scope: string): TablePiece[] | null {
-  const rows = normalizedTableRows(block.text)
-  if (!rows) return null
+function tablePieces(
+  block: WorkbookBlock,
+  rows: string[][],
+  globalRecordOffset: number,
+  scope: string
+): TablePiece[] | null {
   const [headers, ...body] = rows
   const isMaterialTable = headers.some((header) => /\u539f\u89c6\u9891|3\s*\u79d2|\u6587\u6848|\u811a\u672c|\u7d20\u6750|\u89c6\u89d2|\u5185\u5bb9\u5f62\u5f0f/u.test(header))
   const headerCsv = Papa.unparse([['__\u8bc1\u636eID', ...headers]], { newline: '\n' })
@@ -191,17 +205,20 @@ function tablePieces(block: WorkbookBlock, globalRecordOffset: number, scope: st
   return pieces
 }
 
-function tableBatchPlan(source: SourceCleanCacheInput, text: string): SourceCleanBatchPlan | null {
+function tableBatchPlan(
+  source: SourceCleanCacheInput,
+  text: string
+): { plan: SourceCleanBatchPlan | null; degradedReason?: TableDegradedReason } {
   const blocks = workbookBlocks(text)
   const pieces: TablePiece[] = []
   let recordOffset = 0
   let material = false
   for (const block of blocks) {
-    const rows = normalizedTableRows(block.text)
-    if (!rows) return null
-    const bodyCount = rows.length - 1
-    const next = tablePieces(block, recordOffset, sourceEvidenceScope(source))
-    if (!next?.length) return null
+    const normalized = normalizedTableRows(block.text)
+    if (!normalized.ok) return { plan: null, degradedReason: normalized.reason }
+    const bodyCount = normalized.rows.length - 1
+    const next = tablePieces(block, normalized.rows, recordOffset, sourceEvidenceScope(source))
+    if (!next?.length) return { plan: null, degradedReason: 'too_wide' }
     pieces.push(...next)
     material ||= next.some((piece) => piece.isMaterialTable)
     recordOffset += bodyCount
@@ -219,17 +236,18 @@ function tableBatchPlan(source: SourceCleanCacheInput, text: string): SourceClea
       sheetName: piece.sheetName,
       isMaterialTable: material,
       originalTextChars: text.length,
-      evidenceIds: piece.evidenceIds
+      evidenceIds: piece.evidenceIds,
+      mode: 'table_rows' as const
     }
   }))
-  return {
+  return { plan: {
     mode: 'table_rows',
     batches,
     originalRecordCount: recordOffset,
     scheduledRecordCount: recordOffset,
     isMaterialTable: material,
     originalTextChars: text.length
-  }
+  } }
 }
 
 export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): SourceCleanBatchPlan {
@@ -245,7 +263,8 @@ export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): Source
           batchCount: 1,
           isMaterialTable: false,
           originalTextChars: text.length,
-          evidenceIds: [sourceEvidenceId('I', scope, 1)]
+          evidenceIds: [sourceEvidenceId('I', scope, 1)],
+          mode: 'single'
         }
       }],
       isMaterialTable: false,
@@ -254,11 +273,31 @@ export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): Source
   }
   if (source.kind === 'table') {
     const table = tableBatchPlan(source, text)
-    if (table) return table
+    if (table.plan) return table.plan
+    const parts = splitCompleteText(text)
+    const mode = parts.length > 1 ? 'text_chunks' : 'single'
+    return {
+      mode,
+      batches: parts.map((part, index) => ({
+        source: { ...source, text: `【证据片段ID】${sourceEvidenceId('T', scope, index + 1)}\n${part}` },
+        context: {
+          batchIndex: index + 1,
+          batchCount: parts.length,
+          isMaterialTable: false,
+          originalTextChars: text.length,
+          evidenceIds: [sourceEvidenceId('T', scope, index + 1)],
+          mode
+        }
+      })),
+      isMaterialTable: false,
+      originalTextChars: text.length,
+      degradedReason: table.degradedReason
+    }
   }
   const parts = splitCompleteText(text)
+  const mode = parts.length > 1 ? 'text_chunks' : 'single'
   return {
-    mode: parts.length > 1 ? 'text_chunks' : 'single',
+    mode,
     batches: parts.map((part, index) => ({
       source: { ...source, text: `\u3010\u8bc1\u636e\u7247\u6bb5ID\u3011${sourceEvidenceId('T', scope, index + 1)}\n${part}` },
       context: {
@@ -266,7 +305,8 @@ export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): Source
         batchCount: parts.length,
         isMaterialTable: false,
         originalTextChars: text.length,
-        evidenceIds: [sourceEvidenceId('T', scope, index + 1)]
+        evidenceIds: [sourceEvidenceId('T', scope, index + 1)],
+        mode
       }
     })),
     isMaterialTable: false,
@@ -278,7 +318,9 @@ export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outpu
   if (outputs.length !== plan.batches.length || outputs.some((output) => !output.trim())) {
     throw new Error('\u6e05\u6d17\u6279\u6b21\u4e0d\u5b8c\u6574\uff0c\u672c\u6587\u4ef6\u4e0d\u80fd\u6807\u8bb0\u4e3a\u5df2\u5b8c\u6210\u3002')
   }
-  const missing = plan.batches.flatMap((batch, index) => missingSourceCleanEvidenceIds(batch.context, outputs[index]))
+  const missing = plan.batches.flatMap((batch, index) =>
+    missingSourceCleanEvidenceIds(batch.context, outputs[index], plan.mode)
+  )
   if (missing.length) {
     const preview = missing.slice(0, 8).join('\u3001')
     throw new Error(
@@ -301,7 +343,7 @@ export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outpu
         `- \u539f\u59cb\u62bd\u53d6\u6587\u672c\uff1a${plan.originalTextChars.toLocaleString('zh-CN')} \u5b57\u7b26`,
         `- \u52a8\u6001\u6e05\u6d17\u6279\u6b21\uff1a${plan.batches.length} \u6279`,
         `- \u6a21\u578b\u8fd4\u56de\u8986\u76d6\uff1a${plan.batches.flatMap((batch) => batch.context.evidenceIds).length} \u4e2a\u8bc1\u636e\u7247\u6bb5ID\u5747\u5df2\u901a\u8fc7\u7a0b\u5e8f\u6838\u5bf9\u3002`,
-        '- \u5b8c\u6574\u6027\u7ed3\u8bba\uff1a\u5168\u90e8\u6587\u672c\u5206\u6bb5\u5747\u5df2\u9001\u5165\u6e05\u6d17\u4e14\u8fd4\u56de\u8986\u8bc1\u636eID\uff0c\u672a\u505a\u56fa\u5b9a\u957f\u5ea6\u622a\u65ad\u3002'
+        '- 完整性结论：本文件未能按行核对，仅完成文本分段覆盖核对；请结合资料确认页重点检查关键字段。'
       ].join('\n')
   const firstLines = outputs[0].trim().split(/\r?\n/u)
   const firstClassification = firstLines.shift() || ''
@@ -314,14 +356,37 @@ export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outpu
 
 export function missingSourceCleanEvidenceIds(
   context: SourceCleanBatchContext,
-  output: string
+  output: string,
+  mode: SourceCleanBatchPlan['mode']
 ): string[] {
-  return context.evidenceIds.filter((id) => !output.includes(id))
+  if (mode !== 'table_rows') return context.evidenceIds.filter((id) => !output.includes(id))
+  if (output.length > 2_048) {
+    const offsets = context.evidenceIds.map((id) => output.indexOf(id)).filter((offset) => offset >= 0)
+    if (offsets.length === context.evidenceIds.length && Math.min(...offsets) >= output.length - 2_048) {
+      return [...context.evidenceIds]
+    }
+  }
+  const lines = output.split(/\r?\n/u)
+  const headerIndex = lines.findIndex((line) => /^\s*["']?__证据ID["']?\s*[,\t]/u.test(line))
+  if (headerIndex < 0) return [...context.evidenceIds]
+  const parsed = Papa.parse<string[]>(
+    lines.slice(headerIndex).filter((line) => !/^\s*```/u.test(line)).join('\n'),
+    { skipEmptyLines: 'greedy', dynamicTyping: false }
+  )
+  const rows = parsed.data
+    .map((row) => row.map((cell) => String(cell ?? '').trim()))
+    .filter((row) => row.some(Boolean))
+  const dataRows = rows.slice(1).filter((row) => row.length >= 2 && row.slice(1).some(Boolean))
+  if (dataRows.length < context.evidenceIds.length) return [...context.evidenceIds]
+  const counts = new Map<string, number>()
+  for (const row of dataRows) counts.set(row[0], (counts.get(row[0]) || 0) + 1)
+  return context.evidenceIds.filter((id) => counts.get(id) !== 1)
 }
 
 export const sourceCleanBatchInternals = {
   CLEAN_BATCH_CHAR_LIMIT,
   splitCompleteText,
   workbookBlocks,
-  normalizedTableRows
+  normalizedTableRows,
+  SOURCE_TEXT_COMPATIBILITY_LIMIT: SOURCE_TEXT_LIMIT
 }

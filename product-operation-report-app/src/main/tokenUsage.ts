@@ -1,5 +1,5 @@
 import { app } from 'electron'
-import { appendFile, mkdir, readFile } from 'fs/promises'
+import { appendFile, mkdir, readFile, rename, stat } from 'fs/promises'
 import { dirname, join } from 'path'
 import type {
   ChatMessage,
@@ -17,6 +17,7 @@ import { getTokenOptimizationMetrics } from './costOptimization'
 
 const LOG_FILE_NAME = 'token-usage.jsonl'
 const MAX_LOG_BYTES = 64 * 1024 * 1024
+const ROTATE_LOG_BYTES = 48 * 1024 * 1024
 const MAX_IDENTIFIER_LENGTH = 240
 const TASK_TYPES: readonly ModelTaskType[] = [
   'source_clean',
@@ -154,7 +155,7 @@ export async function readTokenUsageRecords(path = tokenUsageLogPath()): Promise
     throw error
   }
   if (Buffer.byteLength(raw, 'utf8') > MAX_LOG_BYTES) {
-    throw new Error('Token 统计文件过大，请先备份后联系开发者归档。')
+    console.warn('Token usage log exceeded the expected size; valid records will still be recovered.')
   }
   const records: TokenUsageRecord[] = []
   for (const line of raw.split(/\r?\n/u)) {
@@ -177,6 +178,30 @@ export async function readTokenUsageRecords(path = tokenUsageLogPath()): Promise
   return records
 }
 
+async function rotateTokenLogIfNeeded(path: string, nextBytes: number): Promise<void> {
+  let bytes = 0
+  try {
+    bytes = (await stat(path)).size
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  if (bytes + nextBytes <= ROTATE_LOG_BYTES) return
+  const month = new Date().toISOString().slice(0, 7).replace('-', '')
+  let archive = join(dirname(path), `token-usage-${month}.jsonl.archive`)
+  for (let index = 2; index < 100; index++) {
+    try {
+      await stat(archive)
+      archive = join(dirname(path), `token-usage-${month}-${index}.jsonl.archive`)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break
+      throw error
+    }
+  }
+  await rename(path, archive)
+  knownLogPath = path
+  knownEventIds = new Set()
+}
+
 async function loadKnownEventIds(path: string): Promise<Set<string>> {
   if (knownEventIds && knownLogPath === path) return knownEventIds
   knownLogPath = path
@@ -189,12 +214,14 @@ export async function appendTokenUsageRecord(record: TokenUsageRecord): Promise<
   const path = tokenUsageLogPath()
   let appended = false
   appendQueue = appendQueue.then(async () => {
-    const ids = await loadKnownEventIds(path)
     const id = eventId(record)
-    if (ids.has(id)) return
     await mkdir(dirname(path), { recursive: true })
-    await appendFile(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
-    ids.add(id)
+    const line = `${JSON.stringify(record)}\n`
+    await rotateTokenLogIfNeeded(path, Buffer.byteLength(line, 'utf8'))
+    const activeIds = await loadKnownEventIds(path)
+    if (activeIds.has(id)) return
+    await appendFile(path, line, { encoding: 'utf8', mode: 0o600 })
+    activeIds.add(id)
     appended = true
   })
   await appendQueue
@@ -387,6 +414,9 @@ export async function getTokenUsageDashboard(): Promise<TokenUsageDashboard> {
 }
 
 export const tokenUsageInternals = {
+  MAX_LOG_BYTES,
+  ROTATE_LOG_BYTES,
+  rotateTokenLogIfNeeded,
   coalesceAttempts,
   resetForTests(): void {
     appendQueue = Promise.resolve()

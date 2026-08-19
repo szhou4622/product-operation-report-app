@@ -15,7 +15,6 @@ import type {
   ModelProfile,
   ModelTaskContext,
   ModelTokenUsage,
-  LicenseUsageResult,
   ParsedFile,
   PointsAccessResult,
   PointsRedeemResult,
@@ -76,12 +75,6 @@ const api = {
 
   deactivateCurrentDevice: (): Promise<ActivationDeactivationResult> =>
     ipcRenderer.invoke('activation:deactivate'),
-
-  canStartLicensedAnalysis: (): Promise<LicenseUsageResult> =>
-    ipcRenderer.invoke('license:canStartAnalysis'),
-
-  consumeAnalysisCredit: (operationId: string): Promise<LicenseUsageResult> =>
-    ipcRenderer.invoke('license:consumeAnalysisCredit', operationId),
 
   getPointsWallet: (): Promise<PointsWalletStatus> => ipcRenderer.invoke('points:get'),
 

@@ -1,6 +1,6 @@
-import type { ModelProfile } from '../shared/types'
+import type { ModelProfile, PointsLedgerEntry, PointsWalletStatus } from '../shared/types'
 import { getLicenseProxyIdentity } from './activation'
-import { AI_PROXY_HEALTH_URL, AI_PROXY_SESSION_URL, NETWORK_TIMEOUT_MS } from './serviceConfig'
+import { AI_PROXY_BASE_URL, AI_PROXY_HEALTH_URL, AI_PROXY_SESSION_URL, NETWORK_TIMEOUT_MS } from './serviceConfig'
 
 interface ProxySession {
   token: string
@@ -8,6 +8,13 @@ interface ProxySession {
 }
 
 let cachedSession: ProxySession | null = null
+let cachedWallet: PointsWalletStatus | null = null
+
+class ProxyHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -34,7 +41,7 @@ async function jsonRequest(url: string, init: RequestInit): Promise<Record<strin
         : typeof body.error === 'string'
           ? body.error
           : ''
-      throw new Error(message || `业务服务器暂时不可用（${response.status}）。`)
+      throw new ProxyHttpError(response.status, message || `业务服务器暂时不可用（${response.status}）。`)
     }
     return body
   } catch (error) {
@@ -78,6 +85,97 @@ export async function getAiProxyToken(force = false): Promise<string> {
 
 export function clearAiProxySession(): void {
   cachedSession = null
+}
+
+export function clearProxyWalletSnapshot(): void {
+  cachedWallet = null
+}
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+function parseLedger(value: unknown): PointsLedgerEntry[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    const kind = row.kind === 'topup' || row.kind === 'usage' || row.kind === 'adjustment' ? row.kind : undefined
+    if (!kind || typeof row.id !== 'string' || typeof row.createdAt !== 'string') return []
+    const entry: PointsLedgerEntry = {
+      id: row.id,
+      createdAt: row.createdAt,
+      kind,
+      description: typeof row.description === 'string' ? row.description : '积分变动',
+      pointsDelta: finiteNumber(row.pointsDelta),
+      balanceAfter: finiteNumber(row.balanceAfter),
+      ...(typeof row.reportSessionId === 'string' ? { reportSessionId: row.reportSessionId } : {}),
+      ...(typeof row.taskType === 'string' ? { taskType: row.taskType as PointsLedgerEntry['taskType'] } : {})
+    }
+    return [entry]
+  }).slice(0, 100)
+}
+
+function parseWallet(value: unknown): PointsWalletStatus {
+  const wallet = asRecord(value)
+  const pricing = asRecord(wallet.pricing)
+  return {
+    balancePoints: finiteNumber(wallet.balancePoints),
+    unlimited: wallet.unlimited === true,
+    totalTopupPoints: finiteNumber(wallet.totalTopupPoints),
+    totalCostPoints: finiteNumber(wallet.totalCostPoints),
+    totalChargedPoints: finiteNumber(wallet.totalChargedPoints),
+    unbilledUsageCount: finiteNumber(wallet.unbilledUsageCount),
+    pricing: {
+      model: typeof pricing.model === 'string' ? pricing.model : '',
+      currency: 'USD',
+      inputUsdPerMillion: finiteNumber(pricing.inputUsdPerMillion),
+      outputUsdPerMillion: finiteNumber(pricing.outputUsdPerMillion),
+      cachedInputUsdPerMillion: finiteNumber(pricing.cachedInputUsdPerMillion),
+      cacheCreationUsdPerMillion: finiteNumber(pricing.cacheCreationUsdPerMillion),
+      usdCnyRate: finiteNumber(pricing.usdCnyRate),
+      pointsPerCny: finiteNumber(pricing.pointsPerCny),
+      cnyPerCostPoint: finiteNumber(pricing.cnyPerCostPoint),
+      costRate: finiteNumber(pricing.costRate),
+      chargeMultiplier: finiteNumber(pricing.chargeMultiplier)
+    },
+    ledger: parseLedger(wallet.ledger)
+  }
+}
+
+async function requestProxyWallet(forceSession = false): Promise<PointsWalletStatus> {
+  const token = await getAiProxyToken(forceSession)
+  const body = await jsonRequest(`${AI_PROXY_BASE_URL}/wallet`, {
+    method: 'GET',
+    headers: { accept: 'application/json', authorization: `Bearer ${token}` }
+  })
+  const wallet = parseWallet(body.wallet)
+  cachedWallet = wallet
+  return wallet
+}
+
+export async function fetchProxyWallet(): Promise<PointsWalletStatus> {
+  try {
+    return await requestProxyWallet(false)
+  } catch (error) {
+    if (error instanceof ProxyHttpError && error.status === 401) {
+      clearAiProxySession()
+      try {
+        return await requestProxyWallet(true)
+      } catch (retryError) {
+        error = retryError
+      }
+    }
+    if (cachedWallet) {
+      return {
+        ...cachedWallet,
+        stale: true,
+        warning: error instanceof Error ? error.message : '余额暂时无法刷新。'
+      }
+    }
+    throw error
+  }
 }
 
 export async function authorizeProxyProfiles(profiles: ModelProfile[]): Promise<ModelProfile[]> {

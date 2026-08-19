@@ -63,6 +63,17 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      - name: Run core regression suite
+        run: npm run test:regression
+
+      - name: Verify update release workflow
+        if: matrix.os == 'windows-latest'
+        run: npm run test:update-release
+
+      - name: Verify adaptive HTML rendering
+        if: matrix.os == 'windows-latest'
+        run: npm run test:html-visual
+
       - name: Build installer
         run: npm run ${{ matrix.script }} -- --${{ matrix.arch }}
 

@@ -11,7 +11,6 @@ import type {
   ActivationStatus,
   LicenseUsageResult
 } from '../shared/types'
-import { ACTIVATION_CODE_COUNT, ACTIVATION_CODE_HASHES } from './activationCodes'
 import {
   LICENSE_ACTIVATE_URL,
   LICENSE_APP_NAME,
@@ -41,14 +40,36 @@ const DEVICE_NAMESPACE = 'product-operation-report:device:v1:'
 const TRANSITIONAL_DEVICE_NAMESPACE = 'product-operation-report:device:v2:'
 const OLD_DEVICE_NAMESPACE = DEVICE_NAMESPACE
 const OLD_ENCRYPTION_NAMESPACE = 'product-operation-report:server-code:v1:'
-const allowedCodeHashes = new Set<string>(ACTIVATION_CODE_HASHES)
 export const LEGACY_ACTIVATION_POINTS = 2_000
 
 let cachedSystemMachineId: string | undefined
 let cachedLegacyDeviceId = ''
 let cachedTransitionalDeviceId = ''
 let cachedDeviceId = ''
-let serverValidatedThisRun = false
+interface RuntimeValidationState {
+  lastSuccessAt?: number
+  lastServerContactFailedAt?: number
+}
+
+let runtimeValidation: RuntimeValidationState = {}
+
+function markValidationSuccess(): void {
+  runtimeValidation = { lastSuccessAt: Date.now() }
+}
+
+function markServerContactFailure(): void {
+  runtimeValidation = { ...runtimeValidation, lastServerContactFailedAt: Date.now() }
+}
+
+function clearRuntimeValidation(): void {
+  runtimeValidation = {}
+}
+
+function hasUsableServerValidation(record?: ServerStoredActivation): boolean {
+  if (runtimeValidation.lastSuccessAt && Date.now() - runtimeValidation.lastSuccessAt <= LICENSE_OFFLINE_GRACE_MS) return true
+  const offlineUntil = record?.offlineUntil ? Date.parse(record.offlineUntil) : 0
+  return Number.isFinite(offlineUntil) && offlineUntil > Date.now() && Boolean(record?.lastValidatedAt)
+}
 
 interface LegacyStoredActivation {
   version: 1
@@ -517,10 +538,6 @@ function isExpired(expiresAt?: string): boolean {
   return Number.isFinite(timestamp) && timestamp <= Date.now()
 }
 
-function legacyLicenseId(codeHash: string): string {
-  return `LEGACY-${codeHash.slice(0, 12).toUpperCase()}`
-}
-
 function activationCodeAvailable(record: StoredActivation): boolean {
   if (record.version === 1) return false
   return Boolean(record.activationCodeStored)
@@ -564,7 +581,7 @@ function friendlyActivationFailure(message: string): string {
 function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): ActivationStatus {
   const common = {
     deviceId,
-    codeCount: ACTIVATION_CODE_COUNT,
+    codeCount: 0,
     appName: LICENSE_APP_NAME,
     unlimited: false,
     offline: false,
@@ -573,15 +590,11 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
   }
   if (!record || !recordMatchesDevice(record, deviceId)) return { ...common, activated: false }
   if (record.version === 1) {
-    const valid = allowedCodeHashes.has(record.codeHash) && !app.isPackaged
     return {
       ...common,
-      activated: valid,
-      activatedAt: valid ? record.activatedAt : undefined,
-      licenseId: valid ? legacyLicenseId(record.codeHash) : undefined,
+      activated: false,
       source: 'legacy',
       licenseType: 'credits',
-      creditsRemaining: valid ? LEGACY_ACTIVATION_POINTS : undefined,
       requiresRevalidation: true,
       message: '旧版授权需要重新输入原激活码，完成服务器凭证升级。'
     }
@@ -589,7 +602,7 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
   const remaining = record.creditsRemaining
   const revoked = Boolean(record.revokedReason) || record.bindingStatus === 'unbound' || isExpired(record.expiresAt)
   const requiresRevalidation = record.source === 'server'
-    ? !serverValidatedThisRun || Boolean(record.requiresRevalidation)
+    ? !hasUsableServerValidation(record) || Boolean(record.requiresRevalidation)
     : true
   let message = record.serverMessage
   if (record.bindingStatus === 'unbound') message = '本机已解除绑定，可在新电脑输入原激活码。'
@@ -945,7 +958,7 @@ export function getLicenseProxyIdentity(): {
 } {
   const current = currentServerRecord()
   const status = getActivationStatus()
-  if (!current || !status.activated || status.requiresRevalidation || !serverValidatedThisRun) {
+  if (!current || !status.activated || status.requiresRevalidation || !hasUsableServerValidation(current.record)) {
     throw new Error(status.message || '请先完成服务器授权验证。')
   }
   if (!current.record.licenseId || !current.vault?.deviceCredential || !current.vault.deviceSession) {
@@ -966,7 +979,7 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
   const deviceId = getDeviceId()
   const stored = readStoredActivation()
   if (!stored || !recordMatchesDevice(stored, deviceId) || stored.version === 1) {
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
     return getActivationStatus()
   }
   const prepared = prepareServerRecord(stored, deviceId)
@@ -975,14 +988,14 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
   if (!current.licenseId || !vault?.activationCode) {
     const updated = { ...sanitizedServerRecord(current), requiresRevalidation: true, serverMessage: '本机授权记录不完整，请重新输入原激活码。' }
     writeStoredActivation(updated)
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
     return toStatus(updated, deviceId)
   }
   if ((!vault.deviceCredential || !vault.deviceSession) && (current.bindingStatus === 'unbound' || current.revokedReason)) {
     // A background status refresh must never rebind a device. Once credentials
     // are revoked, only the user's explicit saved-code or manual activation
     // action may call /activate again.
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
     return toStatus(current, deviceId)
   }
   const result = vault.deviceCredential && vault.deviceSession
@@ -997,17 +1010,17 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     if (!credential || !session) {
       const updated = { ...sanitizedServerRecord(current), requiresRevalidation: true, serverMessage: '服务器未返回完整设备凭证，请重新验证。' }
       writeStoredActivation(updated)
-      serverValidatedThisRun = false
+      clearRuntimeValidation()
       return toStatus(updated, deviceId)
     }
     const updated = entitlementRecord(current, vault.activationCode, deviceId, result)
     writeLicenseVault({ activationCode: vault.activationCode, deviceCredential: credential, deviceSession: session })
     writeStoredActivation(updated)
-    serverValidatedThisRun = true
+    markValidationSuccess()
     return toStatus(updated, deviceId)
   }
-  serverValidatedThisRun = false
   if (result.bindingStatus === 'unbound') {
+    clearRuntimeValidation()
     let activationCodeStored = false
     try {
       if (vault.activationCode) {
@@ -1041,16 +1054,21 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     return toStatus(updated, deviceId)
   }
   if (result.unavailable) {
+    markServerContactFailure()
+    const withinGrace = hasUsableServerValidation(current)
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
       offlineSince: new Date().toISOString(),
-      requiresRevalidation: true,
-      serverMessage: '授权服务器暂时无法连接；历史报告仍可查看和导出，暂不能生成新报告。'
+      requiresRevalidation: !withinGrace,
+      serverMessage: withinGrace
+        ? '当前处于离线授权宽限期，软件会稍后自动重连；可继续生成和导出报告。'
+        : '授权服务器暂时无法连接，且离线宽限期已结束；历史报告仍可查看和导出。'
     }
     writeStoredActivation(updated)
     return toStatus(updated, deviceId)
   }
   if (result.unauthorized) {
+    clearRuntimeValidation()
     let activationCodeStored = false
     try {
       if (vault.activationCode) {
@@ -1079,6 +1097,7 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     return toStatus(updated, deviceId)
   }
   if (result.contractInvalid) {
+    clearRuntimeValidation()
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
       requiresRevalidation: true,
@@ -1093,6 +1112,7 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     revokedReason: result.message,
     serverMessage: result.message
   }
+  clearRuntimeValidation()
   writeStoredActivation(revoked)
   return toStatus(revoked, deviceId)
 }
@@ -1145,11 +1165,11 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
     credentialsSaved = true
     const record = entitlementRecord(samePrimary ? existing?.record || null : null, enteredCode, deviceId, result)
     writeStoredActivation(record)
-    serverValidatedThisRun = true
+    markValidationSuccess()
     const status = toStatus(record, deviceId)
     return { ok: true, message: result.message, status }
   } catch {
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
     if (credentialsSaved) {
       const message = '服务器已接受激活，但本机授权状态保存未完成。请点击“使用已保存的原激活码”恢复，不会重复赠送积分。'
       return { ok: false, message, status: savedCodeRecoveryStatus(deviceId, message) }
@@ -1172,7 +1192,7 @@ export async function redeemPointsWithCode(input: string): Promise<{
 }> {
   const current = currentServerRecord()
   const before = getActivationStatus()
-  if (!current || !before.activated || before.requiresRevalidation || !serverValidatedThisRun) {
+  if (!current || !before.activated || before.requiresRevalidation || !hasUsableServerValidation(current.record)) {
     return { ok: false, message: '请先刷新并确认当前主授权有效。', status: before, addedPoints: 0 }
   }
   const code = input.trim()
@@ -1211,7 +1231,7 @@ export async function redeemPointsWithCode(input: string): Promise<{
     licenseId: returnedPrimaryId
   })
   writeStoredActivation(updated)
-  serverValidatedThisRun = true
+  markValidationSuccess()
   const status = toStatus(updated, before.deviceId)
   return {
     ok: true,
@@ -1228,7 +1248,7 @@ export async function deactivateCurrentDevice(): Promise<ActivationDeactivationR
   if (stored?.version === 1) {
     clearStoredActivation()
     clearLicenseVault()
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
     return {
       ok: true,
       message: '旧版本机授权记录已清除；该记录没有服务器设备绑定。',
@@ -1260,7 +1280,7 @@ export async function deactivateCurrentDevice(): Promise<ActivationDeactivationR
       deviceSession: refreshed.deviceSession
     })
     writeStoredActivation(updated)
-    serverValidatedThisRun = true
+    markValidationSuccess()
     current = currentServerRecord()
   }
   if (!current?.record.licenseId || !current.vault?.deviceCredential || !current.vault.deviceSession) {
@@ -1275,7 +1295,7 @@ export async function deactivateCurrentDevice(): Promise<ActivationDeactivationR
   if (!result.ok) return { ok: false, message: result.message, status: before }
   clearLicenseVault()
   clearStoredActivation()
-  serverValidatedThisRun = false
+  clearRuntimeValidation()
   return {
     ok: true,
     message: '本机已解除绑定。服务器会保留剩余积分和消费记录，可在新电脑输入原激活码。',
@@ -1287,24 +1307,13 @@ export async function deactivateCurrentDevice(): Promise<ActivationDeactivationR
 export function canStartLicensedAnalysis(): LicenseUsageResult {
   const status = getActivationStatus()
   if (!status.activated) return { ok: false, message: status.message || '当前授权不可用。', status }
-  if (status.requiresRevalidation || !serverValidatedThisRun) {
+  if (status.requiresRevalidation) {
     return { ok: false, message: status.message || '请先连接授权服务器完成验证。', status }
   }
   if (!status.unlimited && (status.creditsRemaining ?? 0) <= 0) {
     return { ok: false, message: '积分不足，请充值后再生成新报告。', status }
   }
   return { ok: true, message: status.unlimited ? '无限授权可用。' : '授权可用。', status }
-}
-
-/** Billing is authoritative in the business proxy. The client never subtracts server credits. */
-export function consumeAnalysisCredit(_operationId: string): LicenseUsageResult {
-  const access = canStartLicensedAnalysis()
-  if (!access.ok) return access
-  return {
-    ok: true,
-    message: access.status.unlimited ? '无限授权由服务器确认，不扣积分。' : '本次用量由服务器按真实 Token 结算。',
-    status: access.status
-  }
 }
 
 export function getActivationFilePath(): string {
@@ -1334,6 +1343,6 @@ export const activationInternals = {
     cachedDeviceId = ''
   },
   resetRuntimeValidationForTests(): void {
-    serverValidatedThisRun = false
+    clearRuntimeValidation()
   }
 }

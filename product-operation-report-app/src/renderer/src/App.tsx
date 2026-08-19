@@ -45,6 +45,11 @@ function formatPoints(value: number): string {
   return Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
 }
 
+function formatLedgerTime(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+}
+
 function ProductLogo(): JSX.Element {
   return (
     <svg className="product-logo" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
@@ -858,6 +863,27 @@ export default function App(): JSX.Element {
               {activationStatus.unlimited ? '无限使用' : `剩余 ${formatPoints(pointsWallet?.balancePoints ?? 0)} 积分`}
             </h2>
             <p>如需充值，请输入管理员发放的积分码。</p>
+            {pointsWallet?.stale && (
+              <div className="points-wallet-stale" role="status">
+                余额可能不是最新，网络恢复后会自动刷新。
+              </div>
+            )}
+            <div className="points-ledger-preview" aria-label="最近积分记录">
+              <strong>最近积分记录</strong>
+              {pointsWallet?.ledger.length
+                ? pointsWallet.ledger.slice(0, 8).map((entry) => (
+                    <div key={entry.id}>
+                      <span>
+                        <small>{formatLedgerTime(entry.createdAt)}</small>
+                        {entry.description}
+                      </span>
+                      <b className={entry.pointsDelta >= 0 ? 'positive' : 'negative'}>
+                        {entry.pointsDelta >= 0 ? '+' : ''}{formatPoints(entry.pointsDelta)}
+                      </b>
+                    </div>
+                  ))
+                : <span className="points-ledger-empty">暂无积分变动记录</span>}
+            </div>
             <label className="activation-field">
               <span>积分充值码</span>
               <input

@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createCipheriv, createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,25 +11,23 @@ import * as XLSX from 'xlsx'
 import type { SavedProject } from '../src/shared/types'
 import { parseArchive, parseFile } from '../src/main/ingest'
 import { chatStream, listModels, normalizeProviderUsage, testModel } from '../src/main/model'
-import { loadLastProject, preflightProjectStorage, saveLastProject } from '../src/main/project'
+import { archiveProject, loadLastProject, preflightProjectStorage, pruneOrphanBlobs, saveLastProject } from '../src/main/project'
 import {
   activateWithCode,
   activationInternals,
   canStartLicensedAnalysis,
-  consumeAnalysisCredit,
   deactivateCurrentDevice,
   getActivationStatus,
   getActivationStatusWithServerCheck,
   getDeviceId,
-  LEGACY_ACTIVATION_POINTS,
   revalidateSavedActivationCode,
   revealCurrentActivationCode,
   redeemPointsWithCode
 } from '../src/main/activation'
 import { writeLicenseVault } from '../src/main/licenseVault'
 import { buildActivationDiagnostic } from '../src/main/activationDiagnostics'
+import { clearAiProxySession, clearProxyWalletSnapshot, fetchProxyWallet } from '../src/main/aiProxy'
 import { ExclusiveOperationGate } from '../src/main/exclusiveOperationGate'
-import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
 import {
   getActiveProfile,
   getActiveProfiles,
@@ -182,7 +180,14 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   const largeText = `中段唯一证据-${'资料'.repeat(50_000)}-最后唯一证据`
   const chunkedSnapshot: SavedProject = {
     ...snapshot(7, ''),
-    sources: [{ id: 'large-source', name: '大项目资料.md', kind: 'doc', text: largeText, topLevelId: 'large-source' }],
+    sources: [{
+      id: 'large-source',
+      name: '大项目资料.md',
+      kind: 'doc',
+      text: largeText,
+      warning: '表格分隔结构不规则，请重点核对。',
+      topLevelId: 'large-source'
+    }],
     taskJournal: {
       'session:source_clean:large-source:1': {
         kind: 'source_clean',
@@ -200,7 +205,22 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   assert.doesNotMatch(manifest, /中段唯一证据/u, 'large project content is externalized from the small manifest')
   const restoredChunked = await loadLastProject()
   assert.equal(restoredChunked?.sources[0]?.text, largeText)
+  assert.equal(restoredChunked?.sources[0]?.warning, '表格分隔结构不规则，请重点核对。')
   assert.equal(restoredChunked?.taskJournal?.['session:source_clean:large-source:1']?.output?.endsWith(largeText), true)
+  const parsedManifest = JSON.parse(manifest) as { project: { sources: { text: { $blob: string } }[] } }
+  const missingBlobPath = join(tempUserData, 'project-data', 'blobs', `${parsedManifest.project.sources[0].text.$blob}.txt`)
+  rmSync(missingBlobPath, { force: true })
+  const partiallyRestored = await loadLastProject()
+  assert.ok(partiallyRestored, 'one missing blob must not erase the whole project')
+  assert.match(partiallyRestored?.sources[0]?.text || '', /资料块丢失/u)
+  assert.deepEqual(partiallyRestored?.missingBlobs, ['大项目资料.md'])
+  await saveLastProject({ ...chunkedSnapshot, revision: 8, updatedAt: new Date().toISOString() })
+  await archiveProject(snapshot(8, '上一份项目'))
+  const orphanBlob = join(tempUserData, 'project-data', 'blobs', `${'f'.repeat(64)}.txt`)
+  writeFileSync(orphanBlob, 'orphan', 'utf8')
+  const pruned = await pruneOrphanBlobs()
+  assert.deepEqual(pruned, { skipped: false, deleted: 1 })
+  assert.equal(existsSync(orphanBlob), false)
 }
 
 async function testDeviceIdentityPersistsAcrossAuthorizationReset(): Promise<void> {
@@ -447,34 +467,32 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   const deviceId = getActivationStatus().deviceId
   const activationRecord = {
     version: 1,
-    codeHash: ACTIVATION_CODE_HASHES[0],
+    codeHash: '0'.repeat(64),
     deviceId,
     activatedAt: new Date().toISOString()
   }
   writeFileSync(join(tempUserData, 'activation.json'), '{broken', 'utf8')
   writeFileSync(join(tempUserData, 'activation.json.bak'), JSON.stringify(activationRecord), 'utf8')
   const activationStatus = getActivationStatus()
-  assert.equal(activationStatus.activated, true)
+  assert.equal(activationStatus.activated, false)
   assert.equal(activationStatus.appName, 'ProductOperationReport')
   assert.equal(activationStatus.source, 'legacy')
   assert.equal(activationStatus.licenseType, 'credits')
   assert.equal(activationStatus.unlimited, false)
-  assert.equal(activationStatus.creditsRemaining, LEGACY_ACTIVATION_POINTS)
+  assert.equal(activationStatus.creditsRemaining, undefined)
   assert.equal(activationStatus.offline, false)
-  assert.equal(applyActivationPoints(activationStatus).addedPoints, 2_000)
-  assert.equal(applyActivationPoints(activationStatus).addedPoints, 0, 'the same legacy code only grants its default points once')
-  assert.equal(getPointsWalletStatus().balancePoints, 2_000)
+  assert.equal(applyActivationPoints(activationStatus).addedPoints, 0)
   const refreshedLegacyStatus = await getActivationStatusWithServerCheck()
-  assert.equal(refreshedLegacyStatus.activated, true, 'existing legacy activation remains usable after upgrade')
+  assert.equal(refreshedLegacyStatus.activated, false, 'local hash lists no longer grant model access')
   assert.equal(refreshedLegacyStatus.source, 'legacy')
   assert.equal(refreshedLegacyStatus.unlimited, false)
-  assert.equal(refreshedLegacyStatus.creditsRemaining, 2_000)
+  assert.equal(refreshedLegacyStatus.creditsRemaining, undefined)
 
   const previouslyStoredUnlimited = {
     version: 2,
     appName: 'ProductOperationReport',
     source: 'server',
-    codeHash: ACTIVATION_CODE_HASHES[0],
+    codeHash: '0'.repeat(64),
     encryptedCode: '',
     deviceId,
     activatedAt: new Date().toISOString(),
@@ -489,7 +507,7 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   const migratedUnlimited = getActivationStatus()
   assert.equal(migratedUnlimited.licenseType, 'unlimited')
   assert.equal(migratedUnlimited.unlimited, true)
-  assert.equal(migratedUnlimited.requiresRevalidation, true)
+  assert.equal(migratedUnlimited.requiresRevalidation, false, 'a recent server validation remains usable during offline grace')
   assert.equal(migratedUnlimited.licenseId, 'old-server-unlimited-id')
 
   const recoveryCode = 'PRO-LEGACY-RECOVERY-TEST'
@@ -688,10 +706,10 @@ async function testServerActivationAndCredits(): Promise<void> {
     assert.equal(requestBody.platform, undefined)
     assert.doesNotMatch(readFileSync(join(tempUserData, 'activation.json'), 'utf8'), new RegExp(code))
 
-    const firstUse = consumeAnalysisCredit('analysis-session-one')
+    const firstUse = canStartLicensedAnalysis()
     assert.equal(firstUse.ok, true)
     assert.equal(firstUse.status.creditsRemaining, 100, 'the client never subtracts authoritative server credits')
-    const repeatedUse = consumeAnalysisCredit('analysis-session-one')
+    const repeatedUse = canStartLicensedAnalysis()
     assert.equal(repeatedUse.status.creditsRemaining, 100)
 
     const refreshed = await getActivationStatusWithServerCheck()
@@ -703,6 +721,8 @@ async function testServerActivationAndCredits(): Promise<void> {
     const offline = await getActivationStatusWithServerCheck()
     assert.equal(offline.activated, true)
     assert.equal(offline.offline, true)
+    assert.equal(offline.requiresRevalidation, false, 'temporary network failure keeps the last successful validation')
+    assert.equal(canStartLicensedAnalysis().ok, true, 'offline grace must not interrupt an in-progress report')
 
     globalThis.fetch = (async () => new Response(JSON.stringify({
       ok: false,
@@ -730,7 +750,7 @@ async function testServerActivationAndCredits(): Promise<void> {
     assert.equal(unlimited.ok, true)
     assert.equal(unlimited.status.licenseType, 'unlimited')
     assert.equal(unlimited.status.unlimited, true)
-    const unlimitedUse = consumeAnalysisCredit('analysis-session-unlimited')
+    const unlimitedUse = canStartLicensedAnalysis()
     assert.equal(unlimitedUse.ok, true)
     assert.equal(unlimitedUse.status.unlimited, true)
 
@@ -744,10 +764,93 @@ async function testServerActivationAndCredits(): Promise<void> {
     const deviceId = getActivationStatus().deviceId
     writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify({
       version: 1,
-      codeHash: ACTIVATION_CODE_HASHES[0],
+      codeHash: '0'.repeat(64),
       deviceId,
       activatedAt: new Date().toISOString()
     }), 'utf8')
+  }
+}
+
+async function testProxyWalletBridge(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const code = 'PROXY-WALLET-BRIDGE-CODE'
+  let sessionCount = 0
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/activate')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'wallet-primary',
+          license_type: 'credits',
+          remaining_credits: 201,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getDeviceId(),
+          device_credential: 'wallet-device-credential',
+          device_session: 'wallet-device-session',
+          message: '激活成功'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/session')) {
+        sessionCount += 1
+        return new Response(JSON.stringify({ ok: true, access_token: `proxy-token-${sessionCount}`, expires_in: 900 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      if (url.endsWith('/wallet')) {
+        assert.equal(new Headers(init?.headers).get('authorization'), `Bearer proxy-token-${sessionCount}`)
+        return new Response(JSON.stringify({
+          ok: true,
+          wallet: {
+            balancePoints: 201,
+            unlimited: false,
+            totalTopupPoints: 250,
+            totalCostPoints: 49,
+            totalChargedPoints: 49,
+            unbilledUsageCount: 0,
+            pricing: {
+              model: 'gpt-5.5', currency: 'USD', inputUsdPerMillion: 1.25,
+              outputUsdPerMillion: 7.5, cachedInputUsdPerMillion: 0.125,
+              cacheCreationUsdPerMillion: 0.8, usdCnyRate: 7.2, pointsPerCny: 100,
+              cnyPerCostPoint: 0.01, costRate: 0.5, chargeMultiplier: 2
+            },
+            ledger: [{
+              id: 'ledger-1', createdAt: '2026-08-19T00:00:00Z', kind: 'usage',
+              description: '资料清洗', pointsDelta: -3.25, balanceAfter: 201,
+              reportSessionId: 'report-ledger', taskType: 'source_clean'
+            }]
+          }
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      throw new Error(`unexpected URL ${url}`)
+    }) as typeof fetch
+    assert.equal((await activateWithCode(code)).ok, true)
+    const wallet = await fetchProxyWallet()
+    assert.equal(wallet.balancePoints, 201)
+    assert.equal(wallet.ledger[0]?.description, '资料清洗')
+    assert.equal(wallet.ledger[0]?.reportSessionId, 'report-ledger')
+
+    globalThis.fetch = (async () => { throw new TypeError('network unavailable') }) as typeof fetch
+    const stale = await fetchProxyWallet()
+    assert.equal(stale.balancePoints, 201)
+    assert.equal(stale.stale, true)
+    assert.match(stale.warning || '', /network unavailable/u)
+  } finally {
+    globalThis.fetch = originalFetch
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
   }
 }
 
@@ -983,7 +1086,7 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     const deviceId = getActivationStatus().deviceId
     const v1Record = {
       version: 1,
-      codeHash: ACTIVATION_CODE_HASHES[0],
+      codeHash: '0'.repeat(64),
       deviceId,
       activatedAt: new Date().toISOString()
     }
@@ -1600,6 +1703,30 @@ function testCloseDuringActiveWorkContract(): void {
   assert.doesNotMatch(mainSource, /app:before-close/)
   assert.doesNotMatch(preloadSource, /app:close-ready|app:close-guard-state|app:before-close/)
   assert.doesNotMatch(rendererSource, /onBeforeClose/)
+}
+
+function testRepairPlanStaticContracts(): void {
+  const main = readFileSync(join(process.cwd(), 'src', 'main', 'index.ts'), 'utf8')
+  const preload = readFileSync(join(process.cwd(), 'src', 'preload', 'index.ts'), 'utf8')
+  const store = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'store.ts'), 'utf8')
+  const table = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'tablePreprocess.ts'), 'utf8')
+  const sop = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'sop.ts'), 'utf8')
+  const workflow = readFileSync(join(process.cwd(), '..', '.github', 'workflows', 'build-desktop.yml'), 'utf8')
+  assert.doesNotMatch(main, /function authorizationWallet/u)
+  assert.match(main, /fetchProxyWallet/u)
+  assert.equal((main.match(/getActivationStatusWithServerCheck\(/gu) || []).length, 1, 'only throttled refresh calls device status')
+  assert.doesNotMatch(preload, /license:canStartAnalysis|license:consumeAnalysisCredit/u)
+  assert.doesNotMatch(table, /sourceForModel/u)
+  assert.doesNotMatch(sop, /buildCleanMessages/u)
+  assert.match(store, /scheduleCleaningCheckpointSave\(get\)/u)
+  assert.ok(
+    store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)') < store.indexOf('for (const step of SOP_STEPS)'),
+    'analysis evidence groups are planned once before the step loop'
+  )
+  assert.match(workflow, /npm run test:regression/u)
+  assert.match(workflow, /npm run test:update-release/u)
+  assert.match(workflow, /npm run test:html-visual/u)
+  assert.equal(reportResultCacheInternals.MAX_CACHE_BYTES, 100 * 1024 * 1024)
 }
 
 async function testModelFallbackSequence(): Promise<void> {
@@ -2362,6 +2489,18 @@ async function testTokenUsageMeasurement(): Promise<void> {
   assert.equal(crashed?.missingUsageAttempts, 1)
   const rawLog = readFileSync(path, 'utf8')
   assert.doesNotMatch(rawLog, /SECRET_IMAGE|prompt|activation_code|apiKey|sk-/i)
+  rmSync(path, { force: true })
+  for (const file of readdirSync(tempUserData).filter((name) => /^token-usage-.*\.archive$/u.test(name))) {
+    rmSync(join(tempUserData, file), { force: true })
+  }
+  writeFileSync(path, Buffer.alloc(tokenUsageInternals.ROTATE_LOG_BYTES + 1, 0x20))
+  await tokenUsageInternals.rotateTokenLogIfNeeded(path, 1)
+  assert.equal(existsSync(path), false, 'oversized current log is rotated before the next append')
+  assert.equal(readdirSync(tempUserData).some((name) => /^token-usage-.*\.archive$/u.test(name)), true)
+  tokenUsageInternals.resetForTests()
+  const afterRotation = makeTokenRecord({ requestId: 'after-log-rotation', reportSessionId: 'rotation-report' })
+  assert.equal(await appendTokenUsageRecord(afterRotation), true)
+  assert.equal((await readTokenUsageRecords(path)).some((record) => record.requestId === 'after-log-rotation'), true)
 }
 
 function liveBillingRecord(overrides: Partial<TokenUsageRecord> = {}): TokenUsageRecord {
@@ -2626,13 +2765,47 @@ async function testCostOptimizationPrimitives(): Promise<void> {
     const combined = combineSourceCleanBatchOutputs(
       plan,
       plan.batches.map((batch, index) =>
-        `分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 第${index + 1}批\n\n## 清洗后内容\n` +
-          batch.context.evidenceIds.map((id) => `${id} 已处理`).join('\n')
+        `分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 第${index + 1}批\n\n` +
+          (batch.source.text || '')
       )
     )
     assert.match(combined, new RegExp(`已覆盖素材数量：${recordCount} 条`, 'u'))
     assert.match(combined, /全部有效记录均已送入清洗|未做抽样/u)
+    const answerSheet = plan.batches.map((batch, index) =>
+      `分类：竞品数据 | 抖音 | 素材数据 | 第${index + 1}批\n${'摘要内容'.repeat(900)}\n` +
+        batch.context.evidenceIds.join('\n')
+    )
+    assert.throws(
+      () => combineSourceCleanBatchOutputs(plan, answerSheet),
+      /未覆盖/u,
+      'copying the answer sheet at the end cannot pass row coverage'
+    )
+    const shortRows = plan.batches.map((batch, index) => {
+      const rows = Papa.parse<string[]>(batch.source.text || '', { skipEmptyLines: 'greedy' }).data
+      return `分类：竞品数据 | 抖音 | 素材数据 | 第${index + 1}批\n${Papa.unparse(rows.slice(0, -1))}`
+    })
+    assert.throws(
+      () => combineSourceCleanBatchOutputs(plan, shortRows),
+      /未覆盖/u,
+      'fewer output rows than evidence IDs cannot pass coverage'
+    )
+    const extractionPrompt = String(buildExtractMessages(plan.batches[0].source, plan.batches[0].context)[1].content)
+    for (const id of plan.batches[0].context.evidenceIds) {
+      assert.equal(extractionPrompt.split(id).length - 1, 1, 'table prompt must not repeat the evidence answer sheet')
+    }
   }
+
+  assert.ok(
+    sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT < sourceCleanBatchInternals.SOURCE_TEXT_COMPATIBILITY_LIMIT,
+    'cleaning batches must remain below the source compaction threshold'
+  )
+  const tooWideTable = Papa.unparse([
+    Array.from({ length: 201 }, (_, index) => `列${index + 1}`),
+    Array.from({ length: 201 }, (_, index) => `值${index + 1}`)
+  ])
+  const degraded = buildSourceCleanBatchPlan({ name: '超宽表格.csv', kind: 'table', text: tooWideTable })
+  assert.equal(degraded.mode, 'single')
+  assert.equal(degraded.degradedReason, 'too_wide')
 
   const longDocument = `文档开头-${'A'.repeat(70_000)}-文档中段-${'B'.repeat(70_000)}-文档结尾`
   const documentPlan = buildSourceCleanBatchPlan({ name: '长文档.md', kind: 'doc', text: longDocument })
@@ -3812,7 +3985,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   assert.equal(appComponent.includes('FU5FdRkHFoNH7JxUp6wciLksnEe'), false)
   assert.equal(appComponent.includes('Token 统计'), false, 'Token statistics are not exposed in the customer UI')
   assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
-  assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary|points-ledger-preview/u)
+  assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary/u)
+  assert.match(appComponent, /points-ledger-preview/u, 'the points dialog exposes the real server ledger')
   assert.equal(appComponent.includes('更换电脑'), false, 'device transfer is not placed in the points dialog')
   assert.match(appComponent, /AUTHORIZATION_REFRESH_INTERVAL_MS = 60_000/u)
   assert.match(appComponent, /setInterval\(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS\)/u)
@@ -3864,6 +4038,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     'utf8'
   ).replace(/<\/style/gi, '<\\/style')
   assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
+  assert.match(styles, /@media \(max-width: 46rem\)[\s\S]*?\.contact-entry\s*\{[\s\S]*?display: none/u)
   const htmlPath = join(tempUserData, 'topbar-layout.html')
   writeFileSync(
     htmlPath,
@@ -3907,10 +4082,12 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     'utf8'
   )
 
+  const width = 1280
   const window = new BrowserWindow({
     show: false,
-    width: 1280,
+    width,
     height: 180,
+    useContentSize: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -3921,80 +4098,51 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   topbarAuditWindow = window
   try {
     await window.loadFile(htmlPath)
-    for (const width of [736, 760, 780, 800, 880, 960, 1005, 1120, 1280, 1536, 1600]) {
-      window.setContentSize(width, 180)
-      let layout: {
-        innerWidth: number
-        scrollWidth: number
-        brand: { left: number; right: number; width: number } | null
-        contact: { left: number; right: number; width: number } | null
-        contactPopover: { left: number; right: number; width: number } | null
-        tutorial: { left: number; right: number; width: number } | null
-        actions: { left: number; right: number; width: number } | null
-        contactDisplay: string
-        modelDisplay: string
-      }
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolveWait) => setTimeout(resolveWait, 50))
-        layout = (await window.webContents.executeJavaScript(
-          `(() => {
-            const rect = (selector) => {
-              const element = document.querySelector(selector)
-              if (!(element instanceof HTMLElement)) return null
-              const box = element.getBoundingClientRect()
-              return { left: box.left, right: box.right, width: box.width }
-            }
-            const model = document.querySelector('.model-pill')
-            return {
-              innerWidth: window.innerWidth,
-              scrollWidth: document.documentElement.scrollWidth,
-              brand: rect('.brand'),
-              contact: rect('.contact-entry'),
-              contactPopover: rect('.contact-qr-popover'),
-              tutorial: rect('.tutorial-link'),
-              actions: rect('.topbar .right'),
-              contactDisplay: getComputedStyle(document.querySelector('.contact-entry')).display,
-              modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
-            }
-          })()`
-        )) as typeof layout
-        if (layout.innerWidth === width) break
-      }
-      layout ??= {
-        innerWidth: -1,
-        scrollWidth: -1,
-        brand: null,
-        contact: null,
-        contactPopover: null,
-        tutorial: null,
-        actions: null,
-        contactDisplay: '',
-        modelDisplay: ''
-      }
-      assert.equal(layout.innerWidth, width)
-      assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
-      assert.ok(layout.brand && layout.contact && layout.tutorial && layout.actions)
-      if (layout.contactDisplay === 'none') {
-        assert.ok(
-          layout.brand!.right + 8 <= layout.tutorial!.left,
-          `${width}px 品牌区与教程入口重叠`
-        )
-      } else {
-        assert.ok(layout.brand!.right + 8 <= layout.contact!.left, `${width}px 品牌区与联系方式重叠`)
-        assert.ok(layout.contact!.right + 8 <= layout.tutorial!.left, `${width}px 联系方式与教程入口重叠`)
-        assert.ok(layout.contactPopover && layout.contactPopover.left >= 0, `${width}px 二维码浮层超出左侧窗口`)
-        assert.ok(layout.contactPopover!.right <= layout.innerWidth, `${width}px 二维码浮层超出右侧窗口`)
-      }
-      assert.ok(
-        layout.tutorial!.right + 8 <= layout.actions!.left,
-        `${width}px 教程入口与操作区重叠`
-      )
-      assert.equal(layout.modelDisplay !== 'none', width >= 1536)
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60))
+    const layout = (await window.webContents.executeJavaScript(
+        `(() => {
+          const rect = (selector) => {
+            const element = document.querySelector(selector)
+            if (!(element instanceof HTMLElement)) return null
+            const box = element.getBoundingClientRect()
+            return { left: box.left, right: box.right, width: box.width }
+          }
+          const model = document.querySelector('.model-pill')
+          return {
+            innerWidth: window.innerWidth,
+            scrollWidth: document.documentElement.scrollWidth,
+            brand: rect('.brand'),
+            contact: rect('.contact-entry'),
+            contactPopover: rect('.contact-qr-popover'),
+            tutorial: rect('.tutorial-link'),
+            actions: rect('.topbar .right'),
+            contactDisplay: getComputedStyle(document.querySelector('.contact-entry')).display,
+            modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
+          }
+        })()`
+    )) as {
+      innerWidth: number
+      scrollWidth: number
+      brand: { left: number; right: number; width: number } | null
+      contact: { left: number; right: number; width: number } | null
+      contactPopover: { left: number; right: number; width: number } | null
+      tutorial: { left: number; right: number; width: number } | null
+      actions: { left: number; right: number; width: number } | null
+      contactDisplay: string
+      modelDisplay: string
     }
-  } catch (error) {
+    assert.equal(layout.innerWidth, width)
+    assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
+    assert.ok(layout.brand && layout.contact && layout.tutorial && layout.actions)
+    assert.ok(layout.brand!.right + 8 <= layout.contact!.left, `${width}px 品牌区与联系方式重叠`)
+    assert.ok(layout.contact!.right + 8 <= layout.tutorial!.left, `${width}px 联系方式与教程入口重叠`)
+    assert.ok(layout.contactPopover && layout.contactPopover.left >= 0, `${width}px 二维码浮层超出左侧窗口`)
+    assert.ok(layout.contactPopover!.right <= layout.innerWidth, `${width}px 二维码浮层超出右侧窗口`)
+    assert.ok(layout.tutorial!.right + 8 <= layout.actions!.left, `${width}px 教程入口与操作区重叠`)
+    assert.equal(layout.modelDisplay, 'none')
+  } finally {
     if (!window.isDestroyed()) window.destroy()
     topbarAuditWindow = null
-    throw error
   }
 }
 
@@ -4561,6 +4709,8 @@ async function run(): Promise<void> {
   await testActivationAndSettingsBackup()
   console.log('Regression: server activation, offline grace and idempotent credits')
   await testServerActivationAndCredits()
+  console.log('Regression: proxy wallet ledger and stale snapshot fallback')
+  await testProxyWalletBridge()
   console.log('Regression: explicit zero server balance never reissues granted credits')
   await testExplicitZeroServerBalanceDoesNotReissueGrantedCredits()
   console.log('Regression: safe device unbind and original-code rebind')
@@ -4586,6 +4736,8 @@ async function run(): Promise<void> {
   testChatAdmissionSecurity()
   console.log('Regression: closing during upload or analysis never waits on a renderer snapshot')
   testCloseDuringActiveWorkContract()
+  console.log('Regression: repair-plan static safety and CI contracts')
+  testRepairPlanStaticContracts()
   console.log('Regression: source invalidation')
   await testSourceInvalidation()
   console.log('Regression: reset save rollback')

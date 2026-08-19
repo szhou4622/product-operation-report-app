@@ -64,9 +64,12 @@ class ProxyLedgerTests(unittest.TestCase):
         )
         proxy.settle_request(self.session, request_id, "success", "gpt-5.5", None, 1000, 1500, True)
         with proxy.database() as db:
-            row = db.execute("SELECT COUNT(*) AS c FROM ledger WHERE request_id=?", (request_id,)).fetchone()
+            row = db.execute(
+                "SELECT COUNT(*) AS c,MAX(description) AS description FROM ledger WHERE request_id=?", (request_id,)
+            ).fetchone()
             wallet = db.execute("SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)).fetchone()
         self.assertEqual(row["c"], 1)
+        self.assertEqual(row["description"], "资料汇总")
         self.assertEqual(wallet["locked_milli"], 0)
 
     def test_session_refresh_replaces_stale_proxy_balance_with_license_balance(self) -> None:

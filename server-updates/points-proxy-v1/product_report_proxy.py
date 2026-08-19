@@ -600,6 +600,7 @@ def wallet_json(session: Session, db: sqlite3.Connection) -> dict[str, Any]:
     ).fetchall()
     return {
         "balancePoints": milli_to_points(row["balance_milli"]),
+        "unlimited": session.unlimited,
         "totalTopupPoints": milli_to_points(row["total_topup_milli"]),
         "totalCostPoints": milli_to_points(row["total_cost_milli"]),
         "totalChargedPoints": milli_to_points(row["total_charged_milli"]),
@@ -905,9 +906,17 @@ def finalize_billing_request(
              actual_charge, now, APP_NAME, session.code_id),
         )
         if actual_charge:
+            task_descriptions = {
+                "source_clean": "资料清洗",
+                "summary": "资料汇总",
+                "analysis_step": "分析步骤",
+                "final_part": "最终成稿",
+                "revision_part": "报告修订",
+            }
             db.execute(
                 "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), APP_NAME, session.code_id, "usage", "模型任务", -actual_charge,
+                (str(uuid.uuid4()), APP_NAME, session.code_id, "usage",
+                 task_descriptions.get(request_row["task_type"], "报告修订"), -actual_charge,
                  remaining_milli, request_row["report_session_id"], request_row["task_type"], request_id, now),
             )
         db.execute(

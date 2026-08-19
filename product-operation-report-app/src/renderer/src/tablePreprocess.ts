@@ -337,12 +337,6 @@ export function buildLocalTableCleanDetail(
   return detail.length <= LOCAL_TABLE_MAX_CHARS ? detail : null
 }
 
-export function sourceForModel(source: SourceCleanCacheInput): SourceCleanCacheInput {
-  if (source.kind !== 'table' || !source.text) return source
-  const result = preprocessTableForModel(source.text)
-  return result.applied ? { ...source, text: result.text } : source
-}
-
 export const tablePreprocessInternals = {
   TABLE_PREPROCESS_THRESHOLD,
   LOCAL_TABLE_MAX_CHARS,
