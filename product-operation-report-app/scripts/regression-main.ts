@@ -1547,6 +1547,12 @@ function testManagedModelIsolation(): void {
   process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON = JSON.stringify(validConfig)
   assert.equal(getManagedModelState().mode, 'proxy', 'normal development startup must exercise the production proxy path')
   assert.notEqual(getActiveProfile()?.apiKey, secret, '开发开关未启用时必须忽略模型环境变量')
+  const proxyRendererSettings = loadRendererSettings()
+  assert.equal(proxyRendererSettings.profiles.length, 0)
+  const proxyStoredSettings = JSON.parse(readFileSync(join(tempUserData, 'settings.json'), 'utf8')) as Record<string, unknown>
+  const proxyBackupSettings = JSON.parse(readFileSync(join(tempUserData, 'settings.json.bak'), 'utf8')) as Record<string, unknown>
+  assert.deepEqual(proxyStoredSettings.profiles, [], '代理模式必须清除主设置中的历史本地模型密钥')
+  assert.deepEqual(proxyBackupSettings.profiles, [], '代理模式必须清除备份设置中的历史本地模型密钥')
   process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES = '1'
   try {
     const rendererSettings = loadRendererSettings()

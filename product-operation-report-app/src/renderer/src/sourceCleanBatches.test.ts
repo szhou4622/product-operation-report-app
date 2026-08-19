@@ -58,4 +58,19 @@ describe('row-anchored source cleaning coverage', () => {
     expect(plan.batches.every((batch) => (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT)).toBe(true)
     expect(sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT).toBeLessThanOrEqual(28_000)
   })
+
+  it('plans 50 large files without creating an oversized cleaning batch', () => {
+    const text = Papa.unparse([
+      ['原视频', '完整文案'],
+      ...Array.from({ length: 120 }, (_, index) => [`素材-${index}.mp4`, `第${index}条-${'内容'.repeat(120)}`])
+    ])
+    const plans = Array.from({ length: 50 }, (_, index) =>
+      buildSourceCleanBatchPlan({ name: `压力资料-${index + 1}.csv`, kind: 'table', text })
+    )
+    expect(plans).toHaveLength(50)
+    expect(plans.every((plan) => plan.mode === 'table_rows')).toBe(true)
+    expect(plans.flatMap((plan) => plan.batches).every((batch) =>
+      (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT
+    )).toBe(true)
+  })
 })

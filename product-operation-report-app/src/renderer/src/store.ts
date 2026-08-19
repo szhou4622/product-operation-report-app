@@ -34,6 +34,7 @@ import { validateReportEvidenceLinks, validateReportStructure } from './validate
 import { friendlyError } from './store/errors'
 import { buildProjectSnapshot } from './store/persistence'
 import { mergeRevisionParts, runFinalReportInParts, runModelRetry, selectRevisionParts } from './store/analysis'
+import { planCleaningConcurrency } from './store/cleaning'
 
 export { friendlyError } from './store/errors'
 export { buildProjectSnapshot } from './store/persistence'
@@ -1545,7 +1546,8 @@ export const useStore = create<StoreState>((set, get) => ({
     })
 
     if (todo.length) {
-      const conc = Math.min(MAX_CLEANING_CONCURRENCY, todo.length)
+      const concurrencyPlan = planCleaningConcurrency(todo.length, MAX_CLEANING_CONCURRENCY)
+      const conc = concurrencyPlan.sourceWorkers
       get()._post(
         'assistant',
         `${isRerun ? '补充' : '开始'}清洗 ${todo.length} 份资料（并发 ${conc} 个，更快）……`,
@@ -1636,118 +1638,135 @@ export const useStore = create<StoreState>((set, get) => ({
               }))
               get()._post('assistant', `⚠️ ${s.name}：${warning}`, 'narration')
             }
-            const batchOutputs: string[] = []
-            for (const batch of batchPlan.batches) {
-              if (cancelled || !isCurrentSession()) return
-              if (batchPlan.batches.length > 1) {
-                get()._post(
-                  'assistant',
-                  `正在清洗「${s.name}」第 ${batch.context.batchIndex}/${batch.context.batchCount} 批……`,
-                  'narration'
-                )
-              }
-              const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v4-latency-safe:${batch.context.batchIndex}`
-              const savedBatch = get().taskJournal[batchTaskId]
-              if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
-                batchOutputs.push(savedBatch.output)
-                continue
-              }
-              const res = await runModelRetry(
-                buildExtractMessages(batch.source, batch.context),
-                () => {},
-                (fn) => {
-                  if (fn) aborts.add(fn)
-                },
-                undefined,
-                1,
-                {
-                  reportSessionId: sessionId,
-                  taskType: 'source_clean',
-                  taskKey: batchTaskId,
-                  billingRequestId: batchTaskId,
-                  isVision: s.kind === 'image',
-                  sourceCount,
-                  imageCount,
-                  sourceId: s.id,
-                  stepId: `batch-${batch.context.batchIndex}-of-${batch.context.batchCount}`
+            const batchOutputs: Array<string | undefined> = new Array(batchPlan.batches.length)
+            let sourceFailed = false
+            const markSourceFailure = (error: string): void => {
+              if (sourceFailed) return
+              sourceFailed = true
+              failures.push({ name: s.name, error })
+              set((state) => ({
+                cleaningProgress: {
+                  ...state.cleaningProgress,
+                  running: state.cleaningProgress.running.filter((name) => name !== s.name),
+                  failed: state.cleaningProgress.failed + 1
                 }
-              )
-              if (!isCurrentSession()) return
-              if (!res.ok) {
-                const suffix = batchPlan.batches.length > 1
-                  ? `（第 ${batch.context.batchIndex}/${batch.context.batchCount} 批）`
-                  : ''
-                failures.push({ name: s.name, error: `${suffix}${res.error || '失败'}` })
-                set((st) => ({
-                  cleaningProgress: {
-                    ...st.cleaningProgress,
-                    running: st.cleaningProgress.running.filter((name) => name !== s.name),
-                    failed: st.cleaningProgress.failed + 1
-                  }
-                }))
-                break
-              }
-              let verifiedText = res.text
-              const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batchPlan.mode)
-              if (missingEvidence.length) {
-                get()._post(
-                  'assistant',
-                  `「${s.name}」第 ${batch.context.batchIndex} 批漏了 ${missingEvidence.length} 个证据单元，正在只补做这一批……`,
-                  'narration'
-                )
-                const repairTaskId = `${batchTaskId}:coverage-repair-v1`
-                const repair = await runModelRetry(
+              }))
+            }
+            let nextBatch = 0
+            const batchWorker = async (): Promise<void> => {
+              while (!cancelled && !sourceFailed && isCurrentSession()) {
+                const batchPosition = nextBatch++
+                if (batchPosition >= batchPlan.batches.length) return
+                const batch = batchPlan.batches[batchPosition]
+                if (batchPlan.batches.length > 1) {
+                  get()._post(
+                    'assistant',
+                    `正在清洗「${s.name}」第 ${batch.context.batchIndex}/${batch.context.batchCount} 批……`,
+                    'narration'
+                  )
+                }
+                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v4-latency-safe:${batch.context.batchIndex}`
+                const savedBatch = get().taskJournal[batchTaskId]
+                if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
+                  batchOutputs[batchPosition] = savedBatch.output
+                  continue
+                }
+                const res = await runModelRetry(
                   buildExtractMessages(batch.source, batch.context),
                   () => {},
                   (fn) => {
                     if (fn) aborts.add(fn)
                   },
                   undefined,
-                  0,
+                  1,
                   {
                     reportSessionId: sessionId,
                     taskType: 'source_clean',
-                    taskKey: repairTaskId,
-                    billingRequestId: repairTaskId,
+                    taskKey: batchTaskId,
+                    billingRequestId: batchTaskId,
                     isVision: s.kind === 'image',
                     sourceCount,
                     imageCount,
                     sourceId: s.id,
-                    stepId: `batch-${batch.context.batchIndex}-coverage-repair`
+                    stepId: `batch-${batch.context.batchIndex}-of-${batch.context.batchCount}`
                   }
                 )
-                if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
-                  failures.push({
-                    name: s.name,
-                    error: `第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`
-                  })
-                  set((state) => ({
-                    cleaningProgress: {
-                      ...state.cleaningProgress,
-                      running: state.cleaningProgress.running.filter((name) => name !== s.name),
-                      failed: state.cleaningProgress.failed + 1
+                if (!isCurrentSession()) return
+                if (!res.ok) {
+                  const suffix = batchPlan.batches.length > 1
+                    ? `（第 ${batch.context.batchIndex}/${batch.context.batchCount} 批）`
+                    : ''
+                  markSourceFailure(`${suffix}${res.error || '失败'}`)
+                  continue
+                }
+                let verifiedText = res.text
+                const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batchPlan.mode)
+                if (missingEvidence.length) {
+                  get()._post(
+                    'assistant',
+                    `「${s.name}」第 ${batch.context.batchIndex} 批漏了 ${missingEvidence.length} 个证据单元，正在只补做这一批……`,
+                    'narration'
+                  )
+                  const repairTaskId = `${batchTaskId}:coverage-repair-v1`
+                  const repair = await runModelRetry(
+                    buildExtractMessages(batch.source, batch.context),
+                    () => {},
+                    (fn) => {
+                      if (fn) aborts.add(fn)
+                    },
+                    undefined,
+                    0,
+                    {
+                      reportSessionId: sessionId,
+                      taskType: 'source_clean',
+                      taskKey: repairTaskId,
+                      billingRequestId: repairTaskId,
+                      isVision: s.kind === 'image',
+                      sourceCount,
+                      imageCount,
+                      sourceId: s.id,
+                      stepId: `batch-${batch.context.batchIndex}-coverage-repair`
                     }
-                  }))
-                  break
-                }
-                verifiedText = repair.text
-              }
-              batchOutputs.push(verifiedText)
-              set((state) => ({
-                taskJournal: {
-                  ...state.taskJournal,
-                  [batchTaskId]: {
-                    kind: 'source_clean',
-                    status: 'complete',
-                    output: verifiedText,
-                    updatedAt: new Date().toISOString()
+                  )
+                  if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
+                    markSourceFailure(`第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`)
+                    continue
                   }
+                  verifiedText = repair.text
                 }
-              }))
-              scheduleCleaningCheckpointSave(get)
+                batchOutputs[batchPosition] = verifiedText
+                set((state) => ({
+                  taskJournal: {
+                    ...state.taskJournal,
+                    [batchTaskId]: {
+                      kind: 'source_clean',
+                      status: 'complete',
+                      output: verifiedText,
+                      updatedAt: new Date().toISOString()
+                    }
+                  }
+                }))
+                scheduleCleaningCheckpointSave(get)
+              }
             }
-            if (batchOutputs.length !== batchPlan.batches.length) continue
-            const cleanText = combineSourceCleanBatchOutputs(batchPlan, batchOutputs)
+            const perSourceBatchConcurrency = Math.min(
+              batchPlan.batches.length,
+              concurrencyPlan.batchWorkersPerSource
+            )
+            if (batchPlan.batches.length > 1 && perSourceBatchConcurrency > 1) {
+              get()._post(
+                'assistant',
+                `「${s.name}」共 ${batchPlan.batches.length} 批，将同时处理 ${perSourceBatchConcurrency} 批以缩短等待时间。`,
+                'narration'
+              )
+            }
+            await Promise.all(Array.from({ length: perSourceBatchConcurrency }, () => batchWorker()))
+            if (!isCurrentSession()) return
+            if (
+              sourceFailed ||
+              batchOutputs.filter((output) => Boolean(output?.trim())).length !== batchPlan.batches.length
+            ) continue
+            const cleanText = combineSourceCleanBatchOutputs(batchPlan, batchOutputs as string[])
             set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cleanText }] }))
             try {
               await window.api.storeSourceCleanCache(cacheInput, cleanText)
