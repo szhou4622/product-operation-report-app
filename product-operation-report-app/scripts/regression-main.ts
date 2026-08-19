@@ -1421,6 +1421,11 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
   const originalFetch = globalThis.fetch
   const payload = Buffer.from('verified-update-payload', 'utf8')
   const correctChecksum = createHash('sha256').update(payload).digest('hex')
+  const assetKey = process.platform === 'win32' ? 'windows_x64' : process.arch === 'arm64' ? 'macos_arm64' : 'macos_x64'
+  const assetUrl = process.platform === 'win32'
+    ? 'https://update.dadaozixun.com/POR-test-update.exe'
+    : `https://update.dadaozixun.com/POR-test-update-${process.arch}.dmg`
+  const expectedExtension = process.platform === 'win32' ? /\.exe/u : /\.dmg/u
   let requestedUrl = ''
   try {
     globalThis.fetch = (async (input: string | URL | Request) => {
@@ -1429,8 +1434,8 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         app_name: 'ProductOperationReport',
         version: '999.0.0',
         min_supported_version: '998.0.0',
-        download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
-        sha256: { windows_x64: '0'.repeat(64) },
+        download_url: { [assetKey]: assetUrl },
+        sha256: { [assetKey]: '0'.repeat(64) },
         notes: ['测试更新'],
         force: false
       }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -1446,7 +1451,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://update.dadaozixun.com/POR-test-update.exe' })
+      Object.defineProperty(response, 'url', { value: assetUrl })
       return response
     }) as typeof fetch
     const rejected = await downloadUpdate()
@@ -1456,8 +1461,8 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'ProductOperationReport',
       version: '999.0.1',
-      download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
-      sha256: { windows_x64: correctChecksum },
+      download_url: { [assetKey]: assetUrl },
+      sha256: { [assetKey]: correctChecksum },
       notes: '通过校验',
       force: false
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
@@ -1470,7 +1475,7 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
         status: 200,
         headers: { 'content-length': String(payload.length) }
       })
-      Object.defineProperty(response, 'url', { value: 'https://update.dadaozixun.com/POR-test-update.exe' })
+      Object.defineProperty(response, 'url', { value: assetUrl })
       return response
     }) as typeof fetch
     const accepted = await downloadUpdate()
@@ -1484,18 +1489,18 @@ async function testUpdateConfigAndChecksum(): Promise<void> {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'ProductOperationReport',
       version: '999.0.2',
-      download_url: { windows_x64: 'https://update.dadaozixun.com/not-an-installer.html' },
-      sha256: { windows_x64: correctChecksum },
+      download_url: { [assetKey]: 'https://update.dadaozixun.com/not-an-installer.html' },
+      sha256: { [assetKey]: correctChecksum },
       notes: [],
       force: false
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
-    await assert.rejects(checkForUpdates(), /\.exe/)
+    await assert.rejects(checkForUpdates(), expectedExtension)
 
     globalThis.fetch = (async () => new Response(JSON.stringify({
       app_name: 'AnotherProduct',
       version: '999.0.3',
-      download_url: { windows_x64: 'https://update.dadaozixun.com/POR-test-update.exe' },
-      sha256: { windows_x64: correctChecksum },
+      download_url: { [assetKey]: assetUrl },
+      sha256: { [assetKey]: correctChecksum },
       notes: [],
       force: false
     }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
