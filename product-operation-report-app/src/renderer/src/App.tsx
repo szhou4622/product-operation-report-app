@@ -6,6 +6,7 @@ import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
 import ReportReuseModal from './components/ReportReuseModal'
+import wechatContactQr from './assets/wechat-contact-azssph2.png'
 
 const SOP_GUIDE_URL =
   'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
@@ -684,6 +685,22 @@ export default function App(): JSX.Element {
             <span className="brand-main">产品与内容经营报告系统</span>
             <span className="sub">专业的产品经营与内容分析报告系统</span>
           </span>
+        </div>
+        <div className="contact-entry">
+          <button
+            className="contact-trigger"
+            type="button"
+            aria-describedby="contact-qr-tooltip"
+            aria-label="联系方式 azssph2，悬停或聚焦显示微信二维码"
+          >
+            <span>联系方式：</span>
+            <strong>azssph2</strong>
+          </button>
+          <div className="contact-qr-popover" id="contact-qr-tooltip" role="tooltip">
+            <strong>扫码添加微信</strong>
+            <img src={wechatContactQr} alt="微信联系方式 azssph2 的二维码" />
+            <span>微信号：azssph2</span>
+          </div>
         </div>
         <a
           className="tutorial-link"

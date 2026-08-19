@@ -3823,6 +3823,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     /autosaveAttempt\.current \+= 1[\s\S]{0,100}setAutosaveError\(''\)[\s\S]{0,120}\[activationStatus\?\.activated, activationStatus\?\.licenseId\]/u,
     'an authorization change invalidates stale autosave failures from the previous license'
   )
+  assert.match(appComponent, /联系方式：<\/span>[\s\S]{0,80}<strong>azssph2<\/strong>/u)
+  assert.match(appComponent, /wechat-contact-azssph2\.png/u)
   assert.match(
     appComponent,
     /if \(!activationStatus\?\.activated \|\| !initialized \|\| !settings \|\| persistencePaused\) return/u,
@@ -3861,6 +3863,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
     'utf8'
   ).replace(/<\/style/gi, '<\\/style')
+  assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
   const htmlPath = join(tempUserData, 'topbar-layout.html')
   writeFileSync(
     htmlPath,
@@ -3873,6 +3876,14 @@ async function testWorkbenchTopbarContract(): Promise<void> {
               <span class="brand-main">产品与内容经营报告系统</span>
               <span class="sub">专业的产品经营与内容分析报告系统</span>
             </span>
+          </div>
+          <div class="contact-entry">
+            <button class="contact-trigger" aria-describedby="contact-qr-tooltip">
+              <span>联系方式：</span><strong>azssph2</strong>
+            </button>
+            <div class="contact-qr-popover" id="contact-qr-tooltip" role="tooltip">
+              <strong>扫码添加微信</strong><img alt="微信联系方式 azssph2 的二维码"><span>微信号：azssph2</span>
+            </div>
           </div>
           <a class="tutorial-link" href="${expectedGuideUrl}">
             <span class="tutorial-icon"></span>
@@ -3916,8 +3927,11 @@ async function testWorkbenchTopbarContract(): Promise<void> {
         innerWidth: number
         scrollWidth: number
         brand: { left: number; right: number; width: number } | null
+        contact: { left: number; right: number; width: number } | null
+        contactPopover: { left: number; right: number; width: number } | null
         tutorial: { left: number; right: number; width: number } | null
         actions: { left: number; right: number; width: number } | null
+        contactDisplay: string
         modelDisplay: string
       }
       for (let attempt = 0; attempt < 20; attempt++) {
@@ -3935,8 +3949,11 @@ async function testWorkbenchTopbarContract(): Promise<void> {
               innerWidth: window.innerWidth,
               scrollWidth: document.documentElement.scrollWidth,
               brand: rect('.brand'),
+              contact: rect('.contact-entry'),
+              contactPopover: rect('.contact-qr-popover'),
               tutorial: rect('.tutorial-link'),
               actions: rect('.topbar .right'),
+              contactDisplay: getComputedStyle(document.querySelector('.contact-entry')).display,
               modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
             }
           })()`
@@ -3947,17 +3964,27 @@ async function testWorkbenchTopbarContract(): Promise<void> {
         innerWidth: -1,
         scrollWidth: -1,
         brand: null,
+        contact: null,
+        contactPopover: null,
         tutorial: null,
         actions: null,
+        contactDisplay: '',
         modelDisplay: ''
       }
       assert.equal(layout.innerWidth, width)
       assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
-      assert.ok(layout.brand && layout.tutorial && layout.actions)
-      assert.ok(
-        layout.brand!.right + 8 <= layout.tutorial!.left,
-        `${width}px 品牌区与教程入口重叠`
-      )
+      assert.ok(layout.brand && layout.contact && layout.tutorial && layout.actions)
+      if (layout.contactDisplay === 'none') {
+        assert.ok(
+          layout.brand!.right + 8 <= layout.tutorial!.left,
+          `${width}px 品牌区与教程入口重叠`
+        )
+      } else {
+        assert.ok(layout.brand!.right + 8 <= layout.contact!.left, `${width}px 品牌区与联系方式重叠`)
+        assert.ok(layout.contact!.right + 8 <= layout.tutorial!.left, `${width}px 联系方式与教程入口重叠`)
+        assert.ok(layout.contactPopover && layout.contactPopover.left >= 0, `${width}px 二维码浮层超出左侧窗口`)
+        assert.ok(layout.contactPopover!.right <= layout.innerWidth, `${width}px 二维码浮层超出右侧窗口`)
+      }
       assert.ok(
         layout.tutorial!.right + 8 <= layout.actions!.left,
         `${width}px 教程入口与操作区重叠`
