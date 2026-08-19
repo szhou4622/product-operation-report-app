@@ -10,6 +10,7 @@ import type {
 } from '../shared/types'
 
 const SETTINGS_REQUEST_TIMEOUT_MS = 20_000
+const STREAM_FIRST_BYTE_TIMEOUT_MS = 180_000
 const STREAM_IDLE_TIMEOUT_MS = 90_000
 const STREAM_ABSOLUTE_TIMEOUT_MS = 15 * 60_000
 const MAX_SETTINGS_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -308,15 +309,16 @@ export async function chatStream(
 ): Promise<void> {
   let full = ''
   let latestUsage: ModelTokenUsage | undefined
-  let timeoutReason: 'idle' | 'absolute' | undefined
+  let timeoutReason: 'first-byte' | 'idle' | 'absolute' | undefined
   let idleTimer: ReturnType<typeof setTimeout> | undefined
+  let receivedBodyChunk = false
   const requestController = new AbortController()
   const armIdleTimeout = (): void => {
     if (idleTimer) clearTimeout(idleTimer)
     idleTimer = setTimeout(() => {
-      timeoutReason = 'idle'
+      timeoutReason = receivedBodyChunk ? 'idle' : 'first-byte'
       requestController.abort()
-    }, STREAM_IDLE_TIMEOUT_MS)
+    }, receivedBodyChunk ? STREAM_IDLE_TIMEOUT_MS : STREAM_FIRST_BYTE_TIMEOUT_MS)
   }
   const absoluteTimer = setTimeout(() => {
     timeoutReason = 'absolute'
@@ -486,6 +488,7 @@ export async function chatStream(
     }
     // Node fetch 的 body 是异步可迭代的字节流
     for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      receivedBodyChunk = true
       armIdleTimeout()
       buffer += decoder.decode(chunk, { stream: true })
       if (buffer.length > MAX_SSE_EVENT_CHARS) {
@@ -518,7 +521,9 @@ export async function chatStream(
     if (timeoutReason || (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError'))) {
       emitError(timeoutReason === 'absolute'
         ? '本次模型任务已运行超过15分钟，为保护资料和费用已自动停止。请重试未完成的步骤。'
-        : '模型连续90秒没有返回数据，已自动停止。请检查网络后重试。')
+        : timeoutReason === 'first-byte'
+          ? '模型准备本批资料超过180秒仍未开始返回，已自动停止。软件会保留其他已完成内容，请稍后重试本批。'
+          : '模型已开始处理，但连续90秒没有返回新数据，已自动停止。请检查网络后重试。')
       return
     }
     const hint = /fetch failed|ECONNRESET|socket|terminated|network/i.test(msg)
@@ -530,4 +535,10 @@ export async function chatStream(
     clearTimeout(absoluteTimer)
     signal?.removeEventListener('abort', abortFromCaller)
   }
+}
+
+export const modelStreamTimeouts = {
+  firstByteMs: STREAM_FIRST_BYTE_TIMEOUT_MS,
+  idleMs: STREAM_IDLE_TIMEOUT_MS,
+  absoluteMs: STREAM_ABSOLUTE_TIMEOUT_MS
 }

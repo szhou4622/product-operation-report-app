@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import Papa from 'papaparse'
-import { buildSourceCleanBatchPlan, combineSourceCleanBatchOutputs } from './sourceCleanBatches'
+import {
+  buildSourceCleanBatchPlan,
+  combineSourceCleanBatchOutputs,
+  sourceCleanBatchInternals
+} from './sourceCleanBatches'
 
 describe('row-anchored source cleaning coverage', () => {
   const source = {
@@ -41,5 +45,17 @@ describe('row-anchored source cleaning coverage', () => {
     const plan = buildSourceCleanBatchPlan({ name: '超宽.csv', kind: 'table', text })
     expect(plan.degradedReason).toBe('too_wide')
     expect(plan.mode).toBe('single')
+  })
+
+  it('keeps every latency-safe table batch below the production limit', () => {
+    const rows = [
+      ['原视频', '完整文案'],
+      ...Array.from({ length: 240 }, (_, index) => [`素材-${index}.mp4`, `第${index}条-${'内容'.repeat(120)}`])
+    ]
+    const plan = buildSourceCleanBatchPlan({ name: '大素材表.csv', kind: 'table', text: Papa.unparse(rows) })
+    expect(plan.mode).toBe('table_rows')
+    expect(plan.batches.length).toBeGreaterThan(1)
+    expect(plan.batches.every((batch) => (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT)).toBe(true)
+    expect(sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT).toBeLessThanOrEqual(28_000)
   })
 })

@@ -1646,7 +1646,7 @@ export const useStore = create<StoreState>((set, get) => ({
                   'narration'
                 )
               }
-              const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v3-row-anchored:${batch.context.batchIndex}`
+              const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v4-latency-safe:${batch.context.batchIndex}`
               const savedBatch = get().taskJournal[batchTaskId]
               if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
                 batchOutputs.push(savedBatch.output)

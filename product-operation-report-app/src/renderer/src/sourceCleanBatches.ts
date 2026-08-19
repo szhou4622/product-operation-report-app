@@ -2,7 +2,9 @@ import Papa from 'papaparse'
 import type { SourceCleanCacheInput } from '../../shared/types'
 import { SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 
-const CLEAN_BATCH_CHAR_LIMIT = 55_000
+// 真实 50k Token 清洗请求在兼容中转上可能超过 90 秒才返回首包。
+// 控制在约 28k 字符，让宽表分成更多但更可靠、单次预留更低的批次。
+const CLEAN_BATCH_CHAR_LIMIT = 28_000
 const MIN_TEXT_SPLIT_AT = 20_000
 console.assert(CLEAN_BATCH_CHAR_LIMIT < SOURCE_TEXT_LIMIT, 'cleaning batch limit must remain below source text limit')
 
