@@ -35,8 +35,21 @@ class ProxyLedgerTests(unittest.TestCase):
                 "INSERT INTO wallets(app_name,code_id,machine_code,balance_milli,total_topup_milli,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                 (proxy.APP_NAME, self.session.code_id, self.session.machine_code, 500_000, 500_000, now, now),
             )
+        self.consume_patch = patch.object(
+            proxy, "consume_authoritative_credits", side_effect=self.fake_consume
+        )
+        self.consume_mock = self.consume_patch.start()
+
+    def fake_consume(self, session, amount_milli, billing_request_id, reason):
+        with proxy.database() as db:
+            wallet = db.execute(
+                "SELECT balance_milli FROM wallets WHERE app_name=? AND code_id=?",
+                (proxy.APP_NAME, session.code_id),
+            ).fetchone()
+        return max(0, wallet["balance_milli"] - amount_milli), session.unlimited
 
     def tearDown(self) -> None:
+        self.consume_patch.stop()
         self.temp.cleanup()
 
     def test_duplicate_request_is_rejected_and_settled_once(self) -> None:
@@ -55,6 +68,90 @@ class ProxyLedgerTests(unittest.TestCase):
             wallet = db.execute("SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)).fetchone()
         self.assertEqual(row["c"], 1)
         self.assertEqual(wallet["locked_milli"], 0)
+
+    def test_session_refresh_replaces_stale_proxy_balance_with_license_balance(self) -> None:
+        payload = {
+            "machine_code": self.session.machine_code,
+            "license_id": self.session.license_id,
+            "device_credential": self.session.device_credential,
+            "device_session": self.session.device_session,
+        }
+        with patch.object(
+            proxy, "verify_license",
+            return_value=(self.session.code_id, 201_000, "primary", False),
+        ):
+            proxy.create_session(payload)
+        with proxy.database() as db:
+            wallet = db.execute(
+                "SELECT balance_milli,total_topup_milli FROM wallets WHERE code_id=?",
+                (self.session.code_id,),
+            ).fetchone()
+        self.assertEqual(wallet["balance_milli"], 201_000)
+        self.assertEqual(wallet["total_topup_milli"], 500_000, "a balance refresh is not a new grant")
+
+    def test_billing_failure_stays_locked_and_retries_idempotently(self) -> None:
+        request_id = "a4f81b86-1a5b-4e39-830e-1271165bb8ee"
+        billing_id = "report-a:source_clean:file-1:batch-1"
+        proxy.reserve_request(
+            self.session, request_id, "report-a", "source:1", "source_clean",
+            "gpt-5.5", 1, 1000, billing_id,
+        )
+        self.consume_mock.side_effect = proxy.ApiError(503, "temporary billing outage")
+        proxy.settle_request(
+            self.session, request_id, "success", "gpt-5.5",
+            {"input_tokens": 1000, "output_tokens": 100, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1000, 300, True,
+        )
+        with proxy.database() as db:
+            request = db.execute(
+                "SELECT status,billing_request_id,billing_error FROM model_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            locked = db.execute(
+                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()["locked_milli"]
+        self.assertEqual(request["status"], "billing_pending")
+        self.assertEqual(request["billing_request_id"], billing_id)
+        self.assertIn("temporary", request["billing_error"])
+        self.assertGreater(locked, 0)
+        self.consume_mock.side_effect = self.fake_consume
+        proxy.retry_pending_billing(self.session)
+        with proxy.database() as db:
+            request = db.execute(
+                "SELECT status,billing_error FROM model_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            locked = db.execute(
+                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()["locked_milli"]
+        self.assertEqual(request["status"], "success")
+        self.assertEqual(request["billing_error"], "")
+        self.assertEqual(locked, 0)
+
+    def test_unlimited_license_is_not_blocked_by_zero_balance(self) -> None:
+        self.session.unlimited = True
+        with proxy.database() as db:
+            db.execute(
+                "UPDATE wallets SET balance_milli=0 WHERE app_name=? AND code_id=?",
+                (proxy.APP_NAME, self.session.code_id),
+            )
+        request_id = "c4f81b86-1a5b-4e39-830e-1271165bb8ee"
+        proxy.reserve_request(
+            self.session, request_id, "report-unlimited", "summary:1", "summary",
+            "gpt-5.5", 1, 1000, "report-unlimited:summary:1",
+        )
+        proxy.settle_request(
+            self.session, request_id, "success", "gpt-5.5",
+            {"input_tokens": 1000, "output_tokens": 100, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1000, 300, True,
+        )
+        with proxy.database() as db:
+            request = db.execute(
+                "SELECT status,charged_milli FROM model_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+        self.assertEqual(request["status"], "success")
+        self.assertEqual(request["charged_milli"], 0)
 
     def test_missing_usage_with_content_is_not_free(self) -> None:
         request_id = "f82324d3-df4f-42a4-badb-e0ba393b8f3f"
@@ -202,9 +299,20 @@ class ProxyLedgerTests(unittest.TestCase):
             wallet = db.execute(
                 "SELECT balance_milli,locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
             ).fetchone()
-        self.assertEqual(request["status"], "interrupted_estimated")
+        self.assertEqual(request["status"], "billing_pending")
         self.assertEqual(request["usage_source"], "estimated")
         self.assertGreater(request["charged_milli"], 0)
+        self.assertGreater(wallet["locked_milli"], 0)
+        self.assertEqual(wallet["balance_milli"], 500_000)
+        proxy.retry_pending_billing(self.session)
+        with proxy.database() as db:
+            request = db.execute(
+                "SELECT status FROM model_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            wallet = db.execute(
+                "SELECT balance_milli,locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()
+        self.assertEqual(request["status"], "interrupted_estimated")
         self.assertEqual(wallet["locked_milli"], 0)
         self.assertLess(wallet["balance_milli"], 500_000)
 
@@ -366,10 +474,56 @@ class LicenseContractTests(unittest.TestCase):
             "code_role": "primary",
             "machine_code": "MACHINE-A",
             "binding_status": "active",
-            "remaining_points": 100,
+            "remaining_credits": 100,
         }
         result.update(overrides)
         return result
+
+    def test_authoritative_consume_uses_stable_hashed_billing_id(self) -> None:
+        session = proxy.Session(
+            token_hash="test", code_id="PRIMARY-001", machine_code="MACHINE-A",
+            license_id="PRIMARY-001", device_credential="credential",
+            device_session="session", expires_at=9_999_999_999,
+        )
+        captured = {}
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read(_limit):
+                return json.dumps({
+                    "ok": True,
+                    "app_name": proxy.APP_NAME,
+                    "code_id": "PRIMARY-001",
+                    "remaining_credits": 80,
+                    "unlimited": False,
+                }).encode("utf-8")
+
+        def fake_open(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.get_header("Authorization")
+            captured["credential"] = request.get_header("X-device-credential")
+            captured["timeout"] = timeout
+            return Response()
+
+        with patch.object(proxy, "urlopen", side_effect=fake_open):
+            remaining, unlimited = proxy.consume_authoritative_credits(
+                session, 20_000, "report-a:source_clean:file-1:batch-1", "product_operation_report:source_clean"
+            )
+        self.assertEqual(remaining, 80_000)
+        self.assertFalse(unlimited)
+        self.assertEqual(captured["body"]["amount"], 20)
+        self.assertRegex(captured["body"]["request_id"], r"^por-[0-9a-f]{64}$")
+        self.assertNotIn("source_clean", captured["body"]["request_id"])
+        self.assertEqual(captured["authorization"], "Bearer session")
+        self.assertEqual(captured["credential"], "credential")
 
     def test_license_success_must_be_boolean_true(self) -> None:
         for rejected in (False, "false", 0, 1, "true", None):
@@ -388,6 +542,17 @@ class LicenseContractTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(proxy.ApiError):
                 proxy.parse_license_response(result, 200, "MACHINE-A", {"primary"})
 
+    def test_machine_code_comparison_is_case_insensitive(self) -> None:
+        code_id, points_milli, role = proxy.parse_license_response(
+            self.valid_result(machine_code="B38301CAFA772CE3EAAFB1227B63125B"),
+            200,
+            "b38301cafa772ce3eaafb1227b63125b",
+            {"primary"},
+        )
+        self.assertEqual(code_id, "PRIMARY-001")
+        self.assertEqual(points_milli, 100_000)
+        self.assertEqual(role, "primary")
+
     def test_main_and_topup_code_roles_are_not_interchangeable(self) -> None:
         with self.assertRaises(proxy.ApiError):
             proxy.parse_license_response(
@@ -398,9 +563,9 @@ class LicenseContractTests(unittest.TestCase):
                 self.valid_result(code_role="primary"), 200, "MACHINE-A", {"auto_topup"}
             )
 
-    def test_explicit_zero_remaining_points_never_reissues_granted_points(self) -> None:
+    def test_explicit_zero_remaining_credits_never_reissues_granted_points(self) -> None:
         code_id, points_milli, role = proxy.parse_license_response(
-            self.valid_result(remaining_points=0),
+            self.valid_result(remaining_credits=0),
             200,
             "MACHINE-A",
             {"primary"},
@@ -408,6 +573,45 @@ class LicenseContractTests(unittest.TestCase):
         self.assertEqual(code_id, "PRIMARY-001")
         self.assertEqual(points_milli, 0)
         self.assertEqual(role, "primary")
+
+    def test_legacy_remaining_points_is_accepted_when_unambiguous(self) -> None:
+        response = self.valid_result()
+        response.pop("remaining_credits")
+        response["remaining_points"] = 25
+        _, points_milli, _ = proxy.parse_license_response(
+            response, 200, "MACHINE-A", {"primary"}
+        )
+        self.assertEqual(points_milli, 25_000)
+
+    def test_conflicting_credit_fields_are_rejected(self) -> None:
+        response = self.valid_result(remaining_credits=100, remaining_points=99)
+        with self.assertRaises(proxy.ApiError):
+            proxy.parse_license_response(response, 200, "MACHINE-A", {"primary"})
+
+    def test_authenticated_device_status_can_default_to_primary_role(self) -> None:
+        response = self.valid_result()
+        response.pop("code_role")
+        response.update({
+            "primary_code_id": "PRIMARY-001",
+            "primary_activation_code": "",
+            "transfer_count": 0,
+            "balance_mode": "server_managed",
+            "balance_authoritative": True,
+            "unlimited": False,
+            "entitlement_type": "credits",
+        })
+        code_id, points_milli, role = proxy.parse_license_response(
+            response, 200, "MACHINE-A", {"primary", "legacy_manual"}, default_role="primary"
+        )
+        self.assertEqual(code_id, "PRIMARY-001")
+        self.assertEqual(points_milli, 100_000)
+        self.assertEqual(role, "primary")
+
+    def test_activation_response_cannot_omit_code_role(self) -> None:
+        response = self.valid_result()
+        response.pop("code_role")
+        with self.assertRaises(proxy.ApiError):
+            proxy.parse_license_response(response, 200, "MACHINE-A", {"auto_topup"})
 
     def test_nested_request_echo_cannot_supply_a_server_code_id(self) -> None:
         response = {
@@ -420,7 +624,7 @@ class LicenseContractTests(unittest.TestCase):
             "data": {
                 "binding_status": "active",
                 "code_role": "primary",
-                "remaining_points": 100,
+                "remaining_credits": 100,
             },
         }
         with self.assertRaises(proxy.ApiError):
@@ -443,7 +647,7 @@ class LicenseContractTests(unittest.TestCase):
         for invalid_points in (True, False, "100"):
             with self.subTest(points=invalid_points), self.assertRaises(proxy.ApiError):
                 proxy.parse_license_response(
-                    self.valid_result(remaining_points=invalid_points), 200, "MACHINE-A", {"primary"}
+                    self.valid_result(remaining_credits=invalid_points), 200, "MACHINE-A", {"primary"}
                 )
 
     def test_nginx_public_entrypoints_have_rate_and_connection_limits(self) -> None:

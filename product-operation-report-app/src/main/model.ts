@@ -194,6 +194,25 @@ function endpoint(baseURL: string): string {
   return `${base}/chat/completions`
 }
 
+function readableHttpError(status: number, statusText: string, raw: string, retryAfter?: number): string {
+  let serverMessage = ''
+  try {
+    const parsed = JSON.parse(raw) as { message?: unknown; error?: unknown }
+    if (typeof parsed.message === 'string') serverMessage = parsed.message.trim()
+    else if (typeof parsed.error === 'string') serverMessage = parsed.error.trim()
+    else if (parsed.error && typeof parsed.error === 'object') {
+      const nested = parsed.error as { message?: unknown }
+      if (typeof nested.message === 'string') serverMessage = nested.message.trim()
+    }
+  } catch {
+    serverMessage = raw.trim().replace(/\s+/g, ' ').slice(0, 240)
+  }
+  const fallback = status === 402
+    ? '积分不足，本次任务没有扣费。请充值后重试。'
+    : `服务请求失败（HTTP ${status}${statusText ? ` ${statusText}` : ''}）。`
+  return `HTTP ${status}：${serverMessage || fallback}${retryAfter ? `；建议等待 ${retryAfter} 秒后重试` : ''}`
+}
+
 /** 非流式：测试连通性 */
 export async function testModel(opts: TestModelOptions): Promise<TestModelResult> {
   const { profile, withImageDataUrl } = opts
@@ -232,7 +251,7 @@ export async function testModel(opts: TestModelOptions): Promise<TestModelResult
     if (!res.ok) {
       return {
         ok: false,
-        message: `HTTP ${res.status} ${res.statusText} ${raw.slice(0, 300)}`,
+        message: readableHttpError(res.status, res.statusText, raw),
         latencyMs: Date.now() - started
       }
     }
@@ -337,7 +356,7 @@ export async function chatStream(
     if (!res.ok) {
       const errText = await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
       const wait = res.status === 429 ? retryAfterSeconds(res) : undefined
-      emitError(`HTTP ${res.status} ${res.statusText} ${errText.slice(0, 300)}${wait ? `；建议等待 ${wait} 秒后重试` : ''}`)
+      emitError(readableHttpError(res.status, res.statusText, errText, wait))
       return
     }
     if (!res.body) {

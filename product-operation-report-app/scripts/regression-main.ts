@@ -2167,6 +2167,24 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.equal(rateLimitEvents.at(-1)?.type, 'error')
     assert.match(rateLimitEvents.at(-1)?.type === 'error' ? rateLimitEvents.at(-1)?.message || '' : '', /等待 2 秒/)
 
+    const insufficientPointsEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        ok: false,
+        message: '积分不足：当前可用 100 积分，本批最多需要暂时预留 117.074 积分。系统尚未扣费。'
+      }), {
+        status: 402,
+        statusText: 'Payment Required',
+        headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试积分提示' }], (event) => insufficientPointsEvents.push(event))
+    assert.equal(insufficientPointsEvents.at(-1)?.type, 'error')
+    const pointsMessage = insufficientPointsEvents.at(-1)?.type === 'error'
+      ? insufficientPointsEvents.at(-1)?.message || ''
+      : ''
+    assert.match(pointsMessage, /当前可用 100 积分/)
+    assert.doesNotMatch(pointsMessage, /\{"ok"/)
+
     globalThis.fetch = (async () =>
       new Response(
         JSON.stringify({ data: Array.from({ length: 650 }, (_, index) => ({ id: `model-${index}` })) }),

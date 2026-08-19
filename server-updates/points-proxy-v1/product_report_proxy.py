@@ -45,6 +45,9 @@ LICENSE_STATUS_URL = os.environ.get(
 LICENSE_ACTIVATE_URL = os.environ.get(
     "POR_LICENSE_ACTIVATE_URL", "http://127.0.0.1:8791/api/license/activate"
 )
+LICENSE_CONSUME_URL = os.environ.get(
+    "POR_LICENSE_CONSUME_URL", "http://127.0.0.1:8791/api/license/credits/consume"
+)
 PROVIDER_BASE_URL = os.environ.get("POR_PROVIDER_BASE_URL", "https://ccg-cli.online/v1").rstrip("/")
 PROVIDER_API_KEY = os.environ.get("POR_PROVIDER_API_KEY", "").strip()
 PROVIDER_KEYS_FILE = os.environ.get(
@@ -113,6 +116,7 @@ class Session:
     device_credential: str
     device_session: str
     expires_at: float
+    unlimited: bool = False
 
 
 SESSIONS: dict[str, Session] = {}
@@ -211,6 +215,9 @@ def ensure_schema(db: sqlite3.Connection) -> None:
           charged_milli INTEGER NOT NULL DEFAULT 0,
           started_at TEXT NOT NULL,
           ended_at TEXT
+          ,billing_request_id TEXT NOT NULL DEFAULT ''
+          ,billing_result_status TEXT NOT NULL DEFAULT ''
+          ,billing_error TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_requests_wallet_status
           ON model_requests(app_name, code_id, status, started_at);
@@ -227,6 +234,12 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE model_requests ADD COLUMN upstream_submitted INTEGER NOT NULL DEFAULT 0")
     if "response_model" not in request_columns:
         db.execute("ALTER TABLE model_requests ADD COLUMN response_model TEXT NOT NULL DEFAULT ''")
+    if "billing_request_id" not in request_columns:
+        db.execute("ALTER TABLE model_requests ADD COLUMN billing_request_id TEXT NOT NULL DEFAULT ''")
+    if "billing_result_status" not in request_columns:
+        db.execute("ALTER TABLE model_requests ADD COLUMN billing_result_status TEXT NOT NULL DEFAULT ''")
+    if "billing_error" not in request_columns:
+        db.execute("ALTER TABLE model_requests ADD COLUMN billing_error TEXT NOT NULL DEFAULT ''")
 
 
 def as_object(value: Any) -> dict[str, Any]:
@@ -274,10 +287,11 @@ def parse_license_response(
     status: int,
     expected_machine: str,
     allowed_roles: set[str],
+    default_role: str = "",
 ) -> tuple[str, int, str]:
     forbidden_top_level_aliases = {
         "success", "valid", "activated", "license_id", "activation_id",
-        "bound_machine_code", "device_id", "remaining_credits", "credits_remaining",
+        "bound_machine_code", "device_id", "credits_remaining",
         "wallet_balance", "points_balance", "credits", "points", "initial_credits", "granted_credits",
     }
     if forbidden_top_level_aliases.intersection(result):
@@ -299,26 +313,38 @@ def parse_license_response(
         raise ApiError(403, "授权不属于当前软件。")
 
     response_machine = text(result.get("machine_code"), 200)
-    if not response_machine or not hmac.compare_digest(response_machine, expected_machine):
+    normalized_response_machine = response_machine.strip().lower()
+    normalized_expected_machine = expected_machine.strip().lower()
+    if not normalized_response_machine or not hmac.compare_digest(
+        normalized_response_machine, normalized_expected_machine
+    ):
         raise ApiError(403, "授权绑定的电脑不一致。")
 
     code_id = text(result.get("code_id"), 200)
     if not code_id:
         raise ApiError(503, "授权服务器没有返回稳定的授权标识。")
 
-    role = text(result.get("code_role"), 40).lower()
+    role = text(result.get("code_role"), 40).lower() or text(default_role, 40).lower()
     if role not in allowed_roles:
         raise ApiError(403, "该激活码用途不匹配，不能在这里使用。")
 
-    if "remaining_points" not in result:
+    has_credits = "remaining_credits" in result
+    has_legacy_points = "remaining_points" in result
+    if not has_credits and not has_legacy_points:
         raise ApiError(503, "授权服务器没有返回当前剩余积分。")
-    points = parse_nonnegative(result.get("remaining_points"))
-    if points is None:
+    credits = parse_nonnegative(result.get("remaining_credits")) if has_credits else None
+    legacy_points = parse_nonnegative(result.get("remaining_points")) if has_legacy_points else None
+    if (has_credits and credits is None) or (has_legacy_points and legacy_points is None):
         raise ApiError(503, "授权服务器返回的剩余积分无效。")
+    if has_credits and has_legacy_points and credits != legacy_points:
+        raise ApiError(503, "授权服务器返回了相互冲突的积分余额。")
+    points = credits if has_credits else legacy_points
+    if points is None:
+        raise ApiError(503, "授权服务器没有返回当前剩余积分。")
     return code_id, round(points * 1000), role
 
 
-def verify_license(identity: dict[str, Any]) -> tuple[str, int, str]:
+def verify_license(identity: dict[str, Any]) -> tuple[str, int, str, bool]:
     app_name = text(identity.get("app_name"), 80)
     machine = text(identity.get("machine_code"), 200)
     license_id = text(identity.get("license_id"), 200)
@@ -352,11 +378,43 @@ def verify_license(identity: dict[str, Any]) -> tuple[str, int, str]:
         result = as_object(json.loads(raw.decode("utf-8", "replace")))
     except Exception as error:
         raise ApiError(503, "授权服务器返回异常，请联系管理员。") from error
-    return parse_license_response(result, status, machine, {"primary", "legacy_manual"})
+    # /device/status is authenticated by the device session and credential. The
+    # current license service only returns primary device records from this
+    # endpoint, so use primary as the compatibility default when code_role is
+    # absent. Activation/redeem responses still have to provide an explicit role.
+    code_id, remaining_milli, role = parse_license_response(
+        result, status, machine, {"primary", "legacy_manual"}, default_role="primary"
+    )
+    unlimited = result.get("unlimited", False)
+    if not isinstance(unlimited, bool):
+        raise ApiError(503, "授权服务器返回的无限授权状态无效。")
+    return code_id, remaining_milli, role, unlimited
+
+
+def sync_authoritative_wallet(session: Session, balance_milli: int) -> None:
+    """Mirror the license balance without treating a refresh as a top-up."""
+    with database() as db:
+        ensure_schema(db)
+        now = utc_now()
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT machine_code FROM wallets WHERE app_name=? AND code_id=?", (APP_NAME, session.code_id)
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO wallets(app_name,code_id,machine_code,balance_milli,total_topup_milli,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (APP_NAME, session.code_id, session.machine_code, balance_milli, balance_milli, now, now),
+            )
+        else:
+            db.execute(
+                "UPDATE wallets SET machine_code=?,balance_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+                (session.machine_code, balance_milli, now, APP_NAME, session.code_id),
+            )
+        db.execute("COMMIT")
 
 
 def create_session(payload: dict[str, Any]) -> tuple[str, Session]:
-    code_id, initial_milli, _ = verify_license(payload)
+    code_id, authoritative_milli, _, unlimited = verify_license(payload)
     machine = text(payload.get("machine_code"), 200)
     raw_token = secrets.token_urlsafe(48)
     token_hash = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
@@ -366,6 +424,7 @@ def create_session(payload: dict[str, Any]) -> tuple[str, Session]:
         device_credential=text(payload.get("device_credential"), 8192),
         device_session=text(payload.get("device_session"), 8192),
         expires_at=time.time() + SESSION_TTL_SECONDS,
+        unlimited=unlimited,
     )
     with database() as db:
         ensure_schema(db)
@@ -384,19 +443,20 @@ def create_session(payload: dict[str, Any]) -> tuple[str, Session]:
         if row is None:
             db.execute(
                 "INSERT INTO wallets(app_name,code_id,machine_code,balance_milli,total_topup_milli,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (APP_NAME, code_id, machine, initial_milli, initial_milli, now, now),
+                (APP_NAME, code_id, machine, authoritative_milli, authoritative_milli, now, now),
             )
-            if initial_milli:
+            if authoritative_milli:
                 db.execute(
                     "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), APP_NAME, code_id, "topup", "激活码初始积分", initial_milli,
-                     initial_milli, None, None, None, now),
+                    (str(uuid.uuid4()), APP_NAME, code_id, "topup", "激活码初始积分", authoritative_milli,
+                     authoritative_milli, None, None, None, now),
                 )
-        elif row["machine_code"] != machine:
-            # License service is authoritative for rebind; a verified new machine inherits the same wallet.
+        else:
+            # The license service owns both rebind state and the current balance.
+            # A refresh is a mirror update, never a new grant or ledger top-up.
             db.execute(
-                "UPDATE wallets SET machine_code=?,updated_at=? WHERE app_name=? AND code_id=?",
-                (machine, now, APP_NAME, code_id),
+                "UPDATE wallets SET machine_code=?,balance_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+                (machine, authoritative_milli, now, APP_NAME, code_id),
             )
         db.execute("COMMIT")
     with SESSION_LOCK:
@@ -431,18 +491,90 @@ def require_session(headers: Any, verify: bool = False) -> Session:
         if not wallet or wallet["frozen"] or not hmac.compare_digest(str(wallet["machine_code"]), session.machine_code):
             raise ApiError(403, "当前电脑已不再持有这份授权，请重新激活。")
     if verify:
-        code_id, _, _ = verify_license({
+        code_id, authoritative_milli, _, unlimited = verify_license({
             "app_name": APP_NAME, "machine_code": session.machine_code,
             "license_id": session.license_id, "device_credential": session.device_credential,
             "device_session": session.device_session,
         })
         if not hmac.compare_digest(code_id, session.code_id):
             raise ApiError(403, "授权标识已变化，请重新激活。")
+        session.unlimited = unlimited
+        sync_authoritative_wallet(session, authoritative_milli)
+        retry_pending_billing(session)
     return session
 
 
 def milli_to_points(value: int) -> float | int:
     return value // 1000 if value % 1000 == 0 else round(value / 1000, 3)
+
+
+def billing_consume_request_id(billing_request_id: str) -> str:
+    value = text(billing_request_id, 240)
+    if not value or not SAFE_TEXT_RE.fullmatch(value):
+        raise ApiError(400, "模型计费任务标识无效。")
+    return "por-" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def consume_authoritative_credits(
+    session: Session, amount_milli: int, billing_request_id: str, reason: str
+) -> tuple[int, bool]:
+    if amount_milli <= 0:
+        _, remaining_milli, _, unlimited = verify_license({
+            "app_name": APP_NAME,
+            "machine_code": session.machine_code,
+            "license_id": session.license_id,
+            "device_credential": session.device_credential,
+            "device_session": session.device_session,
+        })
+        return remaining_milli, unlimited
+    payload = json.dumps({
+        "license_protocol_version": 2,
+        "app_name": APP_NAME,
+        "amount": milli_to_points(amount_milli),
+        "reason": text(reason, 120) or "product_operation_report",
+        "request_id": billing_consume_request_id(billing_request_id),
+        "client_version": "proxy",
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        LICENSE_CONSUME_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {session.device_session}",
+            "X-Device-Credential": session.device_credential,
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            raw = response.read(64 * 1024)
+            status = int(response.status)
+    except HTTPError as error:
+        raw = error.read(64 * 1024)
+        status = int(error.code)
+    except (URLError, TimeoutError, OSError) as error:
+        raise ApiError(503, "积分结算服务器暂时不可用，本次任务已进入待结算状态。") from error
+    try:
+        result = as_object(json.loads(raw.decode("utf-8", "replace")))
+    except Exception as error:
+        raise ApiError(503, "积分结算服务器返回异常，本次任务已进入待结算状态。") from error
+    if status < 200 or status >= 300 or result.get("ok") is not True:
+        message = text(result.get("message") or result.get("error"), 300)
+        raise ApiError(status if status >= 400 else 503, message or "积分结算失败，本次任务已进入待结算状态。")
+    response_app = text(result.get("app_name"), 80)
+    if response_app and response_app != APP_NAME:
+        raise ApiError(503, "积分结算响应的软件标识不匹配。")
+    response_code_id = text(result.get("code_id"), 200)
+    if response_code_id and not hmac.compare_digest(response_code_id, session.code_id):
+        raise ApiError(503, "积分结算响应的授权标识不匹配。")
+    if "remaining_credits" not in result:
+        raise ApiError(503, "积分结算响应缺少当前剩余积分。")
+    remaining = parse_nonnegative(result.get("remaining_credits"))
+    unlimited = result.get("unlimited", False)
+    if remaining is None or not isinstance(unlimited, bool):
+        raise ApiError(503, "积分结算响应格式无效。")
+    return round(remaining * 1000), unlimited
 
 
 def pricing(model: str = "gpt-5.5") -> dict[str, Any]:
@@ -691,7 +823,7 @@ def points_for_verified_usage(requested_model: str, response_model: str | None, 
 
 
 def reserve_request(session: Session, request_id: str, report_id: str, task_key: str, task_type: str,
-                    model: str, attempt: int, input_estimate: int) -> int:
+                    model: str, attempt: int, input_estimate: int, billing_request_id: str = "") -> int:
     output_reserve = min(MAX_OUTPUT_TOKENS, TASK_OUTPUT_RESERVES.get(task_type, MAX_OUTPUT_TOKENS))
     reserve_candidates = [points_for_usage(candidate, input_estimate, output_reserve) for candidate in MODEL_PRICES]
     reserve, reserve_cost_cny = max(reserve_candidates, key=lambda item: item[0])
@@ -726,21 +858,95 @@ def reserve_request(session: Session, request_id: str, report_id: str, task_key:
             db.execute("ROLLBACK")
             raise ApiError(403, "积分账户不可用，请重新登录或联系管理员。")
         available = wallet["balance_milli"] - wallet["locked_milli"]
-        if reserve <= 0 or available < reserve:
+        if reserve <= 0 or (not session.unlimited and available < reserve):
             db.execute("ROLLBACK")
-            raise ApiError(402, f"积分不足，本次任务最多需要预留 {milli_to_points(reserve)} 积分。")
+            raise ApiError(
+                402,
+                "积分不足：当前可用 "
+                f"{milli_to_points(max(0, available))} 积分，本批最多需要暂时预留 "
+                f"{milli_to_points(reserve)} 积分。系统尚未扣费。",
+            )
         now = utc_now()
         db.execute(
             "UPDATE wallets SET locked_milli=locked_milli+?,updated_at=? WHERE app_name=? AND code_id=?",
             (reserve, now, APP_NAME, session.code_id),
         )
         db.execute(
-            "INSERT INTO model_requests(request_id,app_name,code_id,machine_code,report_session_id,task_key,task_type,model,attempt,status,reserved_milli,input_estimate,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO model_requests(request_id,app_name,code_id,machine_code,report_session_id,task_key,task_type,model,attempt,status,reserved_milli,input_estimate,started_at,billing_request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, APP_NAME, session.code_id, session.machine_code, report_id, task_key, task_type,
-             model, attempt, "running", reserve, input_estimate, now),
+             model, attempt, "running", reserve, input_estimate, now, billing_request_id or request_id),
         )
         db.execute("COMMIT")
     return reserve
+
+
+def finalize_billing_request(
+    session: Session, request_id: str, remaining_milli: int, unlimited: bool
+) -> None:
+    with database() as db:
+        ensure_schema(db)
+        db.execute("BEGIN IMMEDIATE")
+        request_row = db.execute("SELECT * FROM model_requests WHERE request_id=?", (request_id,)).fetchone()
+        if not request_row or request_row["status"] != "billing_pending":
+            db.execute("ROLLBACK")
+            return
+        wallet = db.execute(
+            "SELECT * FROM wallets WHERE app_name=? AND code_id=?", (APP_NAME, session.code_id)
+        ).fetchone()
+        if not wallet:
+            db.execute("ROLLBACK")
+            raise ApiError(403, "积分账户不可用，请重新登录或联系管理员。")
+        actual_charge = 0 if unlimited else max(0, int(request_row["charged_milli"]))
+        locked = max(0, int(wallet["locked_milli"]) - int(request_row["reserved_milli"]))
+        now = utc_now()
+        db.execute(
+            "UPDATE wallets SET balance_milli=?,locked_milli=?,total_cost_milli=total_cost_milli+?,total_charged_milli=total_charged_milli+?,updated_at=? WHERE app_name=? AND code_id=?",
+            (remaining_milli, locked, math.ceil(float(request_row["cost_cny"]) * POINTS_PER_CNY * 1000),
+             actual_charge, now, APP_NAME, session.code_id),
+        )
+        if actual_charge:
+            db.execute(
+                "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), APP_NAME, session.code_id, "usage", "模型任务", -actual_charge,
+                 remaining_milli, request_row["report_session_id"], request_row["task_type"], request_id, now),
+            )
+        db.execute(
+            "UPDATE model_requests SET status=?,charged_milli=?,billing_error='',ended_at=? WHERE request_id=?",
+            (request_row["billing_result_status"] or "success", actual_charge, now, request_id),
+        )
+        db.execute("COMMIT")
+    session.unlimited = unlimited
+
+
+def record_billing_error(request_id: str, message: str) -> None:
+    with database() as db:
+        ensure_schema(db)
+        db.execute(
+            "UPDATE model_requests SET billing_error=? WHERE request_id=? AND status='billing_pending'",
+            (text(message, 300), request_id),
+        )
+
+
+def retry_pending_billing(session: Session) -> None:
+    with database() as db:
+        ensure_schema(db)
+        pending = db.execute(
+            "SELECT request_id,charged_milli,billing_request_id,task_type FROM model_requests "
+            "WHERE app_name=? AND code_id=? AND status='billing_pending' ORDER BY started_at",
+            (APP_NAME, session.code_id),
+        ).fetchall()
+    for row in pending:
+        try:
+            remaining, unlimited = consume_authoritative_credits(
+                session,
+                int(row["charged_milli"]),
+                row["billing_request_id"] or row["request_id"],
+                f"product_operation_report:{row['task_type']}",
+            )
+        except ApiError as error:
+            record_billing_error(row["request_id"], error.message)
+            raise
+        finalize_billing_request(session, row["request_id"], remaining, unlimited)
 
 
 def settle_request(session: Session, request_id: str, status: str, model: str, usage: dict[str, Any] | None,
@@ -764,6 +970,8 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
     if not sent_content and not usage:
         charged = 0
         cost_cny = 0
+    billing_request_id = request_id
+    task_type = "model"
     with database() as db:
         ensure_schema(db)
         db.execute("BEGIN IMMEDIATE")
@@ -774,26 +982,44 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
         wallet = db.execute(
             "SELECT * FROM wallets WHERE app_name=? AND code_id=?", (APP_NAME, session.code_id)
         ).fetchone()
+        if not wallet:
+            db.execute("ROLLBACK")
+            raise ApiError(403, "积分账户不可用，请重新登录或联系管理员。")
         # The reserve uses the most expensive allowed model and the enforced output cap.
         charged = min(charged, request_row["reserved_milli"])
-        balance = wallet["balance_milli"] - charged
-        locked = max(0, wallet["locked_milli"] - request_row["reserved_milli"])
         now = utc_now()
-        db.execute(
-            "UPDATE wallets SET balance_milli=?,locked_milli=?,total_cost_milli=total_cost_milli+?,total_charged_milli=total_charged_milli+?,updated_at=? WHERE app_name=? AND code_id=?",
-            (balance, locked, math.ceil(cost_cny * POINTS_PER_CNY * 1000), charged, now, APP_NAME, session.code_id),
-        )
-        if charged:
+        billing_request_id = request_row["billing_request_id"] or request_id
+        task_type = request_row["task_type"]
+        if charged <= 0:
+            locked = max(0, wallet["locked_milli"] - request_row["reserved_milli"])
             db.execute(
-                "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), APP_NAME, session.code_id, "usage", "模型任务", -charged, balance,
-                 request_row["report_session_id"], request_row["task_type"], request_id, now),
+                "UPDATE wallets SET locked_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+                (locked, now, APP_NAME, session.code_id),
             )
+            db.execute(
+                "UPDATE model_requests SET status=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=0,charged_milli=0,billing_result_status=?,billing_error='',ended_at=? WHERE request_id=?",
+                (status, input_tokens, output_tokens, cached, created, usage_source, response_model,
+                 status, now, request_id),
+            )
+            db.execute("COMMIT")
+            return
         db.execute(
-            "UPDATE model_requests SET status=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=?,charged_milli=?,ended_at=? WHERE request_id=?",
-            (status, input_tokens, output_tokens, cached, created, usage_source, response_model, cost_cny, charged, now, request_id),
+            "UPDATE model_requests SET status='billing_pending',input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=?,charged_milli=?,billing_result_status=?,billing_error='',ended_at=? WHERE request_id=?",
+            (input_tokens, output_tokens, cached, created, usage_source, response_model, cost_cny,
+             charged, status, now, request_id),
         )
         db.execute("COMMIT")
+    try:
+        remaining, unlimited = consume_authoritative_credits(
+            session,
+            charged,
+            billing_request_id,
+            f"product_operation_report:{task_type}",
+        )
+    except ApiError as error:
+        record_billing_error(request_id, error.message)
+        return
+    finalize_billing_request(session, request_id, remaining, unlimited)
 
 
 def provider_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -880,29 +1106,27 @@ def recover_interrupted_requests() -> None:
             charged = 0
             cost_cny = 0.0
             usage_source = "missing"
-            status = "interrupted"
             if row["upstream_submitted"]:
                 charged, cost_cny = points_for_usage(row["model"], max(0, row["input_estimate"]), 0)
                 charged = min(charged, row["reserved_milli"])
                 usage_source = "estimated"
-                status = "interrupted_estimated"
-            balance = max(0, wallet["balance_milli"] - charged)
-            locked = max(0, wallet["locked_milli"] - row["reserved_milli"])
             now = utc_now()
-            db.execute(
-                "UPDATE wallets SET balance_milli=?,locked_milli=?,total_cost_milli=total_cost_milli+?,total_charged_milli=total_charged_milli+?,updated_at=? WHERE app_name=? AND code_id=?",
-                (balance, locked, math.ceil(cost_cny * POINTS_PER_CNY * 1000), charged, now, row["app_name"], row["code_id"]),
-            )
             if charged:
                 db.execute(
-                    "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), row["app_name"], row["code_id"], "usage", "异常中断保守结算",
-                     -charged, balance, row["report_session_id"], row["task_type"], row["request_id"], now),
+                    "UPDATE model_requests SET status='billing_pending',input_tokens=?,usage_source=?,cost_cny=?,charged_milli=?,billing_result_status='interrupted_estimated',billing_error=?,ended_at=? WHERE request_id=?",
+                    (max(0, row["input_estimate"]), usage_source, cost_cny, charged,
+                     "等待设备重新连接后完成保守结算。", now, row["request_id"]),
                 )
-            db.execute(
-                "UPDATE model_requests SET status=?,input_tokens=?,usage_source=?,cost_cny=?,charged_milli=?,ended_at=? WHERE request_id=?",
-                (status, max(0, row["input_estimate"]) if charged else 0, usage_source, cost_cny, charged, now, row["request_id"]),
-            )
+            else:
+                locked = max(0, wallet["locked_milli"] - row["reserved_milli"])
+                db.execute(
+                    "UPDATE wallets SET locked_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+                    (locked, now, row["app_name"], row["code_id"]),
+                )
+                db.execute(
+                    "UPDATE model_requests SET status='interrupted',usage_source='missing',charged_milli=0,billing_result_status='interrupted',billing_error='',ended_at=? WHERE request_id=?",
+                    (now, row["request_id"]),
+                )
             db.execute("COMMIT")
 
 
@@ -993,6 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
         if not provider_candidates:
             raise ApiError(503, "模型服务密钥尚未在服务器配置。")
         request_id = text(self.headers.get("x-request-id"), 240)
+        billing_request_id = text(self.headers.get("x-billing-request-id"), 240)
         report_id = text(self.headers.get("x-report-session-id"), 200)
         task_key = text(self.headers.get("x-task-key"), 200)
         task_type = text(self.headers.get("x-task-type"), 80)
@@ -1000,7 +1225,14 @@ class Handler(BaseHTTPRequestHandler):
             attempt = int(self.headers.get("x-task-attempt", "0"))
         except ValueError:
             attempt = 0
-        if not REQUEST_ID_RE.fullmatch(request_id) or not report_id or not task_key or not task_type:
+        if (
+            not REQUEST_ID_RE.fullmatch(request_id)
+            or not billing_request_id
+            or not SAFE_TEXT_RE.fullmatch(billing_request_id)
+            or not report_id
+            or not task_key
+            or not task_type
+        ):
             raise ApiError(400, "模型任务标识不完整。")
         if task_type not in ALLOWED_TASK_TYPES or not SAFE_TEXT_RE.fullmatch(task_type):
             raise ApiError(400, "模型任务类型无效。")
@@ -1024,7 +1256,10 @@ class Handler(BaseHTTPRequestHandler):
             upstream_body["temperature"] = float(temperature)
         if task_type in ("source_clean", "summary") and body.get("reasoning_effort") == "low":
             upstream_body["reasoning_effort"] = "low"
-        reserve_request(session, request_id, report_id, task_key, task_type, model, attempt, input_estimate)
+        reserve_request(
+            session, request_id, report_id, task_key, task_type, model, attempt,
+            input_estimate, billing_request_id,
+        )
         upstream_data = json.dumps(upstream_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         mark_upstream_submitted(request_id)
         usage: dict[str, int] | None = None
