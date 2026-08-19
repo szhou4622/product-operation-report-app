@@ -1,5 +1,4 @@
 import { app, shell, BrowserWindow, clipboard, dialog, ipcMain, Menu, session } from 'electron'
-import { randomUUID } from 'crypto'
 import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
 import type {
@@ -7,9 +6,7 @@ import type {
   ActivationStatus,
   AppSettings,
   CostOptimizationEvent,
-  ChatMessage,
   ChatStreamEvent,
-  ModelTaskContext,
   ModelTokenUsage,
   SavedProject,
   ReportResultCacheInput,
@@ -58,21 +55,9 @@ import {
   classifyModelFailure,
   estimateRequestTokens,
   getTokenUsageDashboard,
-  readTokenUsageRecords,
   sanitizeModelTaskContext,
   tokenUsageLogPath
 } from './tokenUsage'
-import {
-  applyActivationPoints,
-  applyRechargeCodePoints,
-  canStartPointsReport,
-  getReportChargedPoints,
-  getPointsWalletStatus,
-  grantDevelopmentPoints,
-  reconcileTokenUsage,
-  settleTokenUsage,
-  clearLocalPointsAfterUnbind
-} from './pointsWallet'
 import {
   clearSourceCleanCache,
   getSourceCleanCacheStats,
@@ -166,9 +151,7 @@ function ensureActivated(): void {
 }
 
 async function broadcastAuthorization(status = getActivationStatus()): Promise<void> {
-  const wallet = getManagedModelState().mode === 'proxy'
-    ? await fetchProxyWallet().catch(() => undefined)
-    : applyActivationPoints(status).wallet
+  const wallet = await fetchProxyWallet().catch(() => undefined)
   for (const window of BrowserWindow.getAllWindows()) {
     if (window.isDestroyed()) continue
     window.webContents.send('activation:changed', status)
@@ -313,9 +296,9 @@ function createWindow(): void {
   })
 
   if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
-    window.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    void window.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    window.loadFile(join(__dirname, '../renderer/index.html'))
+    void window.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -439,20 +422,13 @@ ipcMain.handle('activation:code:copy', () => {
   return { ok: true, message: '激活码已复制到剪贴板。', maskedCode: result.maskedCode }
 })
 ipcMain.handle('activation:deactivate', async () => {
-  const proxyMode = getManagedModelState().mode === 'proxy'
-  const before = proxyMode ? await fetchProxyWallet().catch(() => undefined) : getPointsWalletStatus()
+  const before = await fetchProxyWallet().catch(() => undefined)
   const result = await deactivateCurrentDevice()
   let wallet = before
   if (result.ok && result.unbindId) {
     clearAiProxySession()
     clearProxyWalletSnapshot()
-    if (!proxyMode) {
-      try {
-        wallet = clearLocalPointsAfterUnbind(result.unbindId)
-      } catch {
-        result.message += ' 本机积分显示未能清理，但云端授权已解除；请不要在旧电脑继续使用，并联系管理员。'
-      }
-    }
+    wallet = undefined
   }
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) {
@@ -464,76 +440,35 @@ ipcMain.handle('activation:deactivate', async () => {
 })
 ipcMain.handle('points:get', async () => {
   ensureActivated()
-  if (getManagedModelState().mode === 'proxy') return fetchProxyWallet()
-  applyActivationPoints(getActivationStatus())
-  return reconcileTokenUsage(await readTokenUsageRecords())
+  return fetchProxyWallet()
 })
 ipcMain.handle('points:canStartReport', async () => {
-  if (getManagedModelState().mode !== 'proxy') return canStartPointsReport(getActivationStatus())
   const access = canStartLicensedAnalysis()
   const wallet = await fetchProxyWallet()
   return { ok: access.ok, message: access.message, wallet }
 })
 ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => {
-  if (getManagedModelState().mode !== 'proxy') return { chargedPoints: getReportChargedPoints(reportSessionId) }
   const wallet = await fetchProxyWallet()
   const chargedPoints = wallet.ledger
     .filter((entry) => entry.reportSessionId === reportSessionId && entry.pointsDelta < 0)
     .reduce((sum, entry) => sum + Math.abs(entry.pointsDelta), 0)
   return { chargedPoints }
 })
-ipcMain.handle('points:grantDevelopment', () => {
-  ensureActivated()
-  const wallet = grantDevelopmentPoints(10_000, randomUUID())
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send('points:changed', wallet)
-  }
-  return wallet
-})
 ipcMain.handle('points:redeem', async (_e, code: string) => {
-  if (getManagedModelState().mode === 'proxy') {
-    const before = await fetchProxyWallet()
-    const merged = await redeemPointsWithCode(code)
-    if (merged.ok) {
-      clearAiProxySession()
-      clearProxyWalletSnapshot()
-    }
-    const wallet = merged.ok ? await fetchProxyWallet() : before
-    if (merged.ok) await broadcastAuthorization(merged.status)
-    return {
-      ok: merged.ok,
-      message: merged.message,
-      activation: merged.status,
-      addedPoints: merged.addedPoints,
-      wallet
-    }
+  const before = await fetchProxyWallet()
+  const merged = await redeemPointsWithCode(code)
+  if (merged.ok) {
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
   }
-  const before = getPointsWalletStatus()
-  const currentActivation = getActivationStatus()
-  const grant = await redeemPointsWithCode(code)
-  if (!grant.ok || !grant.grantId || !grant.points) {
-    return {
-      ok: false,
-      message: grant.message,
-      activation: currentActivation,
-      addedPoints: 0,
-      wallet: before
-    }
-  }
-  const applied = applyRechargeCodePoints(grant.grantId, grant.points)
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) {
-      window.webContents.send('points:changed', applied.wallet)
-    }
-  }
+  const wallet = merged.ok ? await fetchProxyWallet() : before
+  if (merged.ok) await broadcastAuthorization(merged.status)
   return {
-    ok: applied.addedPoints > 0,
-    message: applied.addedPoints > 0
-      ? `充值成功，已增加 ${applied.addedPoints} 积分。`
-      : '这个积分码已经入账过，积分没有重复增加。',
-    activation: currentActivation,
-    addedPoints: applied.addedPoints,
-    wallet: applied.wallet
+    ok: merged.ok,
+    message: merged.message,
+    activation: merged.status,
+    addedPoints: merged.addedPoints,
+    wallet
   }
 })
 
@@ -813,7 +748,12 @@ ipcMain.on(
                       'x-task-attempt': String(Math.min(20, context.attempt + profileIndex))
                     }
                   }
-                : {})
+                : {}),
+              promptCacheKey: context.taskType === 'source_clean'
+                ? `source-clean:${context.sourceId || context.taskKey}`
+                : context.taskType === 'analysis_step'
+                  ? `analysis:${context.reportSessionId}:evidence-digest-v1`
+                  : `${context.taskType}:${context.reportSessionId}`
             }
           )
         } catch (error) {
@@ -873,9 +813,7 @@ ipcMain.on(
         await appendTokenUsageRecord(finalRecord).catch((error) => {
           console.error('Unable to append token usage final record:', error)
         })
-        let wallet = managedState.mode === 'proxy'
-          ? undefined
-          : settleTokenUsage(finalRecord)
+        let wallet
         if (managedState.mode === 'proxy' && terminal.type === 'done') {
           wallet = await fetchProxyWallet().catch(() => undefined)
         }
@@ -922,7 +860,7 @@ if (hasSingleInstanceLock) {
     mainWindow.focus()
   })
 
-  app.whenReady().then(() => {
+  void app.whenReady().then(() => {
     setupMenu()
     createWindow()
     const blobPruneTimer = setTimeout(() => {

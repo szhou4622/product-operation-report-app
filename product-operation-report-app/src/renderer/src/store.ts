@@ -1,11 +1,8 @@
 import { create } from 'zustand'
 import type {
   AppSettings,
-  ChatMessage,
   CostOptimizationEvent,
-  ModelTaskContext,
   ProjectCleanDetailSnapshot,
-  ProjectPhase,
   ReportResultCacheInput,
   ReportResultCacheLookupResult,
   ReportResultCacheSnapshot,
@@ -18,10 +15,8 @@ import { SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
 import {
   buildExtractMessages,
-  buildEvidenceConsolidationMessages,
-  buildFinalReportPartMessages,
-  buildStepEvidenceGroupMessages,
-  buildStepFromEvidenceMessages,
+  buildEvidenceDigestConsolidationMessages,
+  buildEvidenceDigestMessages,
   buildStepMessages,
   buildSummaryGroupMessages,
   buildSummaryMergeMessages,
@@ -35,7 +30,14 @@ import {
   combineSourceCleanBatchOutputs,
   missingSourceCleanEvidenceIds
 } from './sourceCleanBatches'
-import { validateFinalReportPart, validateReportEvidenceLinks, validateReportStructure } from './validate'
+import { validateReportEvidenceLinks, validateReportStructure } from './validate'
+import { friendlyError } from './store/errors'
+import { buildProjectSnapshot } from './store/persistence'
+import { mergeRevisionParts, runFinalReportInParts, runModelRetry, selectRevisionParts } from './store/analysis'
+
+export { friendlyError } from './store/errors'
+export { buildProjectSnapshot } from './store/persistence'
+export { mergeRevisionParts, selectRevisionParts } from './store/analysis'
 
 export interface Source {
   id: string
@@ -55,7 +57,7 @@ export interface Source {
   derivedKind?: 'archive-entry' | 'embedded-image' | 'rendered-page' | 'converted-page'
 }
 
-const PARSE_CONCURRENCY = 1
+const PARSE_CONCURRENCY = 2
 export const MAX_CLEANING_CONCURRENCY = 4
 const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 const CLEAN_DETAIL_MARKER = '\n\n---\n## 各来源清洗明细'
@@ -133,6 +135,7 @@ export interface CleaningProgress {
   done: number
   running: string[]
   failed: number
+  startedAt?: number
 }
 
 const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0 })
@@ -235,99 +238,12 @@ export function priorOutputsForStep(
   })
 }
 
-export function friendlyError(value: unknown): string {
-  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
-  if (!raw) return '操作没有完成，请重试。'
-  if (/已停止|aborted|aborterror/i.test(raw)) return '已停止。'
-  if (/enospc|no space left|磁盘空间不足|磁盘已满/i.test(raw)) {
-    return '磁盘空间不足，无法保存文件。请清理空间或改存到其他磁盘后重试。'
-  }
-  if (/ebusy|resource busy|being used|另一个程序正在使用|文件.*占用/i.test(raw)) {
-    return '文件正在被其他程序占用。请关闭同名的 Word 或浏览器文件后重试。'
-  }
-  if (/eperm|eacces|permission denied|access denied|operation not permitted|拒绝访问/i.test(raw)) {
-    return '文件可能正在被占用，或保存位置没有权限。请关闭同名文件，或改存到桌面后重试。'
-  }
-  if (/enoent|path not found|找不到.*路径/i.test(raw)) {
-    return '保存位置已不存在。请重新选择桌面或其他文件夹后重试。'
-  }
-  if (/enametoolong|filename.*too long|path.*too long|文件名.*过长|路径.*过长/i.test(raw)) {
-    return '文件名或保存路径太长。请缩短文件名，或直接保存到桌面。'
-  }
-  if (/timeout|timed out|超时/i.test(raw)) return '请求超时，请检查网络后重试。'
-  if (/401|unauthorized|invalid api key|authentication/i.test(raw)) return '模型服务授权失败，请联系软件管理员。'
-  if (/404|model.*not found|not found.*model/i.test(raw)) return '模型地址或模型名称不正确，请到设置中检查。'
-  if (/429|rate limit|quota|insufficient_quota/i.test(raw)) {
-    const wait = raw.match(/等待\s*(\d+)\s*秒/)
-    return wait
-      ? `模型服务繁忙或额度受限，建议等待 ${wait[1]} 秒后重试。`
-      : '模型服务繁忙或额度受限，请稍后重试。'
-  }
-  if (/fetch failed|econnreset|enotfound|terminated|network/i.test(raw)) {
-    return '网络连接失败，请检查网络和模型地址后重试。'
-  }
-  return raw.slice(0, 280)
-}
-
 const isUserStop = (value: unknown): boolean => /已停止|aborted/i.test(String(value || ''))
 
 function restorePhase(project: SavedProject): Phase {
   if (project.phase === 'cleaning') return 'idle'
   if (project.phase === 'analyzing') return project.cleanedData ? 'checkpoint1' : 'idle'
   return project.phase as Phase
-}
-
-export function buildProjectSnapshot(state: {
-  projectRevision: number
-  analysisSessionId: string
-  sources: Source[]
-  messages: ChatMsg[]
-  cleanedData: string
-  cleanDetails: { id: string; name: string; text: string }[]
-  artifacts: Record<number, string>
-  taskJournal?: Record<string, ProjectTaskSnapshot>
-  reportMarkdown: string
-  reportStale: boolean
-  phase: Phase
-  steering: string
-}): SavedProject {
-  return {
-    revision: state.projectRevision,
-    analysisSessionId: state.analysisSessionId,
-    sources: state.sources.map((s) => ({
-      id: s.id,
-      name: s.name,
-      kind: s.kind,
-      text: s.text,
-      dataUrl: s.dataUrl,
-      error: s.error,
-      warning: s.warning,
-      attribution: s.attribution,
-      platform: s.platform,
-      purpose: s.purpose,
-      note: s.note,
-      size: s.size,
-      topLevelId: s.topLevelId,
-      derivedKind: s.derivedKind
-    })),
-    messages: state.messages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      text: m.text,
-      kind: m.kind
-    })),
-    cleanedData: state.cleanedData,
-    cleanDetails: state.cleanDetails,
-    artifacts: state.artifacts,
-    taskJournal: state.taskJournal || {},
-    reportMarkdown: isRunningPhase(state.phase)
-      ? state.artifacts[REPORT_STEP_ID] || ''
-      : state.reportMarkdown,
-    reportStale: state.reportStale,
-    phase: state.phase as ProjectPhase,
-    steering: state.steering,
-    updatedAt: new Date().toISOString()
-  }
 }
 
 function classify(name: string): Source['kind'] {
@@ -693,28 +609,6 @@ const downscaleImage = async (file: File, maxDim = 1600, quality = 0.9): Promise
   })
 }
 
-const toSourceLike = (
-  s: Source
-): {
-  name: string
-  kind: string
-  text?: string
-  dataUrl?: string
-  attribution?: string
-  platform?: string
-  purpose?: string
-  note?: string
-} => ({
-  name: s.name,
-  kind: s.kind,
-  text: s.text,
-  dataUrl: s.dataUrl,
-  attribution: s.attribution,
-  platform: s.platform,
-  purpose: s.purpose,
-  note: s.note
-})
-
 function cleanedSummaryOnly(cleanedData: string): string {
   const index = cleanedData.indexOf(CLEAN_DETAIL_MARKER)
   return index >= 0 ? cleanedData.slice(0, index).trim() : cleanedData
@@ -724,262 +618,6 @@ function compactForFinalReport(text: string): string {
   // 分析步骤已经通过任务相关的完整证据包控制体积；最终成稿不得再次按字符截断，
   // 否则步骤中段的来源、数字或限制会在最后一跳静默丢失。
   return text
-}
-
-async function runFinalReportInParts(params: {
-  cleanedData: string
-  priorOutputs: PriorOutput[]
-  feedback: string
-  setAbort: (fn: (() => void) | null) => void
-  onProgress: (text: string) => void
-  onRetry: (partLabel: string, n: number) => void
-  taskContext: {
-    reportSessionId: string
-    taskType: 'final_part' | 'revision_part'
-    taskKeyPrefix: string
-    sourceCount: number
-    imageCount: number
-  }
-  parts?: typeof FINAL_REPORT_PARTS
-  completedParts?: Record<string, string>
-  onPartComplete?: (taskId: string, text: string) => Promise<void>
-}): Promise<{ ok: boolean; text: string; error?: string }> {
-  let full = ''
-  for (const part of params.parts || FINAL_REPORT_PARTS) {
-    const taskId = `${params.taskContext.taskKeyPrefix}:${part.id}`
-    const completed = params.completedParts?.[taskId]?.trim()
-    if (completed) {
-      const completedErrors = validateFinalReportPart(completed, part)
-      if (!completedErrors.length) {
-        full = `${full}${completed}\n\n`
-        params.onProgress(full)
-        continue
-      }
-    }
-    const messages = buildFinalReportPartMessages({
-      part,
-      cleanedData: params.cleanedData,
-      priorOutputs: params.priorOutputs,
-      feedback: params.feedback
-    })
-    let current = ''
-    const res = await runModelRetry(
-      messages,
-      (acc) => {
-        current = acc
-        params.onProgress(`${full}${acc}`)
-      },
-      params.setAbort,
-      (n) => params.onRetry(part.label, n),
-      1,
-      {
-        reportSessionId: params.taskContext.reportSessionId,
-        taskType: params.taskContext.taskType,
-        taskKey: taskId,
-        billingRequestId: taskId,
-        isVision: false,
-        sourceCount: params.taskContext.sourceCount,
-        imageCount: params.taskContext.imageCount,
-        partId: part.id
-      }
-    )
-    if (!res.ok) return { ok: false, text: full + current, error: res.error }
-    const partText = res.text.trim()
-    const partErrors = validateFinalReportPart(partText, part)
-    if (partErrors.length) {
-      return { ok: false, text: full + partText, error: `${part.label}结构检查未通过：${partErrors.join('；')}` }
-    }
-    await params.onPartComplete?.(taskId, partText)
-    full = `${full}${partText}\n\n`
-    params.onProgress(full)
-  }
-  return { ok: true, text: full.trim() }
-}
-
-const REVISION_PART_KEYWORDS: Record<(typeof FINAL_REPORT_PARTS)[number]['id'], RegExp> = {
-  'part-0-4': /结论|数据来源|产品基础|一方数据|竞品|素材打法/u,
-  'part-5-8': /卖点|人群|场景|内容主线/u,
-  'part-9': /脚本|选题|3\s*秒|执行方向|视频分类|创作视角/u,
-  'part-10-11': /经营建议|行动建议|限制|风险|近期|中期|验证项/u
-}
-
-function partForSection(section: number): (typeof FINAL_REPORT_PARTS)[number] | undefined {
-  return FINAL_REPORT_PARTS.find((part) => part.sections.includes(String(section)))
-}
-
-export function selectRevisionParts(feedback: string): typeof FINAL_REPORT_PARTS {
-  const selected = new Set<string>()
-  for (const match of feedback.matchAll(/(?:第\s*)?(10|11|[0-9])\s*[-—至到]\s*(10|11|[0-9])\s*章/gu)) {
-    const start = Number(match[1])
-    const end = Number(match[2])
-    for (let section = Math.min(start, end); section <= Math.max(start, end); section++) {
-      const part = partForSection(section)
-      if (part) selected.add(part.id)
-    }
-  }
-  for (const match of feedback.matchAll(/(?:第\s*)?(10|11|[0-9])\s*章/gu)) {
-    const part = partForSection(Number(match[1]))
-    if (part) selected.add(part.id)
-  }
-  if (!selected.size) {
-    for (const part of FINAL_REPORT_PARTS) {
-      if (REVISION_PART_KEYWORDS[part.id].test(feedback)) selected.add(part.id)
-    }
-  }
-  return selected.size
-    ? (FINAL_REPORT_PARTS.filter((part) => selected.has(part.id)) as typeof FINAL_REPORT_PARTS)
-    : FINAL_REPORT_PARTS
-}
-
-function sectionHeadingStart(markdown: string, section: string): number {
-  const escaped = section.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
-  const match = new RegExp(`^##\\s*${escaped}(?:[.、：:\\s]|$)`, 'mu').exec(markdown)
-  return match?.index ?? -1
-}
-
-function partBounds(
-  markdown: string,
-  part: (typeof FINAL_REPORT_PARTS)[number]
-): { start: number; end: number; text: string } | null {
-  for (const section of part.sections) {
-    if (sectionHeadingStart(markdown, section) < 0) return null
-  }
-  const start = part.id === 'part-0-4' ? 0 : sectionHeadingStart(markdown, part.sections[0])
-  if (start < 0) return null
-  const laterBoundaries = part.id === 'part-0-4'
-    ? ['5', '9', '10']
-    : part.id === 'part-5-8'
-      ? ['9', '10']
-      : part.id === 'part-9'
-        ? ['10']
-        : []
-  const ends = laterBoundaries.map((section) => sectionHeadingStart(markdown, section)).filter((index) => index > start)
-  const end = ends.length ? Math.min(...ends) : markdown.length
-  return { start, end, text: markdown.slice(start, end).trim() }
-}
-
-function extractedPart(markdown: string, part: (typeof FINAL_REPORT_PARTS)[number]): string | null {
-  return partBounds(markdown, part)?.text ?? null
-}
-
-export function mergeRevisionParts(
-  previousReport: string,
-  generatedParts: string,
-  selectedParts: typeof FINAL_REPORT_PARTS
-): string | null {
-  let merged = previousReport
-  const replacements = selectedParts.map((part) => ({
-    part,
-    previous: partBounds(previousReport, part),
-    replacement: extractedPart(generatedParts, part)
-  }))
-  if (replacements.some((item) => !item.previous || !item.replacement)) return null
-  const positions = replacements.map((item) => {
-    const previous = item.previous!
-    return { ...item, start: previous.start, end: previous.end }
-  }).sort((a, b) => b.start - a.start)
-  for (const item of positions) {
-    const before = merged.slice(0, item.start)
-    const after = merged.slice(item.end)
-    const separator = after && !item.replacement!.endsWith('\n\n') ? '\n\n' : ''
-    merged = `${before}${item.replacement!.trim()}${separator}${after}`
-  }
-  return merged.trim()
-}
-
-// 包装流式调用为 Promise，并暴露中止函数
-function runModel(
-  messages: ChatMessage[],
-  onAcc: (acc: string) => void,
-  setAbort: (fn: (() => void) | null) => void,
-  context: ModelTaskContext
-): Promise<{ ok: boolean; text: string; error?: string }> {
-  return new Promise((resolve) => {
-    let acc = ''
-    let settled = false
-    let publishTimer: number | null = null
-    let lastPublished = ''
-    const publish = (text: string): void => {
-      if (text === lastPublished) return
-      lastPublished = text
-      onAcc(text)
-    }
-    const flush = (text = acc): void => {
-      if (publishTimer !== null) {
-        window.clearTimeout(publishTimer)
-        publishTimer = null
-      }
-      publish(text)
-    }
-    const done = (r: { ok: boolean; text: string; error?: string }): void => {
-      if (settled) return
-      settled = true
-      flush(r.text)
-      setAbort(null)
-      resolve(r)
-    }
-    try {
-      const handle = window.api.sendChat(messages, context, {
-        onChunk: (d) => {
-          acc += d
-          if (publishTimer === null) {
-            publishTimer = window.setTimeout(() => {
-              publishTimer = null
-              publish(acc)
-            }, 60)
-          }
-        },
-        onDone: (full) => done({ ok: true, text: full || acc }),
-        onError: (msg) => done({ ok: false, text: acc, error: friendlyError(msg) })
-      })
-      setAbort(() => {
-        handle.abort()
-        done({ ok: false, text: acc, error: '已停止' })
-      })
-    } catch (error) {
-      done({ ok: false, text: acc, error: friendlyError(error) })
-    }
-  })
-}
-
-// 带重试的调用：仅在"网络中断且尚无任何输出"时重试，避免重复内容；用户主动停止不重试
-async function runModelRetry(
-  messages: ChatMessage[],
-  onAcc: (acc: string) => void,
-  setAbort: (fn: (() => void) | null) => void,
-  onRetry?: (n: number) => void,
-  retries = 1,
-  taskContext?: Omit<ModelTaskContext, 'attempt'>
-): Promise<{ ok: boolean; text: string; error?: string }> {
-  if (!taskContext) throw new Error('模型任务缺少必要标识。')
-  let res = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: 1 })
-  let n = 0
-  while (
-    !res.ok &&
-    n < retries &&
-    !res.text &&
-    /fetch failed|ECONNRESET|terminated|network|网络连接失败|服务繁忙|额度受限|429/i.test(res.error || '')
-  ) {
-    n++
-    onRetry?.(n)
-    if (/服务繁忙|额度受限|429/i.test(res.error || '')) {
-      const wait = res.error?.match(/等待\s*(\d+)\s*秒/)
-      const delay = wait ? Math.min(60, Number(wait[1])) * 1000 : 1200 * n
-      let stopped = false
-      await new Promise<void>((resolve) => {
-        const timer = window.setTimeout(resolve, delay)
-        setAbort(() => {
-          stopped = true
-          window.clearTimeout(timer)
-          resolve()
-        })
-      })
-      setAbort(null)
-      if (stopped) return { ok: false, text: '', error: '已停止' }
-    }
-    res = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: n + 1 })
-  }
-  return res
 }
 
 function defaultReportName(ext: string): string {
@@ -1831,7 +1469,7 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   _startPaidGeneration: async () => {
-    const { settings, sources, phase } = get()
+    const { settings, phase } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
     let startingPoints: number | undefined
     const pointsApi = window.api as typeof window.api & {
@@ -1901,7 +1539,8 @@ export const useStore = create<StoreState>((set, get) => ({
         total: todo.length,
         done: 0,
         running: [],
-        failed: 0
+        failed: 0,
+        startedAt: Date.now()
       }
     })
 
@@ -2319,6 +1958,122 @@ export const useStore = create<StoreState>((set, get) => ({
     set({ phase: 'analyzing' })
     const { sopRules, cleanedData } = get()
     const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)
+    let analysisInput = cleanedData
+    if (analysisEvidenceGroups.length > 1) {
+      get()._post(
+        'assistant',
+        `资料较多，正在一次性建立 ${analysisEvidenceGroups.length} 组通用证据台账，后续8个分析步骤将直接复用。`,
+        'narration'
+      )
+      const digestOutputs: string[] = []
+      let digestFailure = ''
+      for (let index = 0; index < analysisEvidenceGroups.length; index++) {
+        const taskId = `${sessionId}:evidence_digest:v1:source:${index + 1}`
+        const saved = get().taskJournal[taskId]
+        if (saved?.status === 'complete' && saved.output?.trim()) {
+          digestOutputs.push(saved.output)
+          continue
+        }
+        const digest = await runModelRetry(
+          buildEvidenceDigestMessages({
+            evidenceGroup: analysisEvidenceGroups[index],
+            groupIndex: index + 1,
+            groupCount: analysisEvidenceGroups.length
+          }),
+          () => {},
+          (fn) => set({ abortFn: fn }),
+          (n) => get()._post('assistant', `证据台账第 ${index + 1} 组连接中断，重试第 ${n} 次…`, 'narration'),
+          1,
+          {
+            reportSessionId: sessionId,
+            taskType: 'analysis_step',
+            taskKey: taskId,
+            billingRequestId: taskId,
+            isVision: false,
+            sourceCount: topLevelSourceCount(get().sources),
+            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            stepId: `evidence-digest-${index + 1}`
+          }
+        )
+        if (!digest.ok || !digest.text.trim()) {
+          digestFailure = digest.error || `证据台账第 ${index + 1} 组没有返回内容`
+          break
+        }
+        digestOutputs.push(digest.text)
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [taskId]: {
+              kind: 'analysis_step',
+              status: 'complete',
+              output: digest.text,
+              updatedAt: new Date().toISOString()
+            }
+          }
+        }))
+        await window.api.saveLastProject(buildProjectSnapshot(get()))
+      }
+      let evidenceDigest = digestOutputs.map((output, index) => `### 证据分组 ${index + 1}\n${output}`).join('\n\n')
+      let round = 0
+      while (!digestFailure && planAnalysisEvidenceGroups(evidenceDigest).length > 1 && round < 4) {
+        round += 1
+        const groups = planAnalysisEvidenceGroups(evidenceDigest)
+        const consolidated: string[] = []
+        for (let index = 0; index < groups.length; index++) {
+          const taskId = `${sessionId}:evidence_digest:v1:${round}:${index + 1}`
+          const saved = get().taskJournal[taskId]
+          if (saved?.status === 'complete' && saved.output?.trim()) {
+            consolidated.push(saved.output)
+            continue
+          }
+          const merge = await runModelRetry(
+            buildEvidenceDigestConsolidationMessages({
+              evidenceLedger: groups[index],
+              groupIndex: index + 1,
+              groupCount: groups.length
+            }),
+            () => {},
+            (fn) => set({ abortFn: fn }),
+            undefined,
+            1,
+            {
+              reportSessionId: sessionId,
+              taskType: 'analysis_step',
+              taskKey: taskId,
+              billingRequestId: taskId,
+              isVision: false,
+              sourceCount: topLevelSourceCount(get().sources),
+              imageCount: get().sources.filter((source) => source.kind === 'image').length,
+              stepId: `evidence-digest-merge-${round}-${index + 1}`
+            }
+          )
+          if (!merge.ok || !merge.text.trim()) {
+            digestFailure = merge.error || '通用证据台账合并失败'
+            break
+          }
+          consolidated.push(merge.text)
+          set((state) => ({
+            taskJournal: {
+              ...state.taskJournal,
+              [taskId]: {
+                kind: 'analysis_step',
+                status: 'complete',
+                output: merge.text,
+                updatedAt: new Date().toISOString()
+              }
+            }
+          }))
+          await window.api.saveLastProject(buildProjectSnapshot(get()))
+        }
+        if (!digestFailure) evidenceDigest = consolidated.join('\n\n')
+      }
+      if (digestFailure || planAnalysisEvidenceGroups(evidenceDigest).length > 1) {
+        get()._post('assistant', `⚠️ 通用证据台账生成失败：${digestFailure || '合并后仍超过安全长度'}。请修好后继续分析。`, 'error')
+        set({ phase: 'checkpoint1', abortFn: null })
+        return
+      }
+      analysisInput = evidenceDigest
+    }
     for (const step of SOP_STEPS) {
       if (get().phase !== 'analyzing') return
       const isReportStep = step.id === REPORT_STEP_ID
@@ -2420,180 +2175,30 @@ export const useStore = create<StoreState>((set, get) => ({
         }))
       } else {
         get()._post('assistant', `⏳ 正在：${step.title}…`, 'narration')
-        const evidenceGroups = analysisEvidenceGroups
-        let res: { ok: boolean; text: string; error?: string }
-        if (evidenceGroups.length === 1) {
-          res = await runModelRetry(
-            buildStepMessages({
-              stepId: step.id,
-              stepTitle: step.title,
-              sopRules,
-              cleanedData,
-              priorOutputs,
-              feedback: get().steering
-            }),
-            () => {},
-            (fn) => set({ abortFn: fn }),
-            (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
-            1,
-            {
-              reportSessionId: sessionId,
-              taskType: 'analysis_step',
-              taskKey: `${sessionId}:analysis_step:${step.id}`,
-              billingRequestId: `${sessionId}:analysis_step:${step.id}`,
-              isVision: false,
-              sourceCount: topLevelSourceCount(get().sources),
-              imageCount: get().sources.filter((source) => source.kind === 'image').length,
-              stepId: String(step.id)
-            }
-          )
-        } else {
-          get()._post(
-            'assistant',
-            `资料较多，第 ${step.id} 步将按 ${evidenceGroups.length} 组完整读取，不再抽取开头和结尾。`,
-            'narration'
-          )
-          const evidenceOutputs: string[] = []
-          let evidenceFailure = ''
-          for (let index = 0; index < evidenceGroups.length; index++) {
-            const taskId = `${sessionId}:analysis_evidence:v1:${step.id}:${index + 1}`
-            const saved = get().taskJournal[taskId]
-            if (saved?.status === 'complete' && saved.output?.trim()) {
-              evidenceOutputs.push(saved.output)
-              continue
-            }
-            const groupResult = await runModelRetry(
-              buildStepEvidenceGroupMessages({
-                stepId: step.id,
-                stepTitle: step.title,
-                evidenceGroup: evidenceGroups[index],
-                groupIndex: index + 1,
-                groupCount: evidenceGroups.length,
-                feedback: get().steering
-              }),
-              () => {},
-              (fn) => set({ abortFn: fn }),
-              (n) => get()._post('assistant', `${step.title}第 ${index + 1} 组连接中断，重试第 ${n} 次…`, 'narration'),
-              1,
-              {
-                reportSessionId: sessionId,
-                taskType: 'analysis_step',
-                taskKey: taskId,
-                billingRequestId: taskId,
-                isVision: false,
-                sourceCount: topLevelSourceCount(get().sources),
-                imageCount: get().sources.filter((source) => source.kind === 'image').length,
-                stepId: `${step.id}-evidence-${index + 1}`
-              }
-            )
-            if (!groupResult.ok || !groupResult.text.trim()) {
-              evidenceFailure = groupResult.error || `第 ${index + 1} 组没有返回内容`
-              break
-            }
-            evidenceOutputs.push(groupResult.text)
-            set((state) => ({
-              taskJournal: {
-                ...state.taskJournal,
-                [taskId]: {
-                  kind: 'analysis_step',
-                  status: 'complete',
-                  output: groupResult.text,
-                  updatedAt: new Date().toISOString()
-                }
-              }
-            }))
-            await window.api.saveLastProject(buildProjectSnapshot(get()))
+        const res = await runModelRetry(
+          buildStepMessages({
+            stepId: step.id,
+            stepTitle: step.title,
+            sopRules,
+            cleanedData: analysisInput,
+            priorOutputs,
+            feedback: get().steering
+          }),
+          () => {},
+          (fn) => set({ abortFn: fn }),
+          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
+          1,
+          {
+            reportSessionId: sessionId,
+            taskType: 'analysis_step',
+            taskKey: `${sessionId}:analysis_step:${step.id}`,
+            billingRequestId: `${sessionId}:analysis_step:${step.id}`,
+            isVision: false,
+            sourceCount: topLevelSourceCount(get().sources),
+            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            stepId: String(step.id)
           }
-          if (evidenceFailure) {
-            res = { ok: false, text: '', error: evidenceFailure }
-          } else {
-            let evidenceLedger = evidenceOutputs.map((output, index) => `### 证据分组 ${index + 1}\n${output}`).join('\n\n')
-            let consolidationRound = 0
-            while (planAnalysisEvidenceGroups(evidenceLedger).length > 1 && consolidationRound < 4) {
-              consolidationRound += 1
-              const ledgerGroups = planAnalysisEvidenceGroups(evidenceLedger)
-              const consolidated: string[] = []
-              for (let index = 0; index < ledgerGroups.length; index++) {
-                const taskId = `${sessionId}:analysis_evidence_merge:v1:${step.id}:${consolidationRound}:${index + 1}`
-                const saved = get().taskJournal[taskId]
-                if (saved?.status === 'complete' && saved.output?.trim()) {
-                  consolidated.push(saved.output)
-                  continue
-                }
-                const merge = await runModelRetry(
-                  buildEvidenceConsolidationMessages({
-                    stepId: step.id,
-                    stepTitle: step.title,
-                    evidenceLedger: ledgerGroups[index],
-                    groupIndex: index + 1,
-                    groupCount: ledgerGroups.length
-                  }),
-                  () => {},
-                  (fn) => set({ abortFn: fn }),
-                  undefined,
-                  1,
-                  {
-                    reportSessionId: sessionId,
-                    taskType: 'analysis_step',
-                    taskKey: taskId,
-                    billingRequestId: taskId,
-                    isVision: false,
-                    sourceCount: topLevelSourceCount(get().sources),
-                    imageCount: get().sources.filter((source) => source.kind === 'image').length,
-                    stepId: `${step.id}-evidence-merge-${consolidationRound}-${index + 1}`
-                  }
-                )
-                if (!merge.ok || !merge.text.trim()) {
-                  evidenceFailure = merge.error || '证据账本合并失败'
-                  break
-                }
-                consolidated.push(merge.text)
-                set((state) => ({
-                  taskJournal: {
-                    ...state.taskJournal,
-                    [taskId]: {
-                      kind: 'analysis_step',
-                      status: 'complete',
-                      output: merge.text,
-                      updatedAt: new Date().toISOString()
-                    }
-                  }
-                }))
-                await window.api.saveLastProject(buildProjectSnapshot(get()))
-              }
-              if (evidenceFailure) break
-              evidenceLedger = consolidated.join('\n\n')
-            }
-            if (!evidenceFailure && planAnalysisEvidenceGroups(evidenceLedger).length > 1) {
-              evidenceFailure = '证据账本仍然过大，软件已停止本步骤以避免静默漏掉中间资料。请拆分超大文件后重试。'
-            }
-            res = evidenceFailure
-              ? { ok: false, text: '', error: evidenceFailure }
-              : await runModelRetry(
-                  buildStepFromEvidenceMessages({
-                    stepId: step.id,
-                    stepTitle: step.title,
-                    evidenceLedger,
-                    priorOutputs,
-                    feedback: get().steering
-                  }),
-                  () => {},
-                  (fn) => set({ abortFn: fn }),
-                  (n) => get()._post('assistant', `${step.title}整理结论中断，重试第 ${n} 次…`, 'narration'),
-                  1,
-                  {
-                    reportSessionId: sessionId,
-                    taskType: 'analysis_step',
-                    taskKey: `${sessionId}:analysis_step:${step.id}`,
-                    billingRequestId: `${sessionId}:analysis_step:${step.id}`,
-                    isVision: false,
-                    sourceCount: topLevelSourceCount(get().sources),
-                    imageCount: get().sources.filter((source) => source.kind === 'image').length,
-                    stepId: String(step.id)
-                  }
-                )
-          }
-        }
+        )
         if (!isCurrentSession()) return
         if (!res.ok) {
           get()._post(
@@ -2653,7 +2258,7 @@ export const useStore = create<StoreState>((set, get) => ({
   _rerunReport: async (latestFeedback) => {
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
-    const { sopRules, cleanedData, steering, artifacts } = get()
+    const { cleanedData, steering, artifacts } = get()
     const steeringAtStart = steering
     const reportFeedback = latestFeedback?.trim() || steering
     const previousReport = get().reportMarkdown

@@ -86,9 +86,6 @@ const api = {
   redeemPointsCode: (code: string): Promise<PointsRedeemResult> =>
     ipcRenderer.invoke('points:redeem', code),
 
-  grantDevelopmentPoints: (): Promise<PointsWalletStatus> =>
-    ipcRenderer.invoke('points:grantDevelopment'),
-
   onPointsWalletChanged: (handler: (status: PointsWalletStatus) => void): (() => void) => {
     const listener = (_event: unknown, status: PointsWalletStatus): void => handler(status)
     ipcRenderer.on('points:changed', listener)

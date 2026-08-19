@@ -4680,124 +4680,6 @@ body.resizing .pane-resizer {
   transform: translateY(0);
 }
 
-.contact-entry {
-  position: relative;
-  flex: 0 0 auto;
-  align-self: center;
-}
-
-.contact-entry::after {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  left: 0;
-  height: 12px;
-  content: '';
-}
-
-.contact-trigger {
-  display: inline-flex;
-  align-items: baseline;
-  height: 36px;
-  padding: 0 12px;
-  border: 1px solid rgba(37, 99, 235, 0.18);
-  border-radius: 10px;
-  background: #f8fbff;
-  color: #475569;
-  font: inherit;
-  font-size: 12px;
-  white-space: nowrap;
-  cursor: default;
-  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
-}
-
-.contact-trigger strong {
-  color: #1d4ed8;
-  font-weight: 750;
-  letter-spacing: 0.01em;
-}
-
-.contact-trigger:hover,
-.contact-trigger:focus-visible {
-  border-color: rgba(37, 99, 235, 0.4);
-  background: #eff6ff;
-  color: #1e3a8a;
-}
-
-.contact-trigger:focus-visible {
-  outline: 3px solid rgba(37, 99, 235, 0.2);
-  outline-offset: 2px;
-}
-
-.contact-qr-popover {
-  position: absolute;
-  top: calc(100% + 10px);
-  left: 50%;
-  z-index: 300;
-  display: grid;
-  width: 232px;
-  padding: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 18px 42px rgba(30, 64, 175, 0.16);
-  color: #0f172a;
-  gap: 8px;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transform: translate(-50%, -4px);
-  transition: opacity 150ms ease, transform 150ms ease, visibility 150ms ease;
-}
-
-.contact-qr-popover::before {
-  position: absolute;
-  top: -8px;
-  left: calc(50% - 8px);
-  width: 16px;
-  height: 16px;
-  border-top: 1px solid rgba(148, 163, 184, 0.28);
-  border-left: 1px solid rgba(148, 163, 184, 0.28);
-  background: #ffffff;
-  content: '';
-  transform: rotate(45deg);
-}
-
-.contact-qr-popover strong,
-.contact-qr-popover span {
-  position: relative;
-  z-index: 1;
-  text-align: center;
-}
-
-.contact-qr-popover strong {
-  font-size: 14px;
-}
-
-.contact-qr-popover span {
-  color: #64748b;
-  font-size: 12px;
-}
-
-.contact-qr-popover img {
-  position: relative;
-  z-index: 1;
-  display: block;
-  width: 206px;
-  height: 190px;
-  border-radius: 8px;
-  object-fit: contain;
-  background: #ffffff;
-}
-
-.contact-entry:hover .contact-qr-popover,
-.contact-entry:focus-within .contact-qr-popover {
-  opacity: 1;
-  visibility: visible;
-  pointer-events: auto;
-  transform: translate(-50%, 0);
-}
-
 .topbar .model-pill {
   display: none;
 }
@@ -4834,19 +4716,6 @@ body.resizing .pane-resizer {
     flex-basis: 200px;
   }
 
-  .contact-trigger {
-    padding-inline: 10px;
-  }
-
-  .contact-qr-popover {
-    left: 0;
-    transform: translate(0, -4px);
-  }
-
-  .contact-entry:hover .contact-qr-popover,
-  .contact-entry:focus-within .contact-qr-popover {
-    transform: translate(0, 0);
-  }
 }
 
 @media (max-width: 60rem) {
@@ -4882,10 +4751,6 @@ body.resizing .pane-resizer {
 }
 
 @media (max-width: 46rem) {
-  .contact-entry {
-    display: none;
-  }
-
   .tutorial-link {
     width: 42px;
     flex-basis: 42px;
@@ -4898,13 +4763,6 @@ body.resizing .pane-resizer {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .contact-trigger,
-  .contact-qr-popover {
-    transition-duration: 0ms;
-  }
-}
-
 /* 放在最终主题规则之后，避免通用 modal 样式覆盖开发者统计面板。 */
 .modal-mask.token-stats-mask {
   z-index: 1200;
@@ -4914,73 +4772,6 @@ body.resizing .pane-resizer {
   width: min(980px, calc(100vw - 32px));
   max-width: 980px;
   max-height: min(860px, calc(100vh - 32px));
-}
-
-.points-pricing-summary {
-  display: grid;
-  gap: 6px;
-  padding: 12px 14px;
-  border: 1px solid #bfdbfe;
-  border-radius: 10px;
-  background: #eff6ff;
-  color: #1e3a8a;
-  font-size: 12px;
-  line-height: 1.55;
-}
-
-.points-pricing-summary strong {
-  color: #1d4ed8;
-  font-size: 13px;
-}
-
-.points-ledger-preview {
-  display: grid;
-  gap: 7px;
-  padding: 12px 14px;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  background: #fff;
-}
-
-.points-ledger-preview > strong {
-  color: #0f172a;
-  font-size: 13px;
-}
-
-.points-ledger-preview > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  color: #64748b;
-  font-size: 12px;
-}
-
-.points-ledger-preview > div > span {
-  display: grid;
-  gap: 2px;
-}
-
-.points-ledger-preview small,
-.points-ledger-empty {
-  color: #94a3b8;
-  font-size: 11px;
-}
-
-.points-wallet-stale {
-  padding: 9px 11px;
-  border: 1px solid #fde68a;
-  border-radius: 10px;
-  background: #fffbeb;
-  color: #92400e;
-  font-size: 12px;
-}
-
-.points-ledger-preview b.positive {
-  color: #15803d;
-}
-
-.points-ledger-preview b.negative {
-  color: #dc2626;
 }
 
 @media (max-width: 480px) {

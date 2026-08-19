@@ -157,7 +157,7 @@ async function run(): Promise<void> {
 void app.whenReady().then(async () => {
   try {
     await run()
-    console.log('Utility-process smoke checks passed: FIFO parsing, Markdown, TSV, JSON, YAML, RTF, HTML, PDF text and scan conversion, Office embedded images, bad archive isolation, recovery.')
+    console.log('Utility-process smoke checks passed: two-worker parsing, Markdown, TSV, JSON, YAML, RTF, HTML, PDF text and scan conversion, Office embedded images, bad archive isolation, recovery.')
     disposeParseService()
     app.exit(0)
   } catch (error) {

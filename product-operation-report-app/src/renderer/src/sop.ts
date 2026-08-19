@@ -1,4 +1,4 @@
-import type { ChatMessage, ContentPart } from '../../shared/types'
+import type { ChatMessage } from '../../shared/types'
 import { MODEL_RUNTIME_RULES_VERSION, SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 import type { SourceCleanBatchContext } from './sourceCleanBatches'
 import {
@@ -156,86 +156,47 @@ export function planAnalysisEvidenceGroups(text: string): string[] {
   return groups
 }
 
-export function buildStepEvidenceGroupMessages(params: {
-  stepId: number
-  stepTitle: string
+export function buildEvidenceDigestMessages(params: {
   evidenceGroup: string
   groupIndex: number
   groupCount: number
-  feedback?: string
 }): ChatMessage[] {
-  const instruction = STEP_INSTRUCTIONS[params.stepId] || `完成第 ${params.stepId} 步：${params.stepTitle}`
   return [
     {
       role: 'system',
       content: COMPACT_RUNTIME_RULES + BASE_RULES +
-        '\n你正在为一个大项目建立当前分析步骤的证据候选账本，不是直接写最终结论。'
+        '\n你正在为后续全部分析步骤建立通用事实证据台账。压缩叙述，但不得删除证据锚点。'
     },
     {
       role: 'user',
       content: [
-        `## 当前分析步骤\n第 ${params.stepId} 步 ${params.stepTitle}\n${instruction}`,
         `## 完整证据分组 ${params.groupIndex}/${params.groupCount}`,
         params.evidenceGroup,
-        '## 本组输出要求',
-        '只提取与当前步骤有关的事实、数字、排序、原文、链接和限制；每条必须保留原有 POR-R/POR-T/POR-I 证据ID及来源标题。不得补写本组没有的信息。若本组没有相关证据，明确写“本组无相关证据”。不要写最终章节。',
-        params.feedback ? `## 用户纠偏要求\n${params.feedback}` : ''
-      ].filter(Boolean).join('\n\n')
-    }
-  ]
-}
-
-export function buildEvidenceConsolidationMessages(params: {
-  stepId: number
-  stepTitle: string
-  evidenceLedger: string
-  groupIndex: number
-  groupCount: number
-}): ChatMessage[] {
-  return [
-    {
-      role: 'system',
-      content: COMPACT_RUNTIME_RULES + BASE_RULES +
-        '\n你正在合并证据候选账本。只能去除完全重复项，不得删除不同证据ID、数字、链接、限制或相互冲突的记录。'
-    },
-    {
-      role: 'user',
-      content: [
-        `第 ${params.stepId} 步 ${params.stepTitle}，合并分组 ${params.groupIndex}/${params.groupCount}。`,
-        params.evidenceLedger,
-        '输出去重后的证据账本；保留每条来源标题和证据ID。相互冲突的证据必须并列保留，不能擅自判断。'
+        '## 输出要求',
+        '提取本组全部产品事实、数字、排序、原文、链接、平台口径、限制和冲突记录。每条必须保留原有 POR-R/POR-T/POR-I 证据ID及来源标题。不得只保留当前某一步可能用到的内容。'
       ].join('\n\n')
     }
   ]
 }
 
-export function buildStepFromEvidenceMessages(params: {
-  stepId: number
-  stepTitle: string
+export function buildEvidenceDigestConsolidationMessages(params: {
   evidenceLedger: string
-  priorOutputs: PriorOutput[]
-  feedback?: string
+  groupIndex: number
+  groupCount: number
 }): ChatMessage[] {
-  const priorBlock = params.priorOutputs.length
-    ? params.priorOutputs.map((item) => `### ${item.title}\n${item.output}`).join('\n\n')
-    : '（无）'
   return [
     {
       role: 'system',
       content: COMPACT_RUNTIME_RULES + BASE_RULES +
-        '\n所有原始资料分组都已经进入下面的证据账本。现在只完成指定分析步骤，结论必须绑定账本中的来源和证据ID。'
+        '\n你正在合并供全部分析步骤复用的事实证据台账。只能删除完全重复的叙述，不得删除任何不同证据ID、数字、链接、口径、限制或冲突记录。'
     },
     {
       role: 'user',
       content: [
-        '## 经完整分组核对的证据账本',
+        `## 待合并证据台账 ${params.groupIndex}/${params.groupCount}`,
         params.evidenceLedger,
-        '## 已生成的上游产出',
-        priorBlock,
-        `## 当前任务：第 ${params.stepId} 步 ${params.stepTitle}`,
-        STEP_INSTRUCTIONS[params.stepId] || `完成第 ${params.stepId} 步：${params.stepTitle}`,
-        params.feedback ? `## 用户的纠偏要求（优先满足）\n${params.feedback}` : ''
-      ].filter(Boolean).join('\n\n')
+        '输出通用事实台账。每条保留来源标题和证据ID；冲突证据并列保留，不得擅自裁决。'
+      ].join('\n\n')
     }
   ]
 }

@@ -167,9 +167,21 @@ export async function listModels(profile: ModelProfile): Promise<ModelListResult
 }
 
 // 把内部消息格式转换成 OpenAI 兼容的 messages
-function toOpenAIMessages(messages: ChatMessage[], supportsVision: boolean): unknown[] {
+function toOpenAIMessages(
+  messages: ChatMessage[],
+  supportsVision: boolean,
+  model = '',
+  enablePromptCache = false
+): unknown[] {
+  const explicitCacheControl = enablePromptCache && /claude/i.test(model)
   return messages.map((m) => {
     if (typeof m.content === 'string') {
+      if (explicitCacheControl && m.role === 'system') {
+        return {
+          role: m.role,
+          content: [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }]
+        }
+      }
       return { role: m.role, content: m.content }
     }
     // 多部分内容
@@ -239,7 +251,7 @@ export async function testModel(opts: TestModelOptions): Promise<TestModelResult
       },
       body: JSON.stringify({
         model: profile.model,
-        messages: toOpenAIMessages(messages, profile.supportsVision && !!withImageDataUrl),
+        messages: toOpenAIMessages(messages, profile.supportsVision && !!withImageDataUrl, profile.model),
         ...(profile.temperature === undefined ? {} : { temperature: profile.temperature }),
         stream: false
       }),
@@ -292,7 +304,7 @@ export async function chatStream(
   messages: ChatMessage[],
   onEvent: (ev: ChatStreamEvent) => void,
   signal?: AbortSignal,
-  policy?: { reasoningEffort?: 'low'; requestHeaders?: Record<string, string> }
+  policy?: { reasoningEffort?: 'low'; requestHeaders?: Record<string, string>; promptCacheKey?: string }
 ): Promise<void> {
   let full = ''
   let latestUsage: ModelTokenUsage | undefined
@@ -325,7 +337,7 @@ export async function chatStream(
   const emitError = (message: string): void => onEvent({ type: 'error', message, usage: finalUsage() })
   const emitDone = (): void => onEvent({ type: 'done', full, usage: finalUsage() })
   try {
-    const request = (withReasoningEffort: boolean): Promise<Response> => fetch(endpoint(profile.baseURL), {
+    const request = (withReasoningEffort: boolean, withPromptCache: boolean): Promise<Response> => fetch(endpoint(profile.baseURL), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -334,22 +346,23 @@ export async function chatStream(
       },
       body: JSON.stringify({
         model: profile.model,
-        messages: toOpenAIMessages(messages, profile.supportsVision),
+        messages: toOpenAIMessages(messages, profile.supportsVision, profile.model, withPromptCache),
         ...(profile.temperature === undefined ? {} : { temperature: profile.temperature }),
         stream: true,
         stream_options: { include_usage: true },
+        ...(withPromptCache && policy?.promptCacheKey ? { prompt_cache_key: policy.promptCacheKey } : {}),
         ...(withReasoningEffort && policy?.reasoningEffort
           ? { reasoning_effort: policy.reasoningEffort }
           : {})
       }),
       signal: requestController.signal
     })
-    let res = await request(Boolean(policy?.reasoningEffort))
+    let res = await request(Boolean(policy?.reasoningEffort), Boolean(policy?.promptCacheKey))
     armIdleTimeout()
-    if (!res.ok && policy?.reasoningEffort && (res.status === 400 || res.status === 422)) {
+    if (!res.ok && (policy?.reasoningEffort || policy?.promptCacheKey) && (res.status === 400 || res.status === 422)) {
       await readLimitedText(res, MAX_ERROR_RESPONSE_BYTES).catch(() => '')
       armIdleTimeout()
-      res = await request(false)
+      res = await request(false, false)
       armIdleTimeout()
     }
 

@@ -811,8 +811,15 @@ export default function App(): JSX.Element {
         </div>
       </div>
 
-      {(newAnalysisError || autosaveError || updateCheckNotice) && (
+      {(newAnalysisError || autosaveError || updateCheckNotice || activationStatus.offline) && (
         <div className="app-alert-stack">
+          {activationStatus.offline && (
+            <div className={`authorization-offline-notice${activationStatus.requiresRevalidation ? ' blocked' : ''}`} role="status">
+              {activationStatus.requiresRevalidation
+                ? '授权服务器暂时无法连接，离线宽限期已结束。历史报告仍可查看和导出。'
+                : '当前离线，软件会稍后自动重连。授权仍在72小时宽限期内，可以继续使用。'}
+            </div>
+          )}
           {newAnalysisError && (
             <div className="new-analysis-error" role="alert">
               {newAnalysisError}

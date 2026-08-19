@@ -56,17 +56,6 @@ import {
   tokenUsageLogPath
 } from '../src/main/tokenUsage'
 import {
-  applyActivationPoints,
-  applyRechargeCodePoints,
-  calculateUsagePoints,
-  canStartPointsReport,
-  getPointsWalletStatus,
-  grantDevelopmentPoints,
-  pointsWalletInternals,
-  settleTokenUsage,
-  clearLocalPointsAfterUnbind
-} from '../src/main/pointsWallet'
-import {
   clearSourceCleanCache,
   getSourceCleanCacheStats,
   lookupSourceCleanCache,
@@ -108,6 +97,7 @@ import {
 } from '../src/renderer/src/store'
 import {
   buildExtractMessages,
+  buildEvidenceDigestMessages,
   buildFinalReportPartMessages,
   buildSummaryGroupMessages,
   buildSummaryMergeMessages,
@@ -136,6 +126,7 @@ function encryptV032StoredCode(code: string, deviceId: string): string {
 }
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
+app.disableHardwareAcceleration()
 app.setPath('userData', tempUserData)
 let topbarAuditWindow: BrowserWindow | null = null
 
@@ -463,7 +454,6 @@ async function testActivationAdmissionAndSafeDiagnostics(): Promise<void> {
 }
 
 async function testActivationAndSettingsBackup(): Promise<void> {
-  pointsWalletInternals.resetForTests()
   const deviceId = getActivationStatus().deviceId
   const activationRecord = {
     version: 1,
@@ -481,7 +471,6 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   assert.equal(activationStatus.unlimited, false)
   assert.equal(activationStatus.creditsRemaining, undefined)
   assert.equal(activationStatus.offline, false)
-  assert.equal(applyActivationPoints(activationStatus).addedPoints, 0)
   const refreshedLegacyStatus = await getActivationStatusWithServerCheck()
   assert.equal(refreshedLegacyStatus.activated, false, 'local hash lists no longer grant model access')
   assert.equal(refreshedLegacyStatus.source, 'legacy')
@@ -570,7 +559,6 @@ async function testActivationAndSettingsBackup(): Promise<void> {
       }),
     /https/
   )
-  pointsWalletInternals.resetForTests()
 }
 
 async function testServerActivationAndCredits(): Promise<void> {
@@ -864,7 +852,6 @@ async function testExplicitZeroServerBalanceDoesNotReissueGrantedCredits(): Prom
     rmSync(activationBackup, { force: true })
     rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
     rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
-    pointsWalletInternals.resetForTests()
     globalThis.fetch = (async () => {
       activationCalls += 1
       return new Response(JSON.stringify({
@@ -891,21 +878,14 @@ async function testExplicitZeroServerBalanceDoesNotReissueGrantedCredits(): Prom
     assert.equal(activated.ok, true)
     assert.equal(activated.status.licenseType, 'credits')
     assert.equal(activated.status.creditsRemaining, 0)
-    assert.equal(applyActivationPoints(activated.status).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 0)
-    assert.equal(applyActivationPoints(activated.status).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 0, 'an explicit zero server balance must never be reissued')
 
     const repeated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
     assert.equal(repeated.ok, true, 'same-device activation may reuse locally encrypted device credentials')
     assert.equal(repeated.status.creditsRemaining, 0)
-    assert.equal(applyActivationPoints(repeated.status).addedPoints, 0)
-    assert.equal(getPointsWalletStatus().balancePoints, 0)
   } finally {
     globalThis.fetch = originalFetch
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
-    pointsWalletInternals.resetForTests()
   }
 }
 
@@ -923,7 +903,6 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
   try {
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
-    pointsWalletInternals.resetForTests()
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
       if (url.includes('/device/status')) {
@@ -996,8 +975,6 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
 
     const activated = await activateWithCode(code)
     assert.equal(activated.ok, true)
-    assert.equal(applyActivationPoints(activated.status).addedPoints, 2_000)
-    assert.equal(getPointsWalletStatus().balancePoints, 2_000)
     const storedText = readFileSync(activationFile, 'utf8')
     assert.equal(storedText.includes('fake-device-credential'), false, 'device credential must be encrypted at rest')
     assert.equal(storedText.includes('fake-device-session'), false, 'device session must be encrypted at rest')
@@ -1062,10 +1039,6 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     assert.equal(existsSync(activationBackup), false)
     assert.equal(getActivationStatus().activated, false)
 
-    clearLocalPointsAfterUnbind(unbound.unbindId || '')
-    assert.equal(getPointsWalletStatus().balancePoints, 0)
-    clearLocalPointsAfterUnbind(unbound.unbindId || '')
-    assert.equal(getPointsWalletStatus().balancePoints, 0, 'repeated local cleanup is idempotent')
     assert.equal((await deactivateCurrentDevice()).ok, false, 'repeated unbind is rejected safely')
 
     mode = 'rebind'
@@ -1074,10 +1047,6 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     assert.equal(reactivated.status.bindingStatus, 'active')
     assert.equal(reactivated.status.transferCount, 1)
     assert.equal(reactivated.status.creditsRemaining, 1_234.5)
-    applyActivationPoints(reactivated.status)
-    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5)
-    applyActivationPoints(reactivated.status)
-    assert.equal(getPointsWalletStatus().balancePoints, 1_234.5, 'the same binding generation cannot restore points twice')
 
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
@@ -1105,7 +1074,6 @@ async function testDeviceUnbindAndRebind(): Promise<void> {
     globalThis.fetch = originalFetch
     rmSync(activationFile, { force: true })
     rmSync(activationBackup, { force: true })
-    pointsWalletInternals.resetForTests()
   }
 }
 
@@ -1215,7 +1183,6 @@ async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
     rmSync(activationBackup, { force: true })
     rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
     rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
-    pointsWalletInternals.resetForTests()
     globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
       const code = String(body.activation_code || '')
@@ -1300,7 +1267,6 @@ async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
     rmSync(activationBackup, { force: true })
     rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
     rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
-    pointsWalletInternals.resetForTests()
   }
 }
 
@@ -1716,6 +1682,7 @@ function testRepairPlanStaticContracts(): void {
   assert.match(main, /fetchProxyWallet/u)
   assert.equal((main.match(/getActivationStatusWithServerCheck\(/gu) || []).length, 1, 'only throttled refresh calls device status')
   assert.doesNotMatch(preload, /license:canStartAnalysis|license:consumeAnalysisCredit/u)
+  assert.equal(existsSync(join(process.cwd(), 'src', 'main', 'pointsWallet.ts')), false)
   assert.doesNotMatch(table, /sourceForModel/u)
   assert.doesNotMatch(sop, /buildCleanMessages/u)
   assert.match(store, /scheduleCleaningCheckpointSave\(get\)/u)
@@ -1723,6 +1690,8 @@ function testRepairPlanStaticContracts(): void {
     store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)') < store.indexOf('for (const step of SOP_STEPS)'),
     'analysis evidence groups are planned once before the step loop'
   )
+  assert.match(store, /:evidence_digest:v1:/u)
+  assert.match(store, /cleanedData: analysisInput/u)
   assert.match(workflow, /npm run test:regression/u)
   assert.match(workflow, /npm run test:update-release/u)
   assert.match(workflow, /npm run test:html-visual/u)
@@ -2261,6 +2230,30 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.equal(reasoningFallbackBodies[1].reasoning_effort, undefined)
     assert.equal(fallbackEvents.at(-1)?.type, 'done')
 
+    const cacheBodies: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      cacheBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>)
+      if (cacheBodies.length === 1) return new Response('{"error":"cache_control unsupported"}', { status: 400 })
+      return responseStream([
+        'data: {"choices":[{"delta":{"content":"缓存兼容"},"finish_reason":"stop"}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    }) as typeof fetch
+    const cacheEvents: ChatStreamEvent[] = []
+    await chatStream(
+      { ...profile, model: 'claude-sonnet-4-6' },
+      [{ role: 'system', content: '稳定公共前缀' }, { role: 'user', content: '当前任务' }],
+      (event) => cacheEvents.push(event),
+      undefined,
+      { promptCacheKey: 'analysis:test-report:evidence-digest-v1' }
+    )
+    assert.equal(cacheBodies[0].prompt_cache_key, 'analysis:test-report:evidence-digest-v1')
+    assert.match(JSON.stringify(cacheBodies[0].messages), /cache_control/u)
+    assert.equal(cacheBodies[1].prompt_cache_key, undefined, 'unsupported cache extensions retry once without caching')
+    assert.doesNotMatch(JSON.stringify(cacheBodies[1].messages), /cache_control/u)
+    assert.equal(cacheEvents.at(-1)?.type, 'done')
+
     const lengthEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
       responseStream([
@@ -2501,140 +2494,6 @@ async function testTokenUsageMeasurement(): Promise<void> {
   const afterRotation = makeTokenRecord({ requestId: 'after-log-rotation', reportSessionId: 'rotation-report' })
   assert.equal(await appendTokenUsageRecord(afterRotation), true)
   assert.equal((await readTokenUsageRecords(path)).some((record) => record.requestId === 'after-log-rotation'), true)
-}
-
-function liveBillingRecord(overrides: Partial<TokenUsageRecord> = {}): TokenUsageRecord {
-  const now = new Date(Date.now() + 2_000).toISOString()
-  return makeTokenRecord({
-    requestId: crypto.randomUUID(),
-    reportSessionId: 'billing-report',
-    taskKey: 'billing-report:analysis_step:1',
-    model: 'gpt-5.5',
-    startedAt: now,
-    endedAt: now,
-    ...overrides
-  })
-}
-
-async function testRealTokenPointsBilling(): Promise<void> {
-  pointsWalletInternals.resetForTests()
-  grantDevelopmentPoints(10_000, 'billing-test')
-
-  const inputOnly = liveBillingRecord({
-    inputTokens: 1_000_000,
-    outputTokens: 0,
-    totalTokens: 1_000_000
-  })
-  const inputCharge = calculateUsagePoints(inputOnly)
-  assert.equal(inputCharge?.costPoints, 900)
-  assert.equal(inputCharge?.chargedPoints, 1_800)
-  const afterInput = settleTokenUsage(inputOnly)
-  assert.equal(afterInput.balancePoints, 8_200)
-  assert.equal(afterInput.totalCostPoints, 900)
-  assert.equal(afterInput.totalChargedPoints, 1_800)
-  assert.equal(afterInput.pricing.pointsPerCny, 100)
-  assert.equal(afterInput.pricing.costRate, 0.5)
-  assert.equal(afterInput.pricing.chargeMultiplier, 2)
-  assert.equal(settleTokenUsage(inputOnly).balancePoints, 8_200)
-
-  const failedOutput = liveBillingRecord({
-    taskType: 'final_part',
-    taskKey: 'billing-report:final_part:part-9',
-    partId: 'part-9',
-    status: 'error',
-    failureKind: 'network',
-    inputTokens: 0,
-    outputTokens: 100_000,
-    totalTokens: 100_000
-  })
-  assert.equal(calculateUsagePoints(failedOutput)?.chargedPoints, 1_080)
-  assert.equal(settleTokenUsage(failedOutput).balancePoints, 7_120)
-
-  const cached = liveBillingRecord({
-    inputTokens: 1_000_000,
-    cachedInputTokens: 1_000_000,
-    outputTokens: 0,
-    totalTokens: 1_000_000
-  })
-  assert.equal(calculateUsagePoints(cached)?.costPoints, 90)
-  assert.equal(calculateUsagePoints(cached)?.chargedPoints, 180)
-  assert.equal(settleTokenUsage(cached).balancePoints, 6_940)
-
-  const missing = liveBillingRecord({
-    usageSource: 'missing',
-    inputTokens: 0,
-    outputTokens: 0,
-    totalTokens: 0,
-    estimatedTotalTokens: 20_000
-  })
-  const afterMissing = settleTokenUsage(missing)
-  assert.equal(afterMissing.balancePoints, 6_940)
-  assert.equal(afterMissing.unbilledUsageCount, 1)
-
-  const stoppedRetry = liveBillingRecord({
-    attempt: 2,
-    status: 'aborted',
-    failureKind: 'user_aborted',
-    inputTokens: 100_000,
-    outputTokens: 0,
-    totalTokens: 100_000
-  })
-  assert.equal(calculateUsagePoints(stoppedRetry)?.chargedPoints, 180)
-  assert.equal(settleTokenUsage(stoppedRetry).balancePoints, 6_760)
-
-  for (const item of [
-    { model: 'claude-sonnet-4-6', cost: 288, charged: 576 },
-    { model: 'gemini-3-flash', cost: 864, charged: 1_728 },
-    { model: 'kimi-k2.6', cost: 576, charged: 1_152 }
-  ]) {
-    const charge = calculateUsagePoints(liveBillingRecord({
-      model: item.model,
-      inputTokens: 1_000_000,
-      outputTokens: 0,
-      totalTokens: 1_000_000
-    }))
-    assert.equal(charge?.costPoints, item.cost)
-    assert.equal(charge?.chargedPoints, item.charged)
-  }
-  assert.equal(calculateUsagePoints(liveBillingRecord({ model: 'unknown-model' })), null)
-
-  const activation = {
-    activated: true,
-    deviceId: 'device',
-    licenseId: 'topup-100',
-    codeCount: 100,
-    appName: 'ProductOperationReport',
-    source: 'server' as const,
-    licenseType: 'credits' as const,
-    unlimited: false,
-    creditsRemaining: 100,
-    offline: false
-  }
-  assert.equal(applyActivationPoints(activation).addedPoints, 100)
-  assert.equal(applyActivationPoints(activation).addedPoints, 0)
-  assert.equal(getPointsWalletStatus().balancePoints, 6_860)
-
-  const debt = liveBillingRecord({
-    inputTokens: 5_000_000,
-    outputTokens: 0,
-    totalTokens: 5_000_000
-  })
-  assert.equal(settleTokenUsage(debt).balancePoints, -2_140)
-  const denied = canStartPointsReport(activation)
-  assert.equal(denied.ok, false)
-  assert.match(denied.message, /欠费/)
-
-  assert.equal(applyRechargeCodePoints('topup-300', 300).addedPoints, 300, 'a newly generated backend code can top up once')
-  assert.equal(applyRechargeCodePoints('topup-300', 300).addedPoints, 0, 'reusing the same backend code cannot top up twice')
-  const wrongAppCode = {
-    ...activation,
-    appName: 'AnotherDesktopApp',
-    licenseId: 'wrong-app-999',
-    creditsRemaining: 999
-  }
-  assert.equal(applyActivationPoints(wrongAppCode).addedPoints, 0, 'another app code cannot credit this wallet')
-  assert.equal(getPointsWalletStatus().ledger.some((entry) => entry.description.includes('Token')), false)
-  pointsWalletInternals.resetForTests()
 }
 
 async function testCostOptimizationPrimitives(): Promise<void> {
@@ -2917,6 +2776,13 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(preprocessTableForModel('not a reliable table').canSkipModel, false)
 
   const sharedData = '固定资料'.repeat(1_000)
+  const digestMessages = buildEvidenceDigestMessages({
+    evidenceGroup: '事实A POR-R-ABCDEF12-000001',
+    groupIndex: 1,
+    groupCount: 2
+  })
+  assert.match(String(digestMessages[1].content), /POR-R-ABCDEF12-000001/u)
+  assert.match(String(digestMessages[1].content), /全部分析步骤|证据ID/u)
   const step1 = buildStepMessages({ stepId: 1, stepTitle: '确定产品', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
   const step2 = buildStepMessages({ stepId: 2, stepTitle: '卖点拆解', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
   assert.deepEqual(step1[0], step2[0])
@@ -4033,10 +3899,10 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   )
   assert.ok(phaseTrackerComponent.includes('最多上传 50 份资料'))
 
-  const styles = readFileSync(
-    join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
-    'utf8'
-  ).replace(/<\/style/gi, '<\\/style')
+  const styles = [
+    readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'), 'utf8'),
+    readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'styles', 'contact-wallet.css'), 'utf8')
+  ].join('\n').replace(/<\/style/gi, '<\\/style')
   assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
   assert.match(styles, /@media \(max-width: 46rem\)[\s\S]*?\.contact-entry\s*\{[\s\S]*?display: none/u)
   const htmlPath = join(tempUserData, 'topbar-layout.html')
@@ -4758,8 +4624,6 @@ async function run(): Promise<void> {
   await testStrictModelCompletion()
   console.log('Regression: real token usage measurement and privacy')
   await testTokenUsageMeasurement()
-  console.log('Regression: real token points billing and idempotent top-up')
-  await testRealTokenPointsBilling()
   console.log('Regression: cost optimization cache, preprocessing, prompt prefix and targeted revision')
   await testCostOptimizationPrimitives()
   console.log('Regression: CSV and ZIP guards')

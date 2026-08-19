@@ -1261,6 +1261,9 @@ class Handler(BaseHTTPRequestHandler):
             "stream_options": {"include_usage": True},
             "max_completion_tokens": output_limit,
         }
+        prompt_cache_key = text(body.get("prompt_cache_key"), 200)
+        if prompt_cache_key and SAFE_TEXT_RE.fullmatch(prompt_cache_key):
+            upstream_body["prompt_cache_key"] = prompt_cache_key
         if temperature is not None:
             upstream_body["temperature"] = float(temperature)
         if task_type in ("source_clean", "summary") and body.get("reasoning_effort") == "low":

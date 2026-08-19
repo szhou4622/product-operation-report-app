@@ -40,8 +40,6 @@ const DEVICE_NAMESPACE = 'product-operation-report:device:v1:'
 const TRANSITIONAL_DEVICE_NAMESPACE = 'product-operation-report:device:v2:'
 const OLD_DEVICE_NAMESPACE = DEVICE_NAMESPACE
 const OLD_ENCRYPTION_NAMESPACE = 'product-operation-report:server-code:v1:'
-export const LEGACY_ACTIVATION_POINTS = 2_000
-
 let cachedSystemMachineId: string | undefined
 let cachedLegacyDeviceId = ''
 let cachedTransitionalDeviceId = ''

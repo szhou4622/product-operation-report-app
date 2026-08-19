@@ -159,22 +159,23 @@ export async function fetchProxyWallet(): Promise<PointsWalletStatus> {
   try {
     return await requestProxyWallet(false)
   } catch (error) {
+    let failure: unknown = error
     if (error instanceof ProxyHttpError && error.status === 401) {
       clearAiProxySession()
       try {
         return await requestProxyWallet(true)
       } catch (retryError) {
-        error = retryError
+        failure = retryError
       }
     }
     if (cachedWallet) {
       return {
         ...cachedWallet,
         stale: true,
-        warning: error instanceof Error ? error.message : '余额暂时无法刷新。'
+        warning: failure instanceof Error ? failure.message : '余额暂时无法刷新。'
       }
     }
-    throw error
+    throw failure
   }
 }
 

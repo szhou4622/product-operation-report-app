@@ -31,25 +31,21 @@ interface UtilityState {
   readyTimer: ReturnType<typeof setTimeout>
 }
 
-type UtilityResponse =
-  | { id: string; ok: true; result: ParseResult }
-  | { id: string; ok: false; error: string }
-
 const MAX_FILE_BYTES = 40 * 1024 * 1024
 const MAX_ARCHIVE_BYTES = 120 * 1024 * 1024
 const MAX_PENDING_TASKS = 8
 const MAX_PENDING_BYTES = 200 * 1024 * 1024
+const MAX_UTILITY_WORKERS = 2
 const READY_TIMEOUT_MS = 5_000
 const FILE_TIMEOUT_MS = 180_000
 const ARCHIVE_TIMEOUT_MS = 600_000
 
-let utilityState: UtilityState | null = null
+const utilityStates = new Map<number, UtilityState>()
 let generation = 0
-let current: QueueItem | null = null
+const currentByGeneration = new Map<number, QueueItem>()
 let queue: QueueItem[] = []
 let pendingBytes = 0
 let disposed = false
-let stopping: Promise<void> | null = null
 let serviceBlockedError: Error | null = null
 
 function asError(value: unknown, fallback: string): Error {
@@ -67,7 +63,9 @@ function settleItem(item: QueueItem, error?: Error, result?: ParseResult): void 
   clearItemTimer(item)
   pendingBytes = Math.max(0, pendingBytes - item.byteLength)
   item.data = null
-  if (current === item) current = null
+  if (item.generation !== null && currentByGeneration.get(item.generation) === item) {
+    currentByGeneration.delete(item.generation)
+  }
   if (error) item.reject(error)
   else item.resolve(result as ParseResult)
 }
@@ -81,22 +79,14 @@ function settleReady(state: UtilityState, error?: Error): void {
 }
 
 function stopUtility(state: UtilityState): void {
-  if (utilityState === state) utilityState = null
+  if (utilityStates.get(state.generation) !== state) return
+  utilityStates.delete(state.generation)
   settleReady(state, new Error('文件解析辅助进程已停止。'))
-  if (stopping) return
-
-  let resolveStop!: () => void
-  const stopPromise = new Promise<void>((resolve) => {
-    resolveStop = resolve
-  })
-  stopping = stopPromise
   let finished = false
   const finish = (): void => {
     if (finished) return
     finished = true
     clearTimeout(watchdog)
-    if (stopping === stopPromise) stopping = null
-    resolveStop()
     queueMicrotask(pump)
   }
   const watchdog = setTimeout(() => {
@@ -130,8 +120,9 @@ function stopUtility(state: UtilityState): void {
 }
 
 function failCurrentAndRestart(state: UtilityState, error: Error): void {
-  if (utilityState !== state) return
-  if (current?.generation === state.generation) settleItem(current, error)
+  if (utilityStates.get(state.generation) !== state) return
+  const item = currentByGeneration.get(state.generation)
+  if (item) settleItem(item, error)
   stopUtility(state)
   queueMicrotask(pump)
 }
@@ -141,13 +132,13 @@ function isReadyMessage(value: unknown): boolean {
 }
 
 function handleUtilityMessage(state: UtilityState, value: unknown): void {
-  if (utilityState !== state) return
+  if (utilityStates.get(state.generation) !== state) return
   if (isReadyMessage(value)) {
     settleReady(state)
     return
   }
-  const item = current
-  if (!item || item.generation !== state.generation) return
+  const item = currentByGeneration.get(state.generation)
+  if (!item) return
   if (!value || typeof value !== 'object') {
     failCurrentAndRestart(state, new Error('文件解析服务返回异常，已自动恢复，请重试该文件。'))
     return
@@ -241,60 +232,50 @@ function createUtility(): UtilityState {
     readySettled: false,
     readyTimer: setTimeout(() => undefined, READY_TIMEOUT_MS)
   } satisfies UtilityState
+  utilityStates.set(state.generation, state)
   clearTimeout(state.readyTimer)
   state.readyTimer = setTimeout(() => {
-    if (utilityState !== state) return
+    if (utilityStates.get(state.generation) !== state) return
     settleReady(state, new Error('文件解析组件启动超时，请重试。'))
     stopUtility(state)
   }, READY_TIMEOUT_MS)
 
   child.on('message', (message) => handleUtilityMessage(state, message))
   child.on('exit', (code) => {
-    if (utilityState !== state) return
-    utilityState = null
+    if (utilityStates.get(state.generation) !== state) return
+    utilityStates.delete(state.generation)
     const error = new Error(
       code === 0
         ? '文件解析组件已结束，请重试该文件。'
         : '这个文件导致解析组件异常，已自动隔离；请转换格式或拆分后重试。'
     )
     settleReady(state, error)
-    if (current?.generation === state.generation) settleItem(current, error)
+    const item = currentByGeneration.get(state.generation)
+    if (item) settleItem(item, error)
     queueMicrotask(pump)
   })
   return state
 }
 
-function ensureUtility(): UtilityState {
-  if (!utilityState) utilityState = createUtility()
-  return utilityState
+function idleUtility(): UtilityState | null {
+  for (const state of utilityStates.values()) {
+    if (!currentByGeneration.has(state.generation)) return state
+  }
+  return utilityStates.size < MAX_UTILITY_WORKERS ? createUtility() : null
 }
 
-async function pump(): Promise<void> {
-  if (disposed || current || !queue.length) return
-  if (serviceBlockedError) {
-    const waiting = queue
-    queue = []
-    for (const item of waiting) settleItem(item, serviceBlockedError)
-    return
-  }
-  if (stopping) {
-    void stopping.then(() => pump())
-    return
-  }
-  const item = queue.shift()
-  if (!item) return
-  current = item
-
+async function dispatch(state: UtilityState, item: QueueItem): Promise<void> {
   try {
-    const state = ensureUtility()
-    item.generation = state.generation
     await state.ready
-    if (disposed || current !== item || item.settled || utilityState !== state) return
+    if (
+      disposed || item.settled || currentByGeneration.get(state.generation) !== item ||
+      utilityStates.get(state.generation) !== state
+    ) return
     const data = item.data
     if (!data) throw new Error('文件内容已释放，请重新选择文件。')
     const timeoutMs = item.op === 'archive' ? ARCHIVE_TIMEOUT_MS : FILE_TIMEOUT_MS
     item.timer = setTimeout(() => {
-      if (current !== item || utilityState !== state) return
+      if (currentByGeneration.get(state.generation) !== item || utilityStates.get(state.generation) !== state) return
       settleItem(
         item,
         new Error(
@@ -309,10 +290,29 @@ async function pump(): Promise<void> {
     state.process.postMessage({ id: item.id, op: item.op, name: item.name, data })
     item.data = null
   } catch (error) {
-    if (current === item && !item.settled) {
+    if (currentByGeneration.get(state.generation) === item && !item.settled) {
       settleItem(item, asError(error, '文件解析组件无法启动，请重试。'))
     }
     queueMicrotask(pump)
+  }
+}
+
+function pump(): void {
+  if (disposed || !queue.length) return
+  if (serviceBlockedError) {
+    const waiting = queue
+    queue = []
+    for (const item of waiting) settleItem(item, serviceBlockedError)
+    return
+  }
+  while (queue.length) {
+    const state = idleUtility()
+    if (!state) break
+    const item = queue.shift()
+    if (!item) break
+    item.generation = state.generation
+    currentByGeneration.set(state.generation, item)
+    void dispatch(state, item)
   }
 }
 
@@ -343,7 +343,7 @@ function enqueue<T extends ParseResult>(
       )
     )
   }
-  if (queue.length + (current ? 1 : 0) >= MAX_PENDING_TASKS) {
+  if (queue.length + currentByGeneration.size >= MAX_PENDING_TASKS) {
     return Promise.reject(new Error('待处理文件过多，请等待当前文件完成后再上传。'))
   }
   if (pendingBytes + data.byteLength > MAX_PENDING_BYTES) {
@@ -393,25 +393,27 @@ export function cancelParsingForOwner(ownerId: number, reason = '已取消文件
     if (item.ownerId === ownerId) settleItem(item, error)
     else queue.push(item)
   }
-  if (current?.ownerId === ownerId) {
-    const item = current
+  for (const [workerGeneration, item] of [...currentByGeneration.entries()]) {
+    if (item.ownerId !== ownerId) continue
     settleItem(item, error)
-    if (utilityState && item.generation === utilityState.generation) stopUtility(utilityState)
+    const state = utilityStates.get(workerGeneration)
+    if (state) stopUtility(state)
   }
   queueMicrotask(pump)
 }
 
 export function hasParsingForOwner(ownerId: number): boolean {
-  return current?.ownerId === ownerId || queue.some((item) => item.ownerId === ownerId)
+  return [...currentByGeneration.values()].some((item) => item.ownerId === ownerId) ||
+    queue.some((item) => item.ownerId === ownerId)
 }
 
 export function disposeParseService(): void {
   if (disposed) return
   disposed = true
   const error = new Error('软件正在关闭，已停止文件解析。')
-  if (current) settleItem(current, error)
+  for (const item of [...currentByGeneration.values()]) settleItem(item, error)
   const waiting = queue
   queue = []
   for (const item of waiting) settleItem(item, error)
-  if (utilityState) stopUtility(utilityState)
+  for (const state of [...utilityStates.values()]) stopUtility(state)
 }

@@ -153,11 +153,23 @@ export default function PhaseTracker(): JSX.Element {
             </div>
           )}
           {phase === 'cleaning' && (
-            <div className="health-row strong">
-              <span>正在清洗</span>
-              <b>
-                {cleaningProgress.done}/{cleaningProgress.total}
-              </b>
+            <>
+              <div className="health-row strong">
+                <span>正在清洗</span>
+                <b>{cleaningProgress.done}/{cleaningProgress.total}</b>
+              </div>
+              <div className="health-row">
+                <span>预计时间</span>
+                <b>{cleaningProgress.done > 0 && cleaningProgress.startedAt
+                  ? `约 ${Math.max(1, Math.ceil(((Date.now() - cleaningProgress.startedAt) / cleaningProgress.done) * Math.max(0, cleaningProgress.total - cleaningProgress.done) / 60_000))} 分钟`
+                  : '通常需数分钟'}</b>
+              </div>
+            </>
+          )}
+          {phase === 'analyzing' && (
+            <div className="health-row">
+              <span>预计时间</span>
+              <b>大项目约10-20分钟</b>
             </div>
           )}
           {reportMarkdown && (

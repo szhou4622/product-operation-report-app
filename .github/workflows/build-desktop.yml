@@ -63,6 +63,12 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      - name: Lint TypeScript
+        run: npm run lint
+
+      - name: Run fast unit tests
+        run: npm run test:unit
+
       - name: Run core regression suite
         run: npm run test:regression
 
