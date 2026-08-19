@@ -1598,8 +1598,12 @@ export const useStore = create<StoreState>((set, get) => ({
             } catch {
               // 缓存异常不应影响报告生成，继续走原模型清洗流程。
             }
+            let modelCleanInput = cacheInput
             if (s.kind === 'table' && cacheInput.text) {
               const localResult = preprocessTableForModel(cacheInput.text)
+              if (localResult.applied && localResult.text.trim()) {
+                modelCleanInput = { ...cacheInput, text: localResult.text }
+              }
               const localDetail = buildLocalTableCleanDetail(cacheInput, localResult)
               if (localDetail) {
                 set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: localDetail }] }))
@@ -1615,7 +1619,11 @@ export const useStore = create<StoreState>((set, get) => ({
                     running: st.cleaningProgress.running.filter((name) => name !== s.name)
                   }
                 }))
-                get()._post('assistant', `✅ 本机已整理结构化表格：${s.name}`, 'narration')
+                get()._post(
+                  'assistant',
+                  `✅ 本机已读取结构化表格：${s.name}（${localResult.retainedRows} 条记录，未调用模型，本文件未扣清洗积分）`,
+                  'narration'
+                )
                 await recordOptimizationEvent(
                   optimizationEvent(`local-clean:${sessionId}:${s.id}`, sessionId, 'local_source_clean', {
                     localCompletedFiles: 1,
@@ -1625,7 +1633,7 @@ export const useStore = create<StoreState>((set, get) => ({
                 continue
               }
             }
-            const batchPlan = buildSourceCleanBatchPlan(cacheInput)
+            const batchPlan = buildSourceCleanBatchPlan(modelCleanInput)
             if (batchPlan.degradedReason) {
               const reason = batchPlan.degradedReason === 'quotes'
                 ? '引号未闭合'
@@ -1708,7 +1716,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     'narration'
                   )
                 }
-                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v4-latency-safe:${batch.context.batchIndex}`
+                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v5-local-structured:${batch.context.batchIndex}`
                 const savedBatch = get().taskJournal[batchTaskId]
                 if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
                   batchOutputs[batchPosition] = savedBatch.output

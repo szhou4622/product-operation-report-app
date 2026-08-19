@@ -25,6 +25,7 @@ if (!existsSync(packageRoot)) fail('Packaged app root does not exist.')
 const forbiddenNames = new Set(['managed-model.json', 'managed-model.local.json', 'proxy.env', '.env'])
 const secretPattern = /sk-[A-Za-z0-9_-]{16,}/g
 const providerPattern = /ccg-cli\.online/gi
+const legacyContactPattern = /azssph2|wechat-contact-azssph2/gi
 const textExtensions = new Set(['.js', '.cjs', '.mjs', '.json', '.html', '.css', '.yml', '.yaml', '.txt', '.md'])
 const extracted = mkdtempSync(join(tmpdir(), 'product-report-package-scan-'))
 let scannedRoot = packageRoot
@@ -49,6 +50,8 @@ try {
     secretPattern.lastIndex = 0
     if (providerPattern.test(content)) findings.push(`provider endpoint: ${path}`)
     providerPattern.lastIndex = 0
+    if (legacyContactPattern.test(content)) findings.push(`legacy fixed contact identifier: ${path}`)
+    legacyContactPattern.lastIndex = 0
   })
   if (unpackedRoot !== packageRoot) {
     walk(unpackedRoot, (path, stat) => {
@@ -58,10 +61,12 @@ try {
       secretPattern.lastIndex = 0
       if (providerPattern.test(content)) findings.push(`provider endpoint: ${path}`)
       providerPattern.lastIndex = 0
+      if (legacyContactPattern.test(content)) findings.push(`legacy fixed contact identifier: ${path}`)
+      legacyContactPattern.lastIndex = 0
     })
   }
   if (findings.length) fail(`Package secret scan failed:\n${findings.join('\n')}`)
-  process.stdout.write('Package secret scan passed: no provider key, provider endpoint, or legacy managed-model resource.\n')
+  process.stdout.write('Package secret scan passed: no provider key, provider endpoint, fixed contact identifier, or legacy managed-model resource.\n')
 } finally {
   rmSync(extracted, { recursive: true, force: true })
 }

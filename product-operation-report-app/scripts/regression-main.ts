@@ -46,6 +46,11 @@ import { readBundledSopRules } from '../src/main/sopRules'
 import { checkForUpdates, compareVersions, downloadUpdate } from '../src/main/updater'
 import { canonicalUpdateManifest, verifyUpdateManifestSignature } from '../src/main/updateSignature'
 import {
+  contactInternals,
+  getCachedContactState,
+  refreshContactConfig
+} from '../src/main/contact'
+import {
   appendTokenUsageRecord,
   buildTokenUsageDashboard,
   classifyModelFailure,
@@ -1688,6 +1693,9 @@ function testRepairPlanStaticContracts(): void {
   const store = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'store.ts'), 'utf8')
   const table = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'tablePreprocess.ts'), 'utf8')
   const sop = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'sop.ts'), 'utf8')
+  const contact = readFileSync(join(process.cwd(), 'src', 'main', 'contact.ts'), 'utf8')
+  const builder = readFileSync(join(process.cwd(), 'electron-builder.yml'), 'utf8')
+  const packageScan = readFileSync(join(process.cwd(), 'scripts', 'verify-package-secrets.cjs'), 'utf8')
   const workflow = readFileSync(join(process.cwd(), '..', '.github', 'workflows', 'build-desktop.yml'), 'utf8')
   assert.doesNotMatch(main, /function authorizationWallet/u)
   assert.match(main, /fetchProxyWallet/u)
@@ -1706,6 +1714,12 @@ function testRepairPlanStaticContracts(): void {
   assert.match(workflow, /npm run test:regression/u)
   assert.match(workflow, /npm run test:update-release/u)
   assert.match(workflow, /npm run test:html-visual/u)
+  assert.match(main, /ipcMain\.handle\('contact:get'/u)
+  assert.match(preload, /getContact|onContactChanged/u)
+  assert.match(contact, /CONTACT_CONFIG_URL|contact-config\.json|contact-image\.bin/u)
+  assert.match(builder, /files:[\s\S]*- out\/\*\*\/\*[\s\S]*- assets\/\*\*\/\*/u)
+  assert.doesNotMatch(builder, /win:[\s\S]*files:|mac:[\s\S]*files:/u)
+  assert.match(packageScan, /legacyContactPattern/u)
   assert.equal(reportResultCacheInternals.MAX_CACHE_BYTES, 100 * 1024 * 1024)
 }
 
@@ -2584,18 +2598,25 @@ async function testCostOptimizationPrimitives(): Promise<void> {
     `profile preprocessing: applied=${profile.applied} mode=${profile.mode} rows=${profile.originalRows}`
   )
   assert.equal(profile.mode, 'profile')
-  assert.equal(profile.retainedRows, 60)
-  assert.equal(profile.canSkipModel, false, 'row-reducing digest still requires model cleaning')
-  assert.match(profile.text, /原始有效记录 80 行/u)
+  assert.equal(profile.retainedRows, 80, 'structured preprocessing must preserve every profile row')
+  assert.equal(profile.canSkipModel, true, 'reliable profile tables are completed locally')
+  assert.match(profile.text, /标签79/u)
 
   const materialText = [
-    '发布时间,文案,3秒文案,消耗金额,成交,豆包.思考过程,标签分析.输出结果',
-    ...Array.from({ length: 200 }, (_, index) => `2026-08-${String((index % 28) + 1).padStart(2, '0')},${`内容${index}`.repeat(20)},开头${index},${index},${index},秘密推理${index},冗余${index}`)
+    '原视频,完整文案,前三秒文案,素材类型,视角分析,内容形式,场景标签,卖点排序,豆包,豆包.思考过程,豆包.输出结果',
+    ...Array.from({ length: 200 }, (_, index) => {
+      const wrapper = `旧AI包装${index}-${'冗余'.repeat(20)}`
+      return `video-${index}.mp4,${`内容${index}`.repeat(20)},开头${index},3.2,用户视角,产品展示型,家庭,卖点${index},${wrapper},秘密推理${index},${wrapper}`
+    })
   ].join('\n')
   const material = preprocessTableForModel(materialText)
   assert.equal(material.applied, true, `material preprocessing: ${JSON.stringify(material)}`)
   assert.equal(material.mode, 'material')
-  assert.doesNotMatch(material.text, /秘密推理|思考过程|输出结果/u)
+  assert.equal(material.canSkipModel, true)
+  assert.equal(material.retainedRows, 200, 'material preprocessing must never rank or sample rows')
+  assert.doesNotMatch(material.text, /秘密推理|旧AI包装|思考过程|输出结果/u)
+  assert.match(material.text, /视角分析/u)
+  assert.ok(material.text.indexOf('video-0.mp4') < material.text.indexOf('video-199.mp4'))
   assert.match(material.text, /开头199/u)
 
   for (const recordCount of [2, 59, 121, 437]) {
@@ -2754,14 +2775,15 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(product.applied, true)
   assert.equal(product.mode, 'product')
   assert.match(product.text, /商品名称|成交金额|成交订单数/u)
-  assert.doesNotMatch(product.text, /完全无关字段/u)
+  assert.match(product.text, /完全无关字段/u, 'unknown business columns are preserved instead of guessed away')
   const unrankableProductText = [
     '商品名称,商品编码,完全未知字段',
     ...Array.from({ length: 200 }, (_, index) => `商品${index},SKU-${index},${'未知'.repeat(80)}`)
   ].join('\n')
   const unrankableProduct = preprocessTableForModel(unrankableProductText)
-  assert.equal(unrankableProduct.applied, false, 'product table without a reliable metric falls back')
-  assert.equal(unrankableProduct.text, unrankableProductText)
+  assert.equal(unrankableProduct.canSkipModel, true, 'reliable structured product rows do not require a ranking metric')
+  assert.equal(unrankableProduct.retainedRows, 200)
+  assert.match(unrankableProduct.text, /商品199/u)
 
   const localTableSource = {
     name: '可靠成交数据.csv',
@@ -2780,10 +2802,9 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.ok(localDetail)
   assert.match(localDetail!, /未调用模型|以下内容只来自原表格|产品A/u)
   assert.equal((localDetail!.match(/产品B,800,8/gu) || []).length, 2)
-  assert.ok(localDetail!.length <= 12_000)
   const semanticTable = preprocessTableForModel('标题,脚本文案,成交金额\n测试,这是一段内容,100')
-  assert.equal(semanticTable.canSkipModel, false, 'semantic narrative columns require model cleaning')
-  assert.equal(buildLocalTableCleanDetail({ ...localTableSource, text: '标题,脚本文案,成交金额\n测试,内容,100' }, semanticTable), null)
+  assert.equal(semanticTable.canSkipModel, true, 'reliable semantic rows are passed intact to later analysis without a cleaning rewrite')
+  assert.ok(buildLocalTableCleanDetail({ ...localTableSource, text: '标题,脚本文案,成交金额\n测试,内容,100' }, semanticTable))
   assert.equal(preprocessTableForModel('not a reliable table').canSkipModel, false)
 
   const sharedData = '固定资料'.repeat(1_000)
@@ -3874,8 +3895,19 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     /autosaveAttempt\.current \+= 1[\s\S]{0,100}setAutosaveError\(''\)[\s\S]{0,120}\[activationStatus\?\.activated, activationStatus\?\.licenseId\]/u,
     'an authorization change invalidates stale autosave failures from the previous license'
   )
-  assert.match(appComponent, /联系方式：<\/span>[\s\S]{0,80}<strong>azssph2<\/strong>/u)
-  assert.match(appComponent, /wechat-contact-azssph2\.png/u)
+  const contactComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'ContactAuthor.tsx'),
+    'utf8'
+  )
+  assert.match(appComponent, /<ContactAuthor\s*\/>/u)
+  assert.match(contactComponent, />\s*联系作者\s*<\/button>/u)
+  assert.match(contactComponent, /getContact\(\)|onContactChanged/u)
+  assert.doesNotMatch(`${appComponent}\n${contactComponent}`, /azssph2|微信号|扫码添加微信|wechat-contact/iu)
+  assert.equal(
+    existsSync(join(process.cwd(), 'src', 'renderer', 'src', 'assets', 'contact-author-fallback.png')),
+    true,
+    'generic fallback contact image is bundled with the renderer'
+  )
   assert.match(
     appComponent,
     /if \(!activationStatus\?\.activated \|\| !initialized \|\| !settings \|\| persistencePaused\) return/u,
@@ -3915,6 +3947,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'styles', 'contact-wallet.css'), 'utf8')
   ].join('\n').replace(/<\/style/gi, '<\\/style')
   assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
+  assert.match(styles, /\.contact-entry\.pinned \.contact-qr-popover/u)
   assert.match(styles, /@media \(max-width: 46rem\)[\s\S]*?\.contact-entry\s*\{[\s\S]*?display: none/u)
   if (process.env.CI) return
   const htmlPath = join(tempUserData, 'topbar-layout.html')
@@ -3931,11 +3964,9 @@ async function testWorkbenchTopbarContract(): Promise<void> {
             </span>
           </div>
           <div class="contact-entry">
-            <button class="contact-trigger" aria-describedby="contact-qr-tooltip">
-              <span>联系方式：</span><strong>azssph2</strong>
-            </button>
-            <div class="contact-qr-popover" id="contact-qr-tooltip" role="tooltip">
-              <strong>扫码添加微信</strong><img alt="微信联系方式 azssph2 的二维码"><span>微信号：azssph2</span>
+            <button class="contact-trigger" aria-describedby="contact-author-popover">联系作者</button>
+            <div class="contact-qr-popover" id="contact-author-popover" role="tooltip">
+              <strong>联系作者</strong><img alt="联系作者图片"><span>联系方式图片暂未配置</span>
             </div>
           </div>
           <a class="tutorial-link" href="${expectedGuideUrl}">
@@ -4572,6 +4603,123 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(bundledRules, /Product visual brief/)
 }
 
+async function testContactConfigurationAndCache(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const png = Uint8Array.from(Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  ))
+  const config = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    app_name: 'ProductOperationReport',
+    enabled: true,
+    qr_image_url: 'https://cdn.example.com/contact.png',
+    updated_at: '2026-08-19T10:00:00Z',
+    ...overrides
+  })
+  const reset = (): void => {
+    contactInternals.resetInFlight()
+    rmSync(contactInternals.cacheDirectory(), { recursive: true, force: true })
+  }
+  try {
+    reset()
+    let calls = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls += 1
+      const url = String(input)
+      if (url.includes('/api/contact')) {
+        return new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } })
+    }) as typeof fetch
+    const [remote, sameRemote] = await Promise.all([refreshContactConfig(), refreshContactConfig()])
+    assert.equal(calls, 2, 'concurrent first interactions share one config and image request')
+    assert.equal(remote.source, 'remote')
+    assert.equal(remote.enabled, true)
+    assert.match(remote.imageDataUrl || '', /^data:image\/png;base64,/u)
+    assert.equal(sameRemote.imageDataUrl, remote.imageDataUrl)
+    const cached = getCachedContactState()
+    assert.equal(cached.source, 'cache')
+    assert.equal(cached.imageDataUrl, remote.imageDataUrl)
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => { throw new Error('offline') }) as typeof fetch
+    const offline = await refreshContactConfig()
+    assert.equal(offline.source, 'cache')
+    assert.equal(offline.imageDataUrl, remote.imageDataUrl)
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config({ enabled: false, qr_image_url: '' })), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const disabled = await refreshContactConfig()
+    assert.equal(disabled.enabled, false)
+    assert.equal(disabled.imageDataUrl, undefined)
+    assert.equal(getCachedContactState().enabled, false, 'disabled tombstone prevents an old image from returning')
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config({ qr_image_url: '' })), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const missingImage = await refreshContactConfig()
+    assert.equal(missingImage.enabled, true)
+    assert.equal(missingImage.configured, true)
+    assert.equal(missingImage.imageDataUrl, undefined)
+    assert.match(missingImage.message, /暂未配置/u)
+
+    reset()
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      return url.includes('/api/contact')
+        ? new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+        : new Response(png, { status: 200, headers: { 'content-type': 'image/png' } })
+    }) as typeof fetch
+    const valid = await refreshContactConfig()
+    for (const invalidConfig of [
+      config({ app_name: 'OtherApp' }),
+      config({ qr_image_url: 'http://cdn.example.com/contact.png' })
+    ]) {
+      contactInternals.resetInFlight()
+      globalThis.fetch = (async () => new Response(JSON.stringify(invalidConfig), {
+        status: 200, headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+      const rejected = await refreshContactConfig()
+      assert.equal(rejected.source, 'cache')
+      assert.equal(rejected.imageDataUrl, valid.imageDataUrl, 'invalid remote config cannot overwrite a valid cache')
+    }
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const wrongContentType = await refreshContactConfig()
+    assert.equal(wrongContentType.source, 'cache', 'a non-image response keeps the valid cache')
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response('not configured', { status: 404 })) as typeof fetch
+    const notConfigured = await refreshContactConfig()
+    assert.equal(notConfigured.configured, false)
+    assert.equal(notConfigured.imageDataUrl, undefined)
+    assert.equal(getCachedContactState().imageDataUrl, undefined, '404 clears the active remote image state')
+
+    reset()
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async (input: string | URL | Request) => String(input).includes('/api/contact')
+      ? new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+      : new Response(png, {
+          status: 200,
+          headers: { 'content-type': 'image/png', 'content-length': String(contactInternals.MAX_IMAGE_BYTES + 1) }
+        })) as typeof fetch
+    const oversized = await refreshContactConfig()
+    assert.equal(oversized.source, 'bundled')
+    assert.equal(oversized.imageDataUrl, undefined)
+  } finally {
+    globalThis.fetch = originalFetch
+    contactInternals.resetInFlight()
+    rmSync(contactInternals.cacheDirectory(), { recursive: true, force: true })
+  }
+}
+
 async function run(): Promise<void> {
   console.log('Regression: project persistence')
   await testProjectRevisionAndBackup()
@@ -4605,6 +4753,8 @@ async function run(): Promise<void> {
   testUpdateManifestSignature()
   console.log('Regression: update config and SHA256 guard')
   await testUpdateConfigAndChecksum()
+  console.log('Regression: lazy contact configuration and cache safety')
+  await testContactConfigurationAndCache()
   console.log('Regression: managed model secret isolation')
   testManagedModelIsolation()
   console.log('Regression: fallback model safety boundaries')

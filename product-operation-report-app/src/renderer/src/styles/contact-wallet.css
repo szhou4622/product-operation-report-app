@@ -25,14 +25,8 @@
   font: inherit;
   font-size: 12px;
   white-space: nowrap;
-  cursor: default;
+  cursor: pointer;
   transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
-}
-
-.contact-trigger strong {
-  color: #1d4ed8;
-  font-weight: 750;
-  letter-spacing: 0.01em;
 }
 
 .contact-trigger:hover,
@@ -103,11 +97,25 @@
 }
 
 .contact-entry:hover .contact-qr-popover,
-.contact-entry:focus-within .contact-qr-popover {
+.contact-entry:focus-within .contact-qr-popover,
+.contact-entry.pinned .contact-qr-popover {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
   transform: translate(-50%, 0);
+}
+
+.contact-unavailable {
+  display: grid;
+  min-height: 146px;
+  place-items: center;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: center;
 }
 
 .points-ledger-preview {
@@ -156,7 +164,8 @@
   .contact-trigger { padding-inline: 10px; }
   .contact-qr-popover { left: 0; transform: translate(0, -4px); }
   .contact-entry:hover .contact-qr-popover,
-  .contact-entry:focus-within .contact-qr-popover { transform: translate(0, 0); }
+  .contact-entry:focus-within .contact-qr-popover,
+  .contact-entry.pinned .contact-qr-popover { transform: translate(0, 0); }
 }
 
 @media (max-width: 46rem) {

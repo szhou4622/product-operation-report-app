@@ -163,6 +163,15 @@ export interface UpdateActionResult {
   info?: UpdateInfo
 }
 
+export interface ContactDisplayState {
+  enabled: boolean
+  configured: boolean
+  imageDataUrl?: string
+  updatedAt?: string
+  source: 'remote' | 'cache' | 'bundled'
+  message: string
+}
+
 export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'image'; dataUrl: string } // data:image/png;base64,...

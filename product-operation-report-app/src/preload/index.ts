@@ -9,6 +9,7 @@ import type {
   ActivationStatus,
   ChatMessage,
   ChatStreamEvent,
+  ContactDisplayState,
   CostOptimizationEvent,
   ExportResult,
   ModelListResult,
@@ -47,6 +48,14 @@ export interface ChatHandlers {
 
 const api = {
   getAppVersion: (): Promise<string> => ipcRenderer.invoke('app:version'),
+
+  getContact: (): Promise<ContactDisplayState> => ipcRenderer.invoke('contact:get'),
+
+  onContactChanged: (handler: (state: ContactDisplayState) => void): (() => void) => {
+    const listener = (_event: unknown, state: ContactDisplayState): void => handler(state)
+    ipcRenderer.on('contact:changed', listener)
+    return () => ipcRenderer.removeListener('contact:changed', listener)
+  },
 
   getActivationStatus: (): Promise<ActivationStatus> => ipcRenderer.invoke('activation:status'),
 

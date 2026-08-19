@@ -13,6 +13,7 @@ export const LICENSE_DEVICE_STATUS_URL = `${LICENSE_BASE_URL}/device/status`
 
 export const UPDATE_BASE_URL = 'https://update.dadaozixun.com'
 export const UPDATE_LATEST_URL = `${UPDATE_BASE_URL}/api/update/latest`
+export const CONTACT_CONFIG_URL = `${UPDATE_BASE_URL}/api/contact`
 
 const developmentAiProxyBaseUrl =
   allowDevelopmentOverrides

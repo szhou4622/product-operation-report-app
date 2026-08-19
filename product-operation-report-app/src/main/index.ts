@@ -7,6 +7,7 @@ import type {
   AppSettings,
   CostOptimizationEvent,
   ChatStreamEvent,
+  ContactDisplayState,
   ModelTokenUsage,
   SavedProject,
   ReportResultCacheInput,
@@ -72,6 +73,7 @@ import {
 } from './reportResultCache'
 import { appendCostOptimizationEvent } from './costOptimization'
 import { ChatRequestRegistry, validateChatStartPayload } from './chatAdmission'
+import { getCachedContactState, refreshContactConfig } from './contact'
 import {
   authorizeProxyProfiles,
   clearAiProxySession,
@@ -156,6 +158,12 @@ async function broadcastAuthorization(status = getActivationStatus()): Promise<v
     if (window.isDestroyed()) continue
     window.webContents.send('activation:changed', status)
     if (wallet) window.webContents.send('points:changed', wallet)
+  }
+}
+
+function broadcastContact(state: ContactDisplayState): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('contact:changed', state)
   }
 }
 
@@ -306,6 +314,11 @@ function createWindow(): void {
 ipcMain.handle('settings:get', () => {
   ensureActivated()
   return loadRendererSettings()
+})
+ipcMain.handle('contact:get', () => {
+  const initial = getCachedContactState()
+  void refreshContactConfig().then(broadcastContact)
+  return initial
 })
 ipcMain.handle('settings:save', (_e, settings: AppSettings) => {
   ensureActivated()
