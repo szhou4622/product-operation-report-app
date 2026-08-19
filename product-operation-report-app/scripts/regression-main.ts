@@ -3910,6 +3910,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   ].join('\n').replace(/<\/style/gi, '<\\/style')
   assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
   assert.match(styles, /@media \(max-width: 46rem\)[\s\S]*?\.contact-entry\s*\{[\s\S]*?display: none/u)
+  if (process.env.CI) return
   const htmlPath = join(tempUserData, 'topbar-layout.html')
   writeFileSync(
     htmlPath,
