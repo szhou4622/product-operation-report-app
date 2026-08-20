@@ -1123,23 +1123,39 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   if (enteredCode.length > 512) return { ok: false, message: '激活码格式不正确。', status: currentStatus }
   const deviceId = currentStatus.deviceId
   const existing = currentServerRecord()
+  const savedVault = readLicenseVault()
   const samePrimary = existing?.record.codeHash === hashActivationCode(enteredCode)
+  const savedCodeRecovery = Boolean(
+    savedVault?.activationCode &&
+    savedVault.deviceCredential &&
+    savedVault.deviceSession &&
+    hashActivationCode(savedVault.activationCode) === hashActivationCode(enteredCode)
+  )
   if (currentStatus.activated && existing && !samePrimary) {
     return { ok: false, message: '当前电脑已有主激活码；新增积分请使用“充值积分”。', status: currentStatus }
   }
-  let result = await requestServerActivation(enteredCode, deviceId, samePrimary ? {
-    currentCodeId: existing?.record.licenseId,
-    credentialRefresh: true,
-    deviceCredential: existing?.vault?.deviceCredential,
-    deviceSession: existing?.vault?.deviceSession
-  } : {})
+  const refreshOptions: ActivationRequestOptions = samePrimary
+    ? {
+        currentCodeId: existing?.record.licenseId,
+        credentialRefresh: true,
+        deviceCredential: existing?.vault?.deviceCredential,
+        deviceSession: existing?.vault?.deviceSession
+      }
+    : savedCodeRecovery
+      ? {
+          credentialRefresh: true,
+          deviceCredential: savedVault?.deviceCredential,
+          deviceSession: savedVault?.deviceSession
+        }
+      : {}
+  let result = await requestServerActivation(enteredCode, deviceId, refreshOptions)
   if (!result.ok && result.credentialRefreshRequired && !samePrimary) {
     // A historical server binding can outlive a lost or superseded local
     // summary. Retry only when the authorization service explicitly requires
     // the v2 credential-upgrade flag; never opt into balance merging here.
-    result = await requestServerActivation(enteredCode, deviceId, {
-      credentialRefresh: true
-    })
+    result = await requestServerActivation(enteredCode, deviceId, savedCodeRecovery
+      ? refreshOptions
+      : { credentialRefresh: true })
   }
   if (!result.ok) return { ok: false, message: friendlyActivationFailure(result.message), status: currentStatus }
   if (result.action === 'balance_merged') {
@@ -1152,8 +1168,8 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   if (result.primaryLicenseId && result.licenseId && result.primaryLicenseId !== result.licenseId) {
     return { ok: false, message: '服务器返回的主授权编号不一致，本次没有写入本机授权。', status: currentStatus }
   }
-  const credential = result.deviceCredential || (samePrimary ? existing?.vault?.deviceCredential : undefined)
-  const session = result.deviceSession || (samePrimary ? existing?.vault?.deviceSession : undefined)
+  const credential = result.deviceCredential || (samePrimary ? existing?.vault?.deviceCredential : savedCodeRecovery ? savedVault?.deviceCredential : undefined)
+  const session = result.deviceSession || (samePrimary ? existing?.vault?.deviceSession : savedCodeRecovery ? savedVault?.deviceSession : undefined)
   if (!credential || !session) {
     return { ok: false, message: '服务器没有返回完整的设备会话和设备凭证，本次未写入授权。', status: currentStatus }
   }

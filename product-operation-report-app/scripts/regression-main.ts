@@ -421,6 +421,42 @@ async function testSavedActivationRecovery(): Promise<void> {
     assert.equal(recovered.status.activated, true)
     assert.equal(recovered.status.creditsRemaining, 80)
     assert.equal('activationCode' in recovered, false, 'the saved code must not be returned to the renderer')
+
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    writeLicenseVault({
+      activationCode: savedCode,
+      deviceCredential: 'existing-recovery-credential',
+      deviceSession: 'existing-recovery-session'
+    })
+    let recoveryBody: Record<string, unknown> = {}
+    let recoveryHeaders = new Headers()
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      recoveryBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      recoveryHeaders = new Headers(init?.headers)
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'saved-recovery-primary',
+        license_type: 'credits',
+        remaining_credits: 80,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getDeviceId(),
+        device_credential: 'rotated-recovery-credential',
+        device_session: 'rotated-recovery-session',
+        message: '已有凭证重新验证成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const credentialRecovered = await revalidateSavedActivationCode()
+    assert.equal(credentialRecovered.ok, true)
+    assert.equal(recoveryBody.credential_refresh, true)
+    assert.equal(recoveryBody.current_code_id, undefined, 'missing public summary must not invent a code id')
+    assert.equal(recoveryBody.confirm_merge, undefined)
+    assert.equal(recoveryHeaders.get('authorization'), 'Bearer existing-recovery-session')
+    assert.equal(recoveryHeaders.get('x-device-credential'), 'existing-recovery-credential')
+    assert.equal(revealCurrentActivationCode().activationCode, savedCode)
   } finally {
     globalThis.fetch = originalFetch
     for (const file of files) rmSync(file, { force: true })
