@@ -1,13 +1,29 @@
-import { app, shell, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
-import { randomUUID } from 'crypto'
-import { isAbsolute, join } from 'path'
+import { app, shell, BrowserWindow, clipboard, dialog, ipcMain, Menu, session } from 'electron'
+import { extname, isAbsolute, join, resolve } from 'path'
 import { existsSync } from 'fs'
-import type { AppSettings, ChatMessage, SavedProject, TestModelOptions } from '../shared/types'
-import { getActiveProfile, loadSettings, saveSettings } from './settings'
+import type {
+  ActivationResult,
+  ActivationStatus,
+  AppSettings,
+  CostOptimizationEvent,
+  ChatStreamEvent,
+  ContactDisplayState,
+  ModelTokenUsage,
+  SavedProject,
+  ReportResultCacheInput,
+  ReportResultCacheSnapshot,
+  SourceCleanCacheInput,
+  TestModelOptions,
+  TokenUsageRecord
+} from '../shared/types'
+import { getActiveProfile, getActiveProfiles, loadRendererSettings, saveRendererSettings } from './settings'
+import { getManagedModelState } from './managedModel'
 import { chatStream, listModels, testModel } from './model'
+import { runModelFallbackSequence } from './modelFallback'
 import {
   cancelParsingForOwner,
   disposeParseService,
+  hasParsingForOwner,
   parseArchiveInUtility,
   parseFileInUtility
 } from './parseService'
@@ -16,17 +32,78 @@ import {
   archiveProject,
   loadLastProject,
   loadPreviousProject,
+  preflightProjectStorage,
+  pruneOrphanBlobs,
   saveLastProject,
   saveLastProjectSync
 } from './project'
-import { activateWithCode, getActivationStatus } from './activation'
+import {
+  activateWithCode,
+  canStartLicensedAnalysis,
+  deactivateCurrentDevice,
+  getActivationStatus,
+  getActivationStatusWithServerCheck,
+  revalidateSavedActivationCode,
+  revealCurrentActivationCode,
+  redeemPointsWithCode
+} from './activation'
+import { buildActivationDiagnostic } from './activationDiagnostics'
+import { ExclusiveOperationGate } from './exclusiveOperationGate'
 import { readBundledSopRules } from './sopRules'
+import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
+import {
+  appendTokenUsageRecord,
+  classifyModelFailure,
+  estimateRequestTokens,
+  getTokenUsageDashboard,
+  sanitizeModelTaskContext,
+  tokenUsageLogPath
+} from './tokenUsage'
+import {
+  clearSourceCleanCache,
+  getSourceCleanCacheStats,
+  lookupSourceCleanCache,
+  storeSourceCleanCache
+} from './sourceCleanCache'
+import {
+  clearReportResultCache,
+  getReportResultCacheStats,
+  lookupReportResultCache,
+  storeReportResultCache
+} from './reportResultCache'
+import { appendCostOptimizationEvent } from './costOptimization'
+import { ChatRequestRegistry, validateChatStartPayload } from './chatAdmission'
+import { getCachedContactState, refreshContactConfig } from './contact'
+import {
+  authorizeProxyProfiles,
+  clearAiProxySession,
+  clearProxyWalletSnapshot,
+  fetchProxyWallet,
+  testProxyHealth
+} from './aiProxy'
+
+const developmentUserDataDir =
+  !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
+    ? process.env.PRODUCT_REPORT_DEV_USER_DATA_DIR?.trim()
+    : ''
+if (developmentUserDataDir) app.setPath('userData', resolve(developmentUserDataDir))
 
 let mainWindow: BrowserWindow | null = null
 let latestProjectSnapshot: SavedProject | null = null
+let hardExitTimer: ReturnType<typeof setTimeout> | null = null
+const activationOperationGate = new ExclusiveOperationGate()
+const ACTIVATION_REFRESH_MIN_INTERVAL_MS = 60_000
+let lastActivationRefreshStartedAt = 0
+let automaticSavedCodeRecoveryKey = ''
+const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) app.quit()
+
+function armHardExitWatchdog(): void {
+  if (hardExitTimer) return
+  hardExitTimer = setTimeout(() => app.exit(0), 4_000)
+}
 
 function resolveWindowIcon(): string | undefined {
   const candidates = [
@@ -56,97 +133,124 @@ function validateLocalPath(value: unknown): string {
     throw new Error('文件路径无效，请重新导出。')
   }
   if (!existsSync(value)) throw new Error('文件已被移动或删除，请重新导出。')
-  return value
+  const safeExtensions = new Set(['.html', '.htm', '.md', '.docx', '.pdf', '.txt', '.csv', '.xlsx', '.png', '.jpg', '.jpeg', '.webp'])
+  if (!safeExtensions.has(extname(value).toLowerCase())) {
+    throw new Error('为保护电脑安全，只能打开报告、数据表或图片文件。')
+  }
+  const normalized = resolve(value)
+  if (!allowedLocalOpenPaths.has(normalized)) {
+    throw new Error('只能打开由本软件刚刚导出的文件或更新安装包。')
+  }
+  return normalized
+}
+
+function rememberExportPath<T extends { ok: boolean; path?: string }>(result: T): T {
+  if (result.ok && result.path && isAbsolute(result.path)) allowedLocalOpenPaths.add(resolve(result.path))
+  return result
 }
 
 function ensureActivated(): void {
   if (!getActivationStatus().activated) throw new Error('软件未激活，请先输入激活码。')
 }
 
+async function broadcastAuthorization(status = getActivationStatus()): Promise<void> {
+  const wallet = await fetchProxyWallet().catch(() => undefined)
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue
+    window.webContents.send('activation:changed', status)
+    if (wallet) window.webContents.send('points:changed', wallet)
+  }
+}
+
+function broadcastContact(state: ContactDisplayState): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('contact:changed', state)
+  }
+}
+
+async function refreshActivationStatusThrottled(): Promise<ActivationStatus> {
+  return activationOperationGate.run(async () => {
+    if (Date.now() - lastActivationRefreshStartedAt < ACTIVATION_REFRESH_MIN_INTERVAL_MS) {
+      return getActivationStatus()
+    }
+    lastActivationRefreshStartedAt = Date.now()
+    return getActivationStatusWithServerCheck()
+  }, () => getActivationStatus())
+}
+
 function createWindow(): void {
+  if (app.isPackaged) {
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+          ]
+        }
+      })
+    })
+  }
   const window = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 880,
     minHeight: 640,
     show: false,
-    title: '产品经营报告',
+    title: '产品与内容经营报告系统',
     icon: resolveWindowIcon(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
-      contextIsolation: true
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      devTools: !app.isPackaged
     }
   })
   mainWindow = window
   const ownerId = window.webContents.id
 
   let forceClose = false
-  let closeRequestId = ''
-  let closeTimer: ReturnType<typeof setTimeout> | null = null
-  let closeGuardReady = false
+  let closePromptOpen = false
   const finishClose = (): void => {
+    cancelParsingForOwner(ownerId, '软件正在关闭，文件解析已停止。')
+    chatRequests.abortOwner(ownerId)
+    if (process.platform !== 'darwin') armHardExitWatchdog()
     forceClose = true
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = null
     window.close()
   }
-  const scheduleCloseTimeout = (delay = 5000): void => {
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = setTimeout(() => {
-      closeTimer = null
-      if (!closeRequestId || window.isDestroyed()) return
-      void dialog
-        .showMessageBox(window, {
-          type: 'warning',
-          title: '保存时间较长',
-          message: '软件正在保存当前分析，暂时还不能安全关闭。',
-          detail: '建议继续等待，避免丢失刚才的操作。',
-          buttons: ['继续等待', '仍然退出'],
-          defaultId: 0,
-          cancelId: 0
-        })
-        .then((result) => {
-          if (window.isDestroyed() || !closeRequestId) return
-          if (result.response === 1) finishClose()
-          else scheduleCloseTimeout(10000)
-        })
-    }, delay)
-  }
-  const onCloseReady = (
-    event: Electron.IpcMainEvent,
-    payload: { id?: string; ok?: boolean; error?: string }
-  ): void => {
-    if (event.sender !== window.webContents || !closeRequestId || payload?.id !== closeRequestId) return
-    if (closeTimer) clearTimeout(closeTimer)
-    closeTimer = null
-    closeRequestId = ''
-    if (payload.ok) {
+
+  window.on('close', (event) => {
+    if (forceClose || window.webContents.isDestroyed()) return
+    event.preventDefault()
+    if (closePromptOpen) return
+    const activePhase = latestProjectSnapshot?.phase === 'cleaning' || latestProjectSnapshot?.phase === 'analyzing'
+    const hasActiveWork = activePhase || hasParsingForOwner(ownerId) || chatRequests.hasOwner(ownerId)
+    if (!hasActiveWork) {
       finishClose()
       return
     }
-    void dialog.showMessageBox(window, {
-      type: 'error',
-      title: '暂时无法关闭',
-      message: '当前分析还没有保存成功。',
-      detail: payload.error || '请检查磁盘空间或文件权限，然后再关闭软件。',
-      buttons: ['我知道了']
-    })
-  }
-  ipcMain.on('app:close-ready', onCloseReady)
-  const onCloseGuardState = (event: Electron.IpcMainEvent, ready: boolean): void => {
-    if (event.sender === window.webContents) closeGuardReady = Boolean(ready)
-  }
-  ipcMain.on('app:close-guard-state', onCloseGuardState)
-
-  window.on('close', (event) => {
-    if (forceClose || !closeGuardReady || window.webContents.isDestroyed()) return
-    event.preventDefault()
-    if (closeRequestId) return
-    closeRequestId = randomUUID()
-    window.webContents.send('app:before-close', { id: closeRequestId })
-    scheduleCloseTimeout()
+    closePromptOpen = true
+    void dialog
+      .showMessageBox(window, {
+        type: 'warning',
+        title: '当前任务还没有完成',
+        message: '资料仍在上传、解析或分析，确定要退出软件吗？',
+        detail: '退出会停止当前任务。已经自动保存的资料和历史报告不会删除，下次打开可以继续处理。',
+        buttons: ['停止任务并退出', '继续使用'],
+        defaultId: 1,
+        cancelId: 1
+      })
+      .then((result) => {
+        closePromptOpen = false
+        if (result.response === 0 && !window.isDestroyed()) finishClose()
+      })
+      .catch(() => {
+        closePromptOpen = false
+        if (!window.isDestroyed()) finishClose()
+      })
   })
   window.on('session-end', () => {
     if (latestProjectSnapshot) {
@@ -160,18 +264,14 @@ function createWindow(): void {
   })
 
   window.webContents.on('render-process-gone', () => {
-    closeGuardReady = false
     cancelParsingForOwner(ownerId, '界面已重新加载，旧文件解析已停止。')
-    for (const controller of inflight.values()) controller.abort()
-    inflight.clear()
+    chatRequests.abortOwner(ownerId)
   })
 
   window.on('ready-to-show', () => window.show())
   window.on('closed', () => {
-    if (closeTimer) clearTimeout(closeTimer)
     cancelParsingForOwner(ownerId, '窗口已关闭，旧文件解析已停止。')
-    ipcMain.removeListener('app:close-ready', onCloseReady)
-    ipcMain.removeListener('app:close-guard-state', onCloseGuardState)
+    chatRequests.abortOwner(ownerId)
     if (mainWindow === window) mainWindow = null
   })
 
@@ -204,21 +304,26 @@ function createWindow(): void {
     if (isSafeExternalUrl(url)) void openExternalUrl(url).catch(() => undefined)
   })
 
-  if (process.env['ELECTRON_RENDERER_URL']) {
-    window.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
+    void window.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    window.loadFile(join(__dirname, '../renderer/index.html'))
+    void window.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
 // ---- IPC：设置 ----
 ipcMain.handle('settings:get', () => {
   ensureActivated()
-  return loadSettings()
+  return loadRendererSettings()
+})
+ipcMain.handle('contact:get', () => {
+  const initial = getCachedContactState()
+  void refreshContactConfig().then(broadcastContact)
+  return initial
 })
 ipcMain.handle('settings:save', (_e, settings: AppSettings) => {
   ensureActivated()
-  return saveSettings(settings)
+  return saveRendererSettings(settings)
 })
 ipcMain.handle('shell:openExternal', (_e, url: string) => openExternalUrl(url))
 ipcMain.handle('shell:openPath', async (_e, path: string) => {
@@ -230,9 +335,181 @@ ipcMain.handle('shell:showItemInFolder', (_e, path: string) => {
   ensureActivated()
   shell.showItemInFolder(validateLocalPath(path))
 })
+ipcMain.handle('token-usage:summary', () => {
+  ensureActivated()
+  return getTokenUsageDashboard()
+})
+ipcMain.handle('token-usage:open-location', () => {
+  ensureActivated()
+  shell.showItemInFolder(tokenUsageLogPath())
+})
+
+ipcMain.handle('source-clean-cache:stats', () => getSourceCleanCacheStats())
+ipcMain.handle('source-clean-cache:clear', () => clearSourceCleanCache())
+ipcMain.handle('source-clean-cache:lookup', async (_event, input: SourceCleanCacheInput) => {
+  ensureActivated()
+  const profile = getActiveProfile()
+  if (!profile) return { hit: false, cacheKey: '', stats: await getSourceCleanCacheStats() }
+  return lookupSourceCleanCache(input, profile.model)
+})
+ipcMain.handle(
+  'source-clean-cache:store',
+  async (_event, payload: { input: SourceCleanCacheInput; text: string }) => {
+    ensureActivated()
+    const profile = getActiveProfile()
+    if (!profile) return { stored: false, cacheKey: '', stats: await getSourceCleanCacheStats() }
+    return storeSourceCleanCache(payload.input, profile.model, payload.text)
+  }
+)
+ipcMain.handle('report-result-cache:stats', () => getReportResultCacheStats())
+ipcMain.handle('report-result-cache:clear', () => clearReportResultCache())
+ipcMain.handle('report-result-cache:lookup', async (_event, input: ReportResultCacheInput) => {
+  ensureActivated()
+  const profile = getActiveProfile()
+  if (!profile) return { hit: false, cacheKey: '', stats: await getReportResultCacheStats() }
+  return lookupReportResultCache(input, profile.model)
+})
+ipcMain.handle(
+  'report-result-cache:store',
+  async (_event, payload: { input: ReportResultCacheInput; snapshot: ReportResultCacheSnapshot }) => {
+    ensureActivated()
+    const profile = getActiveProfile()
+    if (!profile) return { stored: false, cacheKey: '', stats: await getReportResultCacheStats() }
+    return storeReportResultCache(payload.input, profile.model, payload.snapshot)
+  }
+)
+ipcMain.handle('cost-optimization:record', (_event, event: CostOptimizationEvent) => {
+  ensureActivated()
+  return appendCostOptimizationEvent(event)
+})
 ipcMain.handle('app:version', () => app.getVersion())
-ipcMain.handle('activation:status', () => getActivationStatus())
-ipcMain.handle('activation:activate', (_e, code: string) => activateWithCode(code))
+ipcMain.handle('activation:refresh', async () => {
+  const status = await refreshActivationStatusThrottled()
+  if (!status.activated) clearAiProxySession()
+  await broadcastAuthorization(status)
+  return status
+})
+async function runActivationOperation(operation: () => Promise<ActivationResult>): Promise<ActivationResult> {
+  return activationOperationGate.run(async () => {
+    const result = await operation()
+    if (result.ok) {
+      clearAiProxySession()
+      lastActivationRefreshStartedAt = Date.now()
+    }
+    if (!result.status.activated) clearAiProxySession()
+    await broadcastAuthorization(result.status)
+    return result
+  }, () => ({
+    ok: false,
+    message: '正在处理上一次激活，请稍候。',
+    status: getActivationStatus()
+  }))
+}
+async function getActivationStatusWithSavedCodeRecovery(): Promise<ActivationStatus> {
+  const status = getActivationStatus()
+  if (status.activated || !status.activationCodeAvailable) return status
+  const recoveryKey = `${status.deviceId}:${status.maskedActivationCode || 'saved'}`
+  if (automaticSavedCodeRecoveryKey === recoveryKey) return status
+  automaticSavedCodeRecoveryKey = recoveryKey
+  const result = await runActivationOperation(() => revalidateSavedActivationCode())
+  return result.status
+}
+ipcMain.handle('activation:status', () => getActivationStatusWithSavedCodeRecovery())
+ipcMain.handle('activation:activate', async (_e, code: unknown) => {
+  if (typeof code !== 'string' || code.length > 512) {
+    return { ok: false, message: '激活码格式不正确。', status: getActivationStatus() }
+  }
+  return runActivationOperation(() => activateWithCode(code))
+})
+ipcMain.handle('activation:revalidate-saved', async () => {
+  return runActivationOperation(() => revalidateSavedActivationCode())
+})
+ipcMain.handle('activation:diagnostics:copy', () => {
+  const diagnostic = buildActivationDiagnostic(
+    getActivationStatus(),
+    app.getVersion(),
+    `${process.platform}-${process.arch}`
+  )
+  clipboard.writeText(diagnostic)
+  return { ok: true, message: '设备诊断信息已复制，可直接发给管理员。' }
+})
+/*
+ * Code reveal/copy remains deliberately separate from diagnostics. The full
+ * activation code only crosses IPC after an explicit user reveal action.
+ */
+ipcMain.handle('activation:code:reveal', () => revealCurrentActivationCode())
+ipcMain.handle('activation:code:copy', () => {
+  const result = revealCurrentActivationCode()
+  if (!result.ok || !result.activationCode) return { ok: false, message: result.message }
+  clipboard.writeText(result.activationCode)
+  return { ok: true, message: '激活码已复制到剪贴板。', maskedCode: result.maskedCode }
+})
+ipcMain.handle('activation:deactivate', async () => {
+  const before = await fetchProxyWallet().catch(() => undefined)
+  const result = await deactivateCurrentDevice()
+  let wallet = before
+  if (result.ok && result.unbindId) {
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
+    wallet = undefined
+  }
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) {
+      window.webContents.send('activation:changed', result.status)
+      if (wallet) window.webContents.send('points:changed', wallet)
+    }
+  }
+  return result
+})
+ipcMain.handle('points:get', async () => {
+  ensureActivated()
+  return fetchProxyWallet()
+})
+ipcMain.handle('points:canStartReport', async () => {
+  const access = canStartLicensedAnalysis()
+  const wallet = await fetchProxyWallet()
+  return { ok: access.ok, message: access.message, wallet }
+})
+ipcMain.handle('points:reportCharge', async (_e, reportSessionId: string) => {
+  const wallet = await fetchProxyWallet()
+  const chargedPoints = wallet.ledger
+    .filter((entry) => entry.reportSessionId === reportSessionId && entry.pointsDelta < 0)
+    .reduce((sum, entry) => sum + Math.abs(entry.pointsDelta), 0)
+  return { chargedPoints }
+})
+ipcMain.handle('points:redeem', async (_e, code: string) => {
+  const before = await fetchProxyWallet()
+  const merged = await redeemPointsWithCode(code)
+  if (merged.ok) {
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
+  }
+  const wallet = merged.ok ? await fetchProxyWallet() : before
+  if (merged.ok) await broadcastAuthorization(merged.status)
+  return {
+    ok: merged.ok,
+    message: merged.message,
+    activation: merged.status,
+    addedPoints: merged.addedPoints,
+    wallet
+  }
+})
+
+// ---- IPC：自动更新 ----
+ipcMain.handle('update:check', () => {
+  ensureActivated()
+  return checkForUpdates()
+})
+ipcMain.handle('update:download', (event) => {
+  ensureActivated()
+  return downloadUpdate((progress) => {
+    if (!event.sender.isDestroyed()) event.sender.send('update:progress', progress)
+  })
+})
+ipcMain.handle('update:install', () => {
+  ensureActivated()
+  return installDownloadedUpdate()
+})
 
 // ---- IPC：项目快照（不包含模型配置 / API Key）----
 ipcMain.handle('project:loadLast', () => {
@@ -243,6 +520,10 @@ ipcMain.handle('project:saveLast', (_e, project: SavedProject) => {
   ensureActivated()
   latestProjectSnapshot = project
   return saveLastProject(project)
+})
+ipcMain.handle('project:preflight', (_e, project: SavedProject) => {
+  ensureActivated()
+  return preflightProjectStorage(project)
 })
 ipcMain.on('project:cacheSnapshot', (_e, project: SavedProject) => {
   if (getActivationStatus().activated) latestProjectSnapshot = project
@@ -259,10 +540,22 @@ ipcMain.handle('project:loadPrevious', () => {
 // ---- IPC：测试模型 ----
 ipcMain.handle('model:test', (_e, opts: TestModelOptions) => {
   ensureActivated()
+  const managed = getManagedModelState()
+  if (managed.enabled) {
+    if (!managed.profile) return { ok: false, message: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    if (managed.mode === 'proxy') return testProxyHealth()
+    return testModel({ ...opts, profile: managed.profile })
+  }
   return testModel(opts)
 })
 ipcMain.handle('model:list', (_e, profile: Parameters<typeof listModels>[0]) => {
   ensureActivated()
+  const managed = getManagedModelState()
+  if (managed.enabled) {
+    if (!managed.profile) return { ok: false, error: managed.info?.error || '内置模型服务配置不可用，请联系软件管理员。' }
+    if (managed.mode === 'proxy') return { ok: true, models: managed.profiles.map((item) => item.model) }
+    return listModels(managed.profile)
+  }
   return listModels(profile)
 })
 
@@ -294,53 +587,280 @@ ipcMain.handle('sop:rules', () => {
 })
 
 // ---- IPC：导出报告 ----
-ipcMain.handle('export:markdown', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:markdown', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportMarkdown(p.content, p.name)
+  return rememberExportPath(await exportMarkdown(p.content, p.name))
 })
-ipcMain.handle('export:docx', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:docx', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportDocx(p.content, p.name)
+  return rememberExportPath(await exportDocx(p.content, p.name))
 })
-ipcMain.handle('export:html', (_e, p: { content: string; name: string }) => {
+ipcMain.handle('export:html', async (_e, p: { content: string; name: string }) => {
   ensureActivated()
-  return exportHtml(p.content, p.name)
+  return rememberExportPath(await exportHtml(p.content, p.name))
 })
 
 // ---- IPC：流式聊天 ----
-const inflight = new Map<string, AbortController>()
+const chatRequests = new ChatRequestRegistry(4)
 
 ipcMain.on(
   'chat:start',
-  async (event, payload: { id: string; messages: ChatMessage[] }) => {
-    const { id, messages } = payload
-    const channel = `chat:event:${id}`
-    if (!getActivationStatus().activated) {
-      event.sender.send(channel, { type: 'error', message: '软件未激活，请先输入激活码。' })
+  async (event, payload: unknown) => {
+    const rawId = payload && typeof payload === 'object' && typeof (payload as { id?: unknown }).id === 'string'
+      ? (payload as { id: string }).id
+      : ''
+    let validated: ReturnType<typeof validateChatStartPayload>
+    try {
+      validated = validateChatStartPayload(payload)
+    } catch (error) {
+      if (/^[0-9a-f-]{36}$/i.test(rawId) && !event.sender.isDestroyed()) {
+        event.sender.send(`chat:event:${rawId}`, {
+          type: 'error',
+          message: error instanceof Error ? error.message : '模型请求格式无效，请重新开始本次分析。',
+          usage: {
+            source: 'missing', inputTokens: 0, outputTokens: 0, reasoningTokens: 0,
+            cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: ''
+          }
+        })
+      }
       return
     }
-    const profile = getActiveProfile()
-    if (!profile) {
-      event.sender.send(channel, { type: 'error', message: '未配置模型，请先在设置里添加模型配置。' })
+    const { id, messages } = validated
+    const channel = `chat:event:${id}`
+    const emptyUsage = (model = ''): ModelTokenUsage => ({
+      source: 'missing',
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      totalTokens: 0,
+      model
+    })
+    if (!getActivationStatus().activated) {
+      event.sender.send(channel, {
+        type: 'error',
+        message: '软件未激活，请先输入激活码。',
+        usage: emptyUsage()
+      })
+      return
+    }
+    let profiles = getActiveProfiles()
+    const managedState = getManagedModelState()
+    const primaryProfile = profiles[0]
+    if (!primaryProfile) {
+      const managed = getManagedModelState()
+      event.sender.send(channel, {
+        type: 'error',
+        message: managed.enabled
+          ? managed.info?.error || '内置模型服务暂不可用，请联系软件管理员。'
+          : '未配置模型，请先在设置里添加模型配置。',
+        usage: emptyUsage()
+      })
+      return
+    }
+    const context = sanitizeModelTaskContext(validated.context)
+    if (!context) {
+      event.sender.send(channel, {
+        type: 'error',
+        message: '模型任务标识无效，请重新开始本次分析。',
+        usage: emptyUsage(primaryProfile.model)
+      })
       return
     }
     const controller = new AbortController()
-    inflight.set(id, controller)
-    await chatStream(
-      profile,
-      messages,
-      (ev) => {
-        if (!event.sender.isDestroyed()) event.sender.send(channel, ev)
-      },
-      controller.signal
+    try {
+      chatRequests.claim(id, event.sender.id, controller)
+    } catch (error) {
+      event.sender.send(channel, {
+        type: 'error',
+        message: error instanceof Error ? error.message : '模型任务暂时无法开始。',
+        usage: emptyUsage(primaryProfile.model)
+      })
+      return
+    }
+    const initialEstimate = estimateRequestTokens(messages)
+    const proxyEndpointFailure = (message: string): boolean => (
+      !/provider_route_unavailable|model[_ -]?(not[_ -]?found|unavailable)|unknown model|模型不存在|模型不可用/i.test(message) &&
+      /业务服务器|会话|积分|HTTP\s+(401|402|403|404|409|429|5\d\d)\b|fetch failed|ECONN|ENOTFOUND|network|网络|timeout|超时/i.test(message)
     )
-    inflight.delete(id)
+    try {
+      if (managedState.mode === 'proxy') {
+        try {
+          const access = canStartLicensedAnalysis()
+          if (!access.ok) {
+            event.sender.send(channel, { type: 'error', message: access.message, usage: emptyUsage() })
+            return
+          }
+          profiles = await authorizeProxyProfiles(profiles)
+        } catch (error) {
+          event.sender.send(channel, {
+            type: 'error',
+            message: error instanceof Error ? error.message : '业务服务器暂时不可用，请稍后重试。',
+            usage: emptyUsage()
+          })
+          return
+        }
+      }
+      const sequence = await runModelFallbackSequence(profiles, async (profile, profileIndex) => {
+        const attemptRequestId = profileIndex === 0 ? id : `${id}:fallback:${profileIndex}`
+        const startedAt = new Date().toISOString()
+        const startedRecord: TokenUsageRecord = {
+          schemaVersion: 1,
+          eventType: 'started',
+          requestId: attemptRequestId,
+          ...context,
+          attempt: Math.min(20, context.attempt + profileIndex),
+          model: profile.model.slice(0, 200),
+          status: 'started',
+          startedAt,
+          endedAt: startedAt,
+          durationMs: 0,
+          outputChars: 0,
+          usageSource: 'missing',
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          totalTokens: 0,
+          estimatedInputTokens: initialEstimate.inputTokens,
+          estimatedOutputTokens: 0,
+          estimatedTotalTokens: initialEstimate.totalTokens
+        }
+        await appendTokenUsageRecord(startedRecord).catch((error) => {
+          console.error('Unable to append token usage start record:', error)
+        })
+
+        let terminal: Extract<ChatStreamEvent, { type: 'done' | 'error' }> | undefined
+        let usage = emptyUsage(profile.model)
+        let outputChars = 0
+        let hasVisibleOutput = false
+        try {
+          await chatStream(
+            profile,
+            messages,
+            (ev) => {
+              if (ev.type === 'chunk') {
+                outputChars += ev.delta.length
+                if (ev.delta.trim()) hasVisibleOutput = true
+              }
+              else if (ev.type === 'usage') usage = ev.usage
+              else {
+                terminal = ev
+                usage = ev.usage
+                if (ev.type === 'done') outputChars = ev.full.length
+              }
+              if (ev.type !== 'done' && ev.type !== 'error' && !event.sender.isDestroyed()) {
+                event.sender.send(channel, ev)
+              }
+            },
+            controller.signal,
+            {
+              ...(profileIndex === 0 && (context.taskType === 'source_clean' || context.taskType === 'summary')
+                ? { reasoningEffort: 'low' as const }
+                : {}),
+              ...(managedState.mode === 'proxy'
+                ? {
+                    requestHeaders: {
+                      'x-request-id': attemptRequestId,
+                      'x-billing-request-id': context.billingRequestId,
+                      'x-report-session-id': context.reportSessionId,
+                      'x-task-key': context.taskKey,
+                      'x-task-type': context.taskType,
+                      'x-task-attempt': String(Math.min(20, context.attempt + profileIndex))
+                    }
+                  }
+                : {}),
+              promptCacheKey: context.taskType === 'source_clean'
+                ? `source-clean:${context.sourceId || context.taskKey}`
+                : context.taskType === 'analysis_step'
+                  ? `analysis:${context.reportSessionId}:evidence-digest-v1`
+                  : `${context.taskType}:${context.reportSessionId}`
+            }
+          )
+        } catch (error) {
+          terminal = {
+            type: 'error',
+            message: error instanceof Error ? error.message : '模型请求异常结束。',
+            usage
+          }
+        }
+        if (!terminal) {
+          terminal = {
+            type: 'error',
+            message: '模型请求已结束，但没有返回可用结果。',
+            usage
+          }
+        }
+
+        const endedAt = new Date().toISOString()
+        const status = controller.signal.aborted
+          ? 'aborted'
+          : terminal.type === 'done'
+            ? 'success'
+            : 'error'
+        const message = terminal.type === 'error' ? terminal.message : ''
+        const failureKind = managedState.mode === 'proxy' && proxyEndpointFailure(message)
+          ? 'proxy_unavailable'
+          : classifyModelFailure(message, status)
+        const estimate = estimateRequestTokens(messages, outputChars)
+        const finalRecord: TokenUsageRecord = {
+          schemaVersion: 1,
+          eventType: 'final',
+          requestId: attemptRequestId,
+          ...context,
+          attempt: Math.min(20, context.attempt + profileIndex),
+          model: usage.model || profile.model.slice(0, 200),
+          status,
+          failureKind,
+          startedAt,
+          endedAt,
+          durationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)),
+          outputChars,
+          usageSource: usage.source,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedInputTokens: usage.cachedInputTokens,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens,
+          totalTokens: usage.totalTokens,
+          ...(usage.source === 'missing'
+            ? {
+                estimatedInputTokens: estimate.inputTokens,
+                estimatedOutputTokens: estimate.outputTokens,
+                estimatedTotalTokens: estimate.totalTokens
+              }
+            : {})
+        }
+        await appendTokenUsageRecord(finalRecord).catch((error) => {
+          console.error('Unable to append token usage final record:', error)
+        })
+        let wallet
+        if (managedState.mode === 'proxy' && terminal.type === 'done') {
+          wallet = await fetchProxyWallet().catch(() => undefined)
+        }
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed() && wallet) window.webContents.send('points:changed', wallet)
+        }
+
+        return {
+          terminal,
+          failureKind,
+          outputChars,
+          hasVisibleOutput,
+          aborted: controller.signal.aborted
+        }
+      })
+      if (!event.sender.isDestroyed()) event.sender.send(channel, sequence.outcome.terminal)
+    } finally {
+      chatRequests.release(id, event.sender.id, controller)
+    }
   }
 )
 
-ipcMain.on('chat:abort', (_e, id: string) => {
-  inflight.get(id)?.abort()
-  inflight.delete(id)
+ipcMain.on('chat:abort', (event, id: string) => {
+  if (typeof id === 'string') chatRequests.abort(id, event.sender.id)
 })
 
 // 应用菜单：提供标准编辑角色，让复制/剪切/粘贴/全选快捷键生效
@@ -349,7 +869,7 @@ function setupMenu(): void {
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac ? [{ role: 'appMenu' as const }] : []),
     { role: 'editMenu' },
-    { role: 'viewMenu' },
+    ...(!app.isPackaged ? [{ role: 'viewMenu' as const }] : []),
     { role: 'windowMenu' }
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
@@ -363,9 +883,13 @@ if (hasSingleInstanceLock) {
     mainWindow.focus()
   })
 
-  app.whenReady().then(() => {
+  void app.whenReady().then(() => {
     setupMenu()
     createWindow()
+    const blobPruneTimer = setTimeout(() => {
+      void pruneOrphanBlobs().catch(() => undefined)
+    }, 30_000)
+    blobPruneTimer.unref()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
@@ -376,6 +900,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('will-quit', () => {
+app.on('before-quit', () => {
+  armHardExitWatchdog()
+  chatRequests.abortAll()
   disposeParseService()
 })

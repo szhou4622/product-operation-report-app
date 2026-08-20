@@ -70,7 +70,6 @@ function stripInline(s: string): string {
     .trim()
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 async function markdownToDocxBuffer(md: string): Promise<Buffer> {
   const { marked } = await import('marked')
   const docx: any = await import('docx')

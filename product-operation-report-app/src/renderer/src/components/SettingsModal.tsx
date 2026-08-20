@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AppSettings, ModelProfile, TestModelResult } from '../../../shared/types'
+import type {
+  ActivationStatus,
+  AppSettings,
+  ModelProfile,
+  PointsWalletStatus,
+  ReportResultCacheStats,
+  SourceCleanCacheStats,
+  TestModelResult
+} from '../../../shared/types'
 import { useStore } from '../store'
 
 const DEFAULT_PROFILE_NAME = 'ai英雄会'
@@ -27,6 +35,18 @@ function openExternalLink(url: string): void {
     return
   }
   window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB'
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
+function formatPoints(value: number): string {
+  return Number.isInteger(value)
+    ? value.toLocaleString('zh-CN')
+    : value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
 }
 
 function normalizeSettings(settings: AppSettings): AppSettings {
@@ -66,6 +86,14 @@ export default function SettingsModal(): JSX.Element | null {
   const settings = useStore((s) => s.settings)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const saveSettings = useStore((s) => s.saveSettings)
+  const phase = useStore((s) => s.phase)
+  // 开发版热更新时主进程/预加载可能短暂仍是旧版本；所有新增缓存接口都必须可选，不能让设置页白屏。
+  const cacheApi = window.api as unknown as {
+    getSourceCleanCacheStats?: () => Promise<SourceCleanCacheStats>
+    clearSourceCleanCache?: () => Promise<SourceCleanCacheStats>
+    getReportResultCacheStats?: () => Promise<ReportResultCacheStats>
+    clearReportResultCache?: () => Promise<ReportResultCacheStats>
+  }
 
   // 本地草稿，确认后再写回
   const [draft, setDraft] = useState<AppSettings>(() => createDraftSettings(settings))
@@ -77,6 +105,20 @@ export default function SettingsModal(): JSX.Element | null {
   const [result, setResult] = useState<TestModelResult | null>(null)
   const [models, setModels] = useState<string[]>([])
   const [modelsMsg, setModelsMsg] = useState('')
+  const [cacheStats, setCacheStats] = useState<SourceCleanCacheStats | null>(null)
+  const [cacheBusy, setCacheBusy] = useState(false)
+  const [cacheMessage, setCacheMessage] = useState('')
+  const [reportCacheStats, setReportCacheStats] = useState<ReportResultCacheStats | null>(null)
+  const [reportCacheBusy, setReportCacheBusy] = useState(false)
+  const [reportCacheMessage, setReportCacheMessage] = useState('')
+  const [cachePanelOpen, setCachePanelOpen] = useState(false)
+  const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null)
+  const [pointsWallet, setPointsWallet] = useState<PointsWalletStatus | null>(null)
+  const [deactivationConfirmOpen, setDeactivationConfirmOpen] = useState(false)
+  const [deactivationBusy, setDeactivationBusy] = useState(false)
+  const [deactivationError, setDeactivationError] = useState('')
+  const [revealedActivationCode, setRevealedActivationCode] = useState('')
+  const [activationCodeNotice, setActivationCodeNotice] = useState('')
   const imgRef = useRef<HTMLInputElement>(null)
   const testRequestSeq = useRef(0)
   const modelsRequestSeq = useRef(0)
@@ -91,10 +133,12 @@ export default function SettingsModal(): JSX.Element | null {
   const hasConnectionResult = Boolean(result?.ok)
   const canTestVision = hasApiKey && Boolean(selected?.supportsVision)
   const hasUnsavedChanges = Boolean(baselineRef.current && JSON.stringify(draft) !== baselineRef.current)
+  const analysisBusy = phase === 'cleaning' || phase === 'analyzing'
 
   const requestClose = useCallback((): void => {
     if (saving) return
     if (hasUnsavedChanges && !window.confirm('设置还没有保存。\n\n要放弃刚才的修改吗？')) return
+    setRevealedActivationCode('')
     setSettingsOpen(false)
   }, [hasUnsavedChanges, saving, setSettingsOpen])
 
@@ -112,7 +156,31 @@ export default function SettingsModal(): JSX.Element | null {
     setModels([])
     setModelsMsg('')
     setActionError('')
+    setCachePanelOpen(false)
+    setCacheMessage('')
+    setReportCacheMessage('')
   }, [open, settings])
+
+  useEffect(() => {
+    if (!open || !settings?.managedModel?.enabled) return
+    let alive = true
+    setDeactivationConfirmOpen(false)
+    setDeactivationError('')
+    setRevealedActivationCode('')
+    setActivationCodeNotice('')
+    void Promise.all([window.api.getActivationStatus(), window.api.getPointsWallet()])
+      .then(([activation, wallet]) => {
+        if (!alive) return
+        setActivationStatus(activation)
+        setPointsWallet(wallet)
+      })
+      .catch(() => {
+        if (alive) setDeactivationError('设备授权状态暂时无法读取，请关闭窗口后重试。')
+      })
+    return () => {
+      alive = false
+    }
+  }, [open, settings?.managedModel?.enabled])
 
   useEffect(() => {
     testRequestSeq.current++
@@ -124,6 +192,33 @@ export default function SettingsModal(): JSX.Element | null {
     setModelsMsg('')
   }, [selectedId, selected?.apiKey, selected?.baseURL, selected?.model, selected?.supportsVision])
 
+  const loadCacheStats = async (): Promise<void> => {
+    const tasks: Promise<unknown>[] = []
+    if (typeof cacheApi.getSourceCleanCacheStats === 'function') {
+      tasks.push(
+        cacheApi.getSourceCleanCacheStats().then(setCacheStats).catch(() => {
+          setCacheStats(null)
+          setCacheMessage('清洗缓存暂时无法读取，不影响正常生成报告。')
+        })
+      )
+    } else {
+      setCacheStats(null)
+      setCacheMessage('缓存服务尚未加载，请关闭并重新打开软件。')
+    }
+    if (typeof cacheApi.getReportResultCacheStats === 'function') {
+      tasks.push(
+        cacheApi.getReportResultCacheStats().then(setReportCacheStats).catch(() => {
+          setReportCacheStats(null)
+          setReportCacheMessage('报告缓存暂时无法读取，不影响正常生成报告。')
+        })
+      )
+    } else {
+      setReportCacheStats(null)
+      setReportCacheMessage('缓存服务尚未加载，请关闭并重新打开软件。')
+    }
+    await Promise.all(tasks)
+  }
+
   // Esc 关闭弹窗
   useEffect(() => {
     if (!open) return
@@ -134,7 +229,261 @@ export default function SettingsModal(): JSX.Element | null {
     return () => window.removeEventListener('keydown', onKey)
   }, [open, requestClose])
 
+  const clearCleaningCache = async (): Promise<void> => {
+    if (cacheBusy || !window.confirm('确定清理本机文件清洗缓存吗？\n\n不会删除报告或原始文件；下次使用相同资料时需要重新处理。')) return
+    if (typeof cacheApi.clearSourceCleanCache !== 'function') {
+      setCacheMessage('缓存服务尚未加载，请关闭并重新打开软件。')
+      return
+    }
+    setCacheBusy(true)
+    setCacheMessage('')
+    try {
+      setCacheStats(await cacheApi.clearSourceCleanCache())
+      setCacheMessage('清洗缓存已清理。')
+    } catch (error) {
+      setCacheMessage(friendlySettingsError(error, '清理缓存失败，请重启软件后重试。'))
+    } finally {
+      setCacheBusy(false)
+    }
+  }
+
+  const clearReportCache = async (): Promise<void> => {
+    if (reportCacheBusy || !window.confirm('确定清理完整报告复用缓存吗？\n\n不会删除历史项目、导出报告或原始文件；以后相同资料需要重新生成。')) return
+    if (typeof cacheApi.clearReportResultCache !== 'function') {
+      setReportCacheMessage('缓存服务尚未加载，请关闭并重新打开软件。')
+      return
+    }
+    setReportCacheBusy(true)
+    setReportCacheMessage('')
+    try {
+      setReportCacheStats(await cacheApi.clearReportResultCache())
+      setReportCacheMessage('完整报告缓存已清理。')
+    } catch (error) {
+      setReportCacheMessage(friendlySettingsError(error, '清理完整报告缓存失败，请重启软件后重试。'))
+    } finally {
+      setReportCacheBusy(false)
+    }
+  }
+
+  const submitDeactivation = async (): Promise<void> => {
+    if (deactivationBusy || analysisBusy) return
+    setDeactivationBusy(true)
+    setDeactivationError('')
+    try {
+      const result = await window.api.deactivateCurrentDevice()
+      if (!result.ok) {
+        setDeactivationError(result.message)
+        return
+      }
+      setSettingsOpen(false)
+    } catch (error) {
+      setDeactivationError(friendlySettingsError(error, '解除绑定失败，本机仍保持激活，请稍后重试。'))
+    } finally {
+      setDeactivationBusy(false)
+    }
+  }
+
+  const copyCurrentActivationCode = async (): Promise<void> => {
+    try {
+      const result = await window.api.copyActivationCode()
+      if (!result.ok) {
+        setActivationCodeNotice(result.message)
+        return
+      }
+      setActivationCodeNotice('已复制')
+    } catch {
+      setActivationCodeNotice('复制失败，请点击“显示”后手动记录。')
+    }
+  }
+
+  const toggleCurrentActivationCode = async (): Promise<void> => {
+    if (revealedActivationCode) {
+      setRevealedActivationCode('')
+      return
+    }
+    try {
+      const result = await window.api.revealActivationCode()
+      if (!result.ok || !result.activationCode) {
+        setActivationCodeNotice(result.message)
+        return
+      }
+      setRevealedActivationCode(result.activationCode)
+      setActivationCodeNotice('完整激活码仅在当前窗口临时显示。')
+    } catch {
+      setActivationCodeNotice('读取激活码失败，请稍后重试。')
+    }
+  }
+
   if (!open) return null
+
+  const cachePanel = (
+    <details
+      className="cache-management"
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open
+        setCachePanelOpen(nextOpen)
+        if (nextOpen) void loadCacheStats()
+      }}
+    >
+      <summary>本机缓存管理（一般不用）</summary>
+      {cachePanelOpen && <div className="cache-card-stack">
+      <div className="clean-cache-card">
+        <div>
+          <span>本机清洗缓存</span>
+          <b>{cacheStats ? `${cacheStats.entryCount} 份 · 命中 ${cacheStats.totalHits} 次 · ${formatBytes(cacheStats.totalBytes)}` : '正在读取…'}</b>
+          <em>相同文件30天内自动复用，可减少重复等待。</em>
+          {cacheMessage && <small>{cacheMessage}</small>}
+        </div>
+        <button className="btn" type="button" disabled={cacheBusy || !cacheStats?.entryCount} onClick={() => void clearCleaningCache()}>
+          {cacheBusy ? '清理中…' : '清理缓存'}
+        </button>
+      </div>
+      <div className="clean-cache-card report-cache-card">
+        <div>
+          <span>完整报告复用</span>
+          <b>{reportCacheStats ? `${reportCacheStats.entryCount} 份 · 命中 ${reportCacheStats.totalHits} 次 · ${formatBytes(reportCacheStats.totalBytes)}` : '正在读取…'}</b>
+          <em>完全相同的资料和要求，30天内可选择直接恢复上次结果。</em>
+          {reportCacheMessage && <small>{reportCacheMessage}</small>}
+        </div>
+        <button className="btn" type="button" disabled={reportCacheBusy || !reportCacheStats?.entryCount} onClick={() => void clearReportCache()}>
+          {reportCacheBusy ? '清理中…' : '清理报告缓存'}
+        </button>
+      </div>
+      </div>}
+    </details>
+  )
+
+  const managed = settings?.managedModel
+  if (managed?.enabled) {
+    return (
+      <div className="modal-mask">
+        <div className="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-head">
+            <h3 id="settings-title">设置 · AI 服务</h3>
+            <button className="btn" disabled={deactivationBusy} onClick={() => setSettingsOpen(false)}>
+              关闭
+            </button>
+          </div>
+          <div className="modal-body">
+            <div className="settings-guide">
+              <div className="settings-guide-main">
+                <span className="settings-guide-kicker">无需填写 API Key</span>
+                <b>{managed.configured ? 'AI 服务已就绪' : 'AI 服务需要维护'}</b>
+                <span>
+                  {managed.configured
+                    ? '服务和授权已由软件配置完成，直接上传资料并开始生成报告即可。'
+                    : managed.error || 'AI 服务暂不可用，请联系软件管理员。'}
+                </span>
+              </div>
+            </div>
+            <div className={`test-result ${managed.configured ? 'ok' : 'err'}`} role="status">
+              {managed.configured ? '✓ 服务配置正常' : '✗ 服务配置异常'}
+              {'\n'}
+              {managed.configured
+                ? `支持文字资料分析${managed.supportsVision ? '和图片识别' : ''}`
+                : '用户无需自行修改设置，请把此提示反馈给软件管理员。'}
+            </div>
+            <section className="service-device-transfer" aria-labelledby="service-device-title">
+              <div className="service-device-heading">
+                <div>
+                  <span>设备授权</span>
+                  <b id="service-device-title">当前电脑已激活</b>
+                  <small>只有准备换到另一台电脑使用时，才需要解除本机绑定。</small>
+                </div>
+                <div className="service-device-actions">
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={analysisBusy || deactivationBusy || activationStatus?.activated === false}
+                  title={analysisBusy ? '请先等待当前分析完成或停止' : '解除当前电脑绑定'}
+                  onClick={() => {
+                    setDeactivationError('')
+                    setDeactivationConfirmOpen(true)
+                  }}
+                >
+                  更换电脑
+                </button>
+                </div>
+              </div>
+              <div className="service-license-code">
+                <div>
+                  <span>当前软件激活码</span>
+                  <code>
+                    {activationStatus?.activationCodeAvailable
+                      ? revealedActivationCode
+                        ? revealedActivationCode
+                        : activationStatus.maskedActivationCode || '••••••••'
+                      : '旧版本地授权未保存原码'}
+                  </code>
+                  <small>积分充值码只增加余额，不会替换这里的激活码。</small>
+                </div>
+                {activationStatus?.activationCodeAvailable && (
+                  <div className="service-license-actions">
+                    <button className="btn" type="button" onClick={() => void toggleCurrentActivationCode()}>
+                      {revealedActivationCode ? '隐藏' : '显示激活码'}
+                    </button>
+                    <button className="btn" type="button" onClick={() => void copyCurrentActivationCode()}>
+                      复制
+                    </button>
+                  </div>
+                )}
+                {activationCodeNotice && <em>{activationCodeNotice}</em>}
+              </div>
+              {deactivationConfirmOpen && (
+                <div className="service-transfer-confirm" role="group" aria-label="确认解除本机绑定">
+                  <strong>确认解除这台电脑的绑定？</strong>
+                  <p>
+                    {activationStatus?.source === 'legacy'
+                      ? '当前是旧版本地授权，没有建立云端设备绑定。解除后历史报告仍保留；新电脑通过服务器输入激活码后即可使用，积分以服务器记录为准。'
+                      : `解除后软件会回到激活页面。历史报告仍保留；在新电脑输入同一个激活码即可继续使用。${
+                          activationStatus?.unlimited
+                            ? ' 当前为无限使用授权，重新绑定后仍由服务器恢复无限授权。'
+                            : pointsWallet
+                            ? ` 当前剩余 ${formatPoints(pointsWallet.balancePoints)} 积分由服务器保留，重新绑定后自动恢复。`
+                            : ''
+                        }`}
+                  </p>
+                  {deactivationError && <div className="privacy-error">{deactivationError}</div>}
+                  <div className="service-transfer-actions">
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={deactivationBusy}
+                      onClick={() => {
+                        setDeactivationConfirmOpen(false)
+                        setDeactivationError('')
+                      }}
+                    >
+                      取消
+                    </button>
+                    <button
+                      className="btn danger"
+                      type="button"
+                      disabled={deactivationBusy || analysisBusy}
+                      onClick={() => void submitDeactivation()}
+                    >
+                      {deactivationBusy ? '正在安全解绑…' : '确认解除绑定'}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {!deactivationConfirmOpen && deactivationError && (
+                <div className="privacy-error">{deactivationError}</div>
+              )}
+            </section>
+            {cachePanel}
+            <div className="hint">为避免误操作，模型地址、模型名称和授权信息不会显示在用户界面中。</div>
+          </div>
+          <div className="modal-foot">
+            <div />
+            <button className="btn primary" disabled={deactivationBusy} onClick={() => setSettingsOpen(false)}>
+              我知道了
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   const patch = (p: Partial<ModelProfile>): void => {
     setDraft((d) => ({
@@ -310,6 +659,8 @@ export default function SettingsModal(): JSX.Element | null {
               打开配置教程
             </a>
           </div>
+
+          {cachePanel}
 
           <div className="settings-steps" aria-label="模型配置步骤">
             <div className={`settings-step ${hasApiKey ? 'done' : 'active'}`}>

@@ -1,5 +1,5 @@
 import { SOP_STEPS } from '../../../shared/types'
-import { useStore } from '../store'
+import { derivedSourceCount, topLevelSourceCount, useStore } from '../store'
 
 const MACROS = [
   { title: '上传资料', desc: '产品手卡、自有数据、竞品数据' },
@@ -48,8 +48,10 @@ export default function PhaseTracker(): JSX.Element {
   const reportMarkdown = useStore((s) => s.reportMarkdown)
   const artifacts = useStore((s) => s.artifacts)
   const ai = activeIndex(phase)
-  const parsedCount = sources.filter((s) => s.dataUrl || s.text).length
-  const competitorCount = sources.filter((s) => /竞品数据|竞品|对标|对手/.test(s.attribution ?? '')).length
+  const uploadedFileCount = topLevelSourceCount(sources)
+  const parsedFileCount = topLevelSourceCount(sources.filter((source) => source.dataUrl || source.text))
+  const competitorFileCount = topLevelSourceCount(sources.filter((source) => /竞品数据|竞品|对标|对手/.test(source.attribution ?? '')))
+  const derivedCount = derivedSourceCount(sources)
 
   const analysisTasks = SOP_STEPS.map((step) => ({
     id: step.id,
@@ -128,25 +130,46 @@ export default function PhaseTracker(): JSX.Element {
         </div>
 
         <div className="source-health">
-          <div className="source-health-title">资料状态</div>
+          <div className="source-health-title">
+            <span>资料状态</span>
+            <small>最多上传 50 份资料</small>
+          </div>
           <div className="health-row">
             <span>已上传</span>
-            <b>{sources.length} 份</b>
+            <b>{uploadedFileCount} 份</b>
           </div>
           <div className="health-row">
             <span>可分析</span>
-            <b>{parsedCount} 份</b>
+            <b>{parsedFileCount} 份</b>
           </div>
           <div className="health-row">
             <span>竞品资料</span>
-            <b>{competitorCount} 份</b>
+            <b>{competitorFileCount} 份</b>
           </div>
+          {derivedCount > 0 && (
+            <div className="health-row">
+              <span>已展开证据</span>
+              <b>{derivedCount} 项</b>
+            </div>
+          )}
           {phase === 'cleaning' && (
-            <div className="health-row strong">
-              <span>正在清洗</span>
-              <b>
-                {cleaningProgress.done}/{cleaningProgress.total}
-              </b>
+            <>
+              <div className="health-row strong">
+                <span>正在清洗</span>
+                <b>{cleaningProgress.done}/{cleaningProgress.total}</b>
+              </div>
+              <div className="health-row">
+                <span>预计时间</span>
+                <b>{cleaningProgress.done > 0 && cleaningProgress.startedAt
+                  ? `约 ${Math.max(1, Math.ceil(((Date.now() - cleaningProgress.startedAt) / cleaningProgress.done) * Math.max(0, cleaningProgress.total - cleaningProgress.done) / 60_000))} 分钟`
+                  : '通常需数分钟'}</b>
+              </div>
+            </>
+          )}
+          {phase === 'analyzing' && (
+            <div className="health-row">
+              <span>预计时间</span>
+              <b>大项目约10-20分钟</b>
             </div>
           )}
           {reportMarkdown && (

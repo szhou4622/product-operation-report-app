@@ -1,17 +1,27 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import type { ActivationStatus } from '../../shared/types'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import type { ActivationStatus, PointsWalletStatus, UpdateDownloadProgress, UpdateInfo } from '../../shared/types'
 import { buildProjectSnapshot, useStore } from './store'
 import PhaseTracker from './components/PhaseTracker'
 import ConversationPanel from './components/ConversationPanel'
 import ReportPreview from './components/ReportPreview'
 import SettingsModal from './components/SettingsModal'
+import ReportReuseModal from './components/ReportReuseModal'
+import ContactAuthor from './components/ContactAuthor'
 
 const SOP_GUIDE_URL =
   'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
+const AUTHORIZATION_REFRESH_INTERVAL_MS = 60_000
 
 function friendlyUiError(value: unknown, fallback: string): string {
-  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
+  const raw = (value instanceof Error ? value.message : String(value || ''))
+    .replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, '')
+    .replace(/^Error:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
   if (!raw) return fallback
+  if (/更新配置签名无效|update.*signature|signature.*invalid/i.test(raw)) {
+    return '更新信息暂时无法验证，已为你停止本次更新。当前版本可以继续正常使用，请稍后再试。'
+  }
   if (/ENOSPC|no space|磁盘.*满/i.test(raw)) return '磁盘空间不足，请清理空间后重试。'
   if (/EACCES|EPERM|permission|access denied|权限/i.test(raw)) {
     return '没有写入权限，请关闭占用文件的软件，或换一个可保存的位置后重试。'
@@ -29,6 +39,15 @@ function openExternalLink(url: string): void {
     return
   }
   window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function formatPoints(value: number): string {
+  return Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
+}
+
+function formatLedgerTime(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
 }
 
 function ProductLogo(): JSX.Element {
@@ -60,6 +79,7 @@ export default function App(): JSX.Element {
   const initialized = useStore((s) => s.initialized)
   const persistencePaused = useStore((s) => s.persistencePaused)
   const projectRevision = useStore((s) => s.projectRevision)
+  const analysisSessionId = useStore((s) => s.analysisSessionId)
   const settings = useStore((s) => s.settings)
   const phase = useStore((s) => s.phase)
   const sources = useStore((s) => s.sources)
@@ -67,6 +87,7 @@ export default function App(): JSX.Element {
   const cleanedData = useStore((s) => s.cleanedData)
   const cleanDetails = useStore((s) => s.cleanDetails)
   const artifacts = useStore((s) => s.artifacts)
+  const taskJournal = useStore((s) => s.taskJournal)
   const reportMarkdown = useStore((s) => s.reportMarkdown)
   const reportStale = useStore((s) => s.reportStale)
   const steering = useStore((s) => s.steering)
@@ -76,8 +97,10 @@ export default function App(): JSX.Element {
   const restorePreviousAnalysis = useStore((s) => s.restorePreviousAnalysis)
   const previousProjectAvailable = useStore((s) => s.previousProjectAvailable)
   const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null)
+  const [pointsWallet, setPointsWallet] = useState<PointsWalletStatus | null>(null)
   const [activationCode, setActivationCode] = useState('')
   const [activationError, setActivationError] = useState('')
+  const [activationActionNotice, setActivationActionNotice] = useState('')
   const [activationBusy, setActivationBusy] = useState(false)
   const [privacySaving, setPrivacySaving] = useState(false)
   const [privacyError, setPrivacyError] = useState('')
@@ -88,14 +111,27 @@ export default function App(): JSX.Element {
   const [initError, setInitError] = useState('')
   const [autosaveError, setAutosaveError] = useState('')
   const [appVersion, setAppVersion] = useState('')
+  const [licenseEntryOpen, setLicenseEntryOpen] = useState(false)
+  const [replacementCode, setReplacementCode] = useState('')
+  const [replacementError, setReplacementError] = useState('')
+  const [replacementBusy, setReplacementBusy] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [updateDismissed, setUpdateDismissed] = useState(false)
+  const [updateBusy, setUpdateBusy] = useState<'idle' | 'check' | 'download' | 'install'>('idle')
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null)
+  const [updateError, setUpdateError] = useState('')
+  const [updateCheckNotice, setUpdateCheckNotice] = useState('')
   const autosaveAttempt = useRef(0)
-  const reportForEmergencyCache =
-    phase === 'cleaning' || phase === 'analyzing' ? artifacts[9] || '' : reportMarkdown
-
+  const activationRefreshInFlight = useRef(false)
+  const updateCheckAttempted = useRef(false)
   const checkActivation = async (): Promise<void> => {
     setActivationLoadError('')
     try {
-      setActivationStatus(await window.api.getActivationStatus())
+      const local = await window.api.getActivationStatus()
+      const status = local.source === 'server'
+        ? await window.api.refreshActivationStatus()
+        : local
+      setActivationStatus(status)
     } catch (error) {
       setActivationLoadError(friendlyUiError(error, '读取激活状态失败，请重试。'))
     }
@@ -120,6 +156,65 @@ export default function App(): JSX.Element {
     }
   }, [])
 
+  useEffect(() => window.api.onActivationStatusChanged((status) => {
+    setActivationStatus(status)
+    if (status.activated) {
+      setActivationError('')
+      setActivationActionNotice('')
+    }
+  }), [])
+  useEffect(() => window.api.onPointsWalletChanged(setPointsWallet), [])
+
+  useEffect(() => {
+    // Invalidate a save that started under the previous authorization. A remote
+    // unbind can finish while that save is still awaiting the main process; its
+    // expected "not activated" rejection must not survive a successful rebind.
+    autosaveAttempt.current += 1
+    setAutosaveError('')
+  }, [activationStatus?.activated, activationStatus?.licenseId])
+
+  useEffect(() => {
+    if (activationStatus?.source !== 'server') return
+    let disposed = false
+    const refreshAuthorization = async (): Promise<void> => {
+      if (activationRefreshInFlight.current) return
+      activationRefreshInFlight.current = true
+      try {
+        const status = await window.api.refreshActivationStatus()
+        if (!disposed) setActivationStatus(status)
+      } catch {
+        // The main process retains the last safe status on a network failure.
+        // Focus, visibility and interval events will retry without blocking UI.
+      } finally {
+        activationRefreshInFlight.current = false
+      }
+    }
+    const handleFocus = (): void => {
+      void refreshAuthorization()
+    }
+    const handleVisibilityChange = (): void => {
+      if (!document.hidden) void refreshAuthorization()
+    }
+    void refreshAuthorization()
+    const timer = window.setInterval(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS)
+    window.addEventListener('focus', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId, activationStatus?.bindingStatus])
+
+  useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
+
+  useEffect(() => {
+    if (!updateCheckNotice) return
+    const handle = window.setTimeout(() => setUpdateCheckNotice(''), 5000)
+    return () => window.clearTimeout(handle)
+  }, [updateCheckNotice])
+
   useEffect(() => {
     if (!activationStatus?.activated || initialized) return
     setInitError('')
@@ -129,18 +224,25 @@ export default function App(): JSX.Element {
   }, [activationStatus?.activated, init, initialized])
 
   useEffect(() => {
-    if (!initialized || !settings || persistencePaused) return
+    if (!activationStatus?.activated) return
+    void window.api.getPointsWallet().then(setPointsWallet).catch(() => undefined)
+  }, [activationStatus?.activated, activationStatus?.licenseId])
+
+  useEffect(() => {
+    if (!activationStatus?.activated || !initialized || !settings || persistencePaused) return
     const handle = window.setTimeout(() => {
       const attempt = ++autosaveAttempt.current
       void window.api
         .saveLastProject(
           buildProjectSnapshot({
             projectRevision,
+            analysisSessionId,
             sources,
             messages,
             cleanedData,
             cleanDetails,
             artifacts,
+            taskJournal,
             reportMarkdown,
             reportStale,
             phase,
@@ -155,35 +257,9 @@ export default function App(): JSX.Element {
             setAutosaveError(friendlyUiError(error, '自动保存失败，请检查磁盘空间后重试。'))
           }
         })
-    }, 100)
+    }, 900)
     return () => window.clearTimeout(handle)
-  }, [initialized, persistencePaused, settings, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportMarkdown, reportStale, phase, steering])
-
-  useLayoutEffect(() => {
-    if (!initialized || persistencePaused) return
-    window.api.cacheProjectSnapshot(
-      buildProjectSnapshot({
-        projectRevision,
-        sources,
-        messages,
-        cleanedData,
-        cleanDetails,
-        artifacts,
-        reportMarkdown: reportForEmergencyCache,
-        reportStale,
-        phase,
-        steering
-      })
-    )
-  }, [initialized, persistencePaused, projectRevision, sources, messages, cleanedData, cleanDetails, artifacts, reportForEmergencyCache, reportStale, phase, steering])
-
-  useEffect(() => {
-    if (!initialized) return
-    return window.api.onBeforeClose(async () => {
-      const state = useStore.getState()
-      await window.api.saveLastProject(buildProjectSnapshot(state))
-    })
-  }, [initialized])
+  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, taskJournal, reportMarkdown, reportStale, phase, steering])
 
   useEffect(() => {
     if (newAnalysisState !== 'success' && newAnalysisState !== 'error') return
@@ -196,22 +272,52 @@ export default function App(): JSX.Element {
 
   const active =
     settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
+  const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
 
   const [columns, setColumns] = useState({ left: 240, right: 380 })
   const [windowWidth, setWindowWidth] = useState(() => window.innerWidth || 1280)
-  const activeEndpoint = active?.baseURL.trim().replace(/\/+$/, '') || ''
+  const activeEndpoint = managed?.baseURL.trim().replace(/\/+$/, '') || active?.baseURL.trim().replace(/\/+$/, '') || ''
+  const modelConfigured = Boolean(managed?.configured || active)
   const needsPrivacyConsent = Boolean(
-    settings && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
+    settings && modelConfigured && (!settings.privacyAccepted || settings.privacyEndpoint !== activeEndpoint)
   )
+  const updateVisible = Boolean(updateInfo?.available && !updateDismissed)
+  const licenseLabel = activationStatus?.unlimited || pointsWallet?.unlimited
+    ? '无限使用'
+    : pointsWallet
+      ? pointsWallet.balancePoints < 0
+      ? `欠费 ${formatPoints(Math.abs(pointsWallet.balancePoints))} 积分`
+      : `剩余 ${formatPoints(pointsWallet.balancePoints)} 积分`
+    : '积分加载中'
+
+  useEffect(() => {
+    if (
+      !initialized ||
+      !activationStatus?.activated ||
+      needsPrivacyConsent ||
+      updateCheckAttempted.current
+    ) return
+    updateCheckAttempted.current = true
+    void window.api
+      .checkForUpdates()
+      .then((info) => {
+        if (info.available) {
+          setUpdateInfo(info)
+          setUpdateDismissed(false)
+        }
+      })
+      .catch(() => undefined)
+  }, [activationStatus?.activated, initialized, needsPrivacyConsent])
 
   useEffect(() => {
     const elements = Array.from(document.querySelectorAll<HTMLElement>('.topbar, .panes'))
+    const blocked = needsPrivacyConsent || updateVisible || licenseEntryOpen
     for (const element of elements) {
-      if (needsPrivacyConsent) element.setAttribute('inert', '')
+      if (blocked) element.setAttribute('inert', '')
       else element.removeAttribute('inert')
     }
     return () => elements.forEach((element) => element.removeAttribute('inert'))
-  }, [needsPrivacyConsent])
+  }, [licenseEntryOpen, needsPrivacyConsent, updateVisible])
 
   const analysisBusy = phase === 'cleaning' || phase === 'analyzing'
   const hasAnalysis = Boolean(
@@ -299,6 +405,7 @@ export default function App(): JSX.Element {
     if (activationBusy) return
     setActivationBusy(true)
     setActivationError('')
+    setActivationActionNotice('')
     try {
       const result = await window.api.activate(activationCode)
       if (!result.ok) {
@@ -309,6 +416,118 @@ export default function App(): JSX.Element {
       setActivationError(friendlyUiError(error, '激活失败，请重试。'))
     } finally {
       setActivationBusy(false)
+    }
+  }
+
+  const revalidateSavedActivation = async (): Promise<void> => {
+    if (activationBusy) return
+    setActivationBusy(true)
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const result = await window.api.revalidateSavedActivationCode()
+      setActivationStatus(result.status)
+      if (!result.ok) setActivationError(result.message)
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '重新验证失败，请检查网络后重试。'))
+    } finally {
+      setActivationBusy(false)
+    }
+  }
+
+  const refreshActivationEntry = async (): Promise<void> => {
+    if (activationBusy) return
+    setActivationBusy(true)
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const status = await window.api.refreshActivationStatus()
+      setActivationStatus(status)
+      if (!status.activated) setActivationActionNotice('已重新检测授权状态。')
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '暂时无法检测授权状态，请稍后重试。'))
+    } finally {
+      setActivationBusy(false)
+    }
+  }
+
+  const copyActivationDiagnostics = async (): Promise<void> => {
+    setActivationError('')
+    setActivationActionNotice('')
+    try {
+      const result = await window.api.copyActivationDiagnostics()
+      if (result.ok) setActivationActionNotice(result.message)
+      else setActivationError(result.message)
+    } catch (error) {
+      setActivationError(friendlyUiError(error, '复制诊断信息失败，请重试。'))
+    }
+  }
+
+  const submitReplacementActivation = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault()
+    if (replacementBusy) return
+    if (!window.confirm('确认将这个积分码合并到当前主授权吗？\n\n合并成功后，积分码只能使用一次，当前主激活码不会改变。')) return
+    setReplacementBusy(true)
+    setReplacementError('')
+    try {
+      const result = await window.api.redeemPointsCode(replacementCode)
+      setActivationStatus(result.activation)
+      setPointsWallet(result.wallet)
+      if (result.ok) {
+        setReplacementCode('')
+        setLicenseEntryOpen(false)
+      } else {
+        setReplacementError(result.message)
+      }
+    } catch (error) {
+      setReplacementError(friendlyUiError(error, '充值失败，请检查网络后重试。'))
+    } finally {
+      setReplacementBusy(false)
+    }
+  }
+
+  const handleApplyUpdate = async (): Promise<void> => {
+    if (updateBusy !== 'idle') return
+    setUpdateError('')
+    try {
+      if (!updateInfo?.downloaded) {
+        setUpdateBusy('download')
+        setUpdateProgress({ receivedBytes: 0, percent: 0 })
+        const download = await window.api.downloadUpdate()
+        if (download.info) setUpdateInfo(download.info)
+        if (!download.ok) {
+          setUpdateError(download.message)
+          return
+        }
+      }
+      setUpdateBusy('install')
+      const install = await window.api.installUpdate()
+      if (install.info) setUpdateInfo(install.info)
+      if (!install.ok) setUpdateError(install.message)
+    } catch (error) {
+      setUpdateError(friendlyUiError(error, '更新失败，当前版本仍可继续使用，请稍后重试。'))
+    } finally {
+      setUpdateBusy('idle')
+    }
+  }
+
+  const handleCheckForUpdates = async (): Promise<void> => {
+    if (updateBusy !== 'idle') return
+    setUpdateBusy('check')
+    setUpdateError('')
+    setUpdateCheckNotice('')
+    try {
+      const info = await window.api.checkForUpdates()
+      setUpdateInfo(info)
+      if (info.available) {
+        setUpdateDismissed(false)
+      } else {
+        setUpdateCheckNotice(`当前已经是最新版本 v${info.currentVersion}`)
+      }
+    } catch (error) {
+      setUpdateCheckNotice(friendlyUiError(error, '暂时无法检查更新，请稍后重试。'))
+    } finally {
+      setUpdateBusy('idle')
     }
   }
 
@@ -369,30 +588,64 @@ export default function App(): JSX.Element {
           <div className="activation-logo">
             <ProductLogo />
           </div>
-          <div className="activation-kicker">产品经营报告</div>
-          <h1>首次使用需要激活</h1>
-          <p>请输入管理员发放的激活码。激活成功后，本设备可永久使用。</p>
+          <div className="activation-kicker">产品与内容经营报告系统</div>
+          <h1>{activationStatus.activationCodeAvailable ? '重新验证授权' : '首次使用需要激活'}</h1>
+          <p>
+            {activationStatus.activationCodeAvailable
+              ? '本机已安全保存原激活码，可以直接重新验证；也可以输入管理员新发的主激活码。'
+              : '请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。'}
+          </p>
+          {activationStatus.activationCodeAvailable && (
+            <button
+              type="button"
+              className="btn activation-saved-code"
+              onClick={() => void revalidateSavedActivation()}
+              disabled={activationBusy}
+            >
+              使用已保存的原激活码{activationStatus.maskedActivationCode ? `（${activationStatus.maskedActivationCode}）` : ''}
+            </button>
+          )}
           <label className="activation-field">
             <span>激活码</span>
             <input
               autoFocus
               value={activationCode}
-              onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
+              onChange={(event) => {
+                setActivationCode(event.target.value.toUpperCase())
+                setActivationError('')
+              }}
               placeholder="POR-XXXX-XXXX-XXXX-XXXX"
               spellCheck={false}
+              disabled={activationBusy}
             />
           </label>
           <div className="activation-device">
-            <span>当前设备码</span>
-            <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+            <div className="activation-device-info">
+              <span>当前设备码</span>
+              <b>{activationStatus.deviceId.slice(0, 12).toUpperCase()}</b>
+            </div>
+            <button type="button" className="activation-device-copy" onClick={() => void copyActivationDiagnostics()}>
+              复制诊断信息
+            </button>
           </div>
-          <div className="activation-note">如果激活遇到问题，把设备码发给管理员即可。</div>
+          <div className="activation-entry-actions">
+            <button type="button" onClick={() => void refreshActivationEntry()} disabled={activationBusy}>
+              重新检测授权状态
+            </button>
+          </div>
+          <div className="activation-note">如果激活遇到问题，复制诊断信息发给管理员即可。</div>
+          {activationStatus.message && !activationError && !activationActionNotice && (
+            <div className="activation-notice" role="status">{activationStatus.message}</div>
+          )}
+          {activationActionNotice && !activationError && (
+            <div className="activation-notice" role="status">{activationActionNotice}</div>
+          )}
           {activationError && <div className="activation-error">{activationError}</div>}
           <button className="btn primary activation-submit" disabled={activationBusy}>
             {activationBusy ? '正在激活...' : '激活并进入软件'}
           </button>
           <div className="activation-note">
-            激活码不会明文保存在软件包中；本机会保存一份授权记录。
+            本地只保存加密授权记录，不保存服务器密钥或 API Key。
           </div>
         </form>
       </div>
@@ -430,14 +683,15 @@ export default function App(): JSX.Element {
     <div className="app app-workbench">
       <div className="topbar">
         <div className="brand">
-          <span className="brand-mark" aria-label="产品经营报告 Logo">
+          <span className="brand-mark" aria-label="产品与内容经营报告系统 Logo">
             <ProductLogo />
           </span>
           <span className="brand-copy">
-            <span className="brand-main">产品经营报告</span>
-            <span className="sub">专业的产品经营分析与报告系统</span>
+            <span className="brand-main">产品与内容经营报告系统</span>
+            <span className="sub">专业的产品经营与内容分析报告系统</span>
           </span>
         </div>
+        <ContactAuthor />
         <a
           className="tutorial-link"
           href={SOP_GUIDE_URL}
@@ -468,9 +722,6 @@ export default function App(): JSX.Element {
           </span>
         </a>
         <div className="right">
-          <span className="model-pill">
-            {active ? `模型：${active.name}（${active.model}）` : '未配置模型'}
-          </span>
           <button
             className="btn new-analysis-button"
             type="button"
@@ -502,20 +753,58 @@ export default function App(): JSX.Element {
               {restoreBusy ? '正在恢复…' : '恢复上一份'}
             </button>
           )}
-          {appVersion && <span className="app-version">v{appVersion}</span>}
+          <button
+            className={`license-pill${activationStatus.offline ? ' offline' : ''}${!activationStatus.unlimited && (pointsWallet?.balancePoints ?? 0) <= 0 ? ' empty' : ''}`}
+            type="button"
+            title={activationStatus.message || '查看积分余额或输入充值码'}
+            onClick={() => {
+              setReplacementError('')
+              setLicenseEntryOpen(true)
+            }}
+          >
+            {licenseLabel}{activationStatus.requiresRevalidation ? ' · 待验证' : ''}
+          </button>
+          {appVersion && (
+            <button
+              className={`app-version update-check-button${updateInfo?.available ? ' available' : ''}${updateInfo?.downloaded ? ' downloaded' : ''}`}
+              type="button"
+              disabled={updateBusy !== 'idle'}
+              title={updateInfo?.downloaded
+                ? '更新包已经下载完成，点击开始安装'
+                : updateInfo?.available
+                  ? '有新版本，点击查看更新说明'
+                  : '手动检查是否有新版本'}
+              onClick={() => void handleCheckForUpdates()}
+            >
+              {updateBusy === 'check'
+                ? '正在检查…'
+                : updateInfo?.downloaded
+                  ? '安装更新'
+                  : updateInfo?.available
+                    ? `新版本 v${updateInfo.latestVersion}`
+                    : `v${appVersion} · 检查更新`}
+            </button>
+          )}
           <button
             className="btn"
             disabled={analysisBusy}
-            title={analysisBusy ? '当前分析完成或停止后才能修改模型设置' : '打开模型设置'}
+            title={analysisBusy ? '当前分析完成或停止后才能查看设置' : managed ? '查看内置 AI 服务状态' : '打开模型设置'}
             onClick={() => setSettingsOpen(true)}
           >
-            ⚙ 设置
+            ⚙ {managed ? '服务状态' : '设置'}
           </button>
         </div>
       </div>
 
-      {(newAnalysisError || autosaveError) && (
+      {(newAnalysisError || autosaveError || updateCheckNotice || activationStatus.offline) && (
         <div className="app-alert-stack">
+          {activationStatus.offline && (
+            <div className={`authorization-offline-notice${activationStatus.requiresRevalidation ? ' blocked' : ''}`} role="status">
+              {activationStatus.requiresRevalidation
+                ? '授权服务器暂时无法连接，离线宽限期已结束。历史报告仍可查看和导出。'
+                : '当前离线，软件会稍后自动重连。授权仍在72小时宽限期内，可以继续使用。'}
+            </div>
+          )}
           {newAnalysisError && (
             <div className="new-analysis-error" role="alert">
               {newAnalysisError}
@@ -524,6 +813,11 @@ export default function App(): JSX.Element {
           {autosaveError && (
             <div className="new-analysis-error" role="alert">
               自动保存失败，当前内容可能尚未写入磁盘：{autosaveError}
+            </div>
+          )}
+          {updateCheckNotice && (
+            <div className="update-check-notice" role="status">
+              {updateCheckNotice}
             </div>
           )}
         </div>
@@ -551,37 +845,166 @@ export default function App(): JSX.Element {
       </div>
 
       <SettingsModal />
+      <ReportReuseModal />
+
+      {licenseEntryOpen && (
+        <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="license-entry-title">
+          <form className="privacy-card license-entry-card" onSubmit={(event) => void submitReplacementActivation(event)}>
+            <div className="privacy-kicker">积分余额</div>
+            <h2 id="license-entry-title">
+              {activationStatus.unlimited ? '无限使用' : `剩余 ${formatPoints(pointsWallet?.balancePoints ?? 0)} 积分`}
+            </h2>
+            <p>如需充值，请输入管理员发放的积分码。</p>
+            {pointsWallet?.stale && (
+              <div className="points-wallet-stale" role="status">
+                余额可能不是最新，网络恢复后会自动刷新。
+              </div>
+            )}
+            <div className="points-ledger-preview" aria-label="最近积分记录">
+              <strong>最近积分记录</strong>
+              {pointsWallet?.ledger.length
+                ? pointsWallet.ledger.slice(0, 8).map((entry) => (
+                    <div key={entry.id}>
+                      <span>
+                        <small>{formatLedgerTime(entry.createdAt)}</small>
+                        {entry.description}
+                      </span>
+                      <b className={entry.pointsDelta >= 0 ? 'positive' : 'negative'}>
+                        {entry.pointsDelta >= 0 ? '+' : ''}{formatPoints(entry.pointsDelta)}
+                      </b>
+                    </div>
+                  ))
+                : <span className="points-ledger-empty">暂无积分变动记录</span>}
+            </div>
+            <label className="activation-field">
+              <span>积分充值码</span>
+              <input
+                autoFocus
+                value={replacementCode}
+                onChange={(event) => setReplacementCode(event.target.value.toUpperCase())}
+                placeholder="请输入管理员发放的积分码"
+                spellCheck={false}
+              />
+            </label>
+            {replacementError && <div className="privacy-error">{replacementError}</div>}
+            <div className="privacy-actions">
+              <button
+                className="btn"
+                type="button"
+                disabled={replacementBusy}
+                onClick={() => {
+                  setLicenseEntryOpen(false)
+                  setReplacementError('')
+                }}
+              >
+                取消
+              </button>
+              <button className="btn primary" disabled={replacementBusy || !replacementCode.trim()}>
+                {replacementBusy ? '正在充值…' : '充值积分'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {updateVisible && updateInfo && (
+        <div className="privacy-mask update-mask" role="dialog" aria-modal="true" aria-labelledby="update-title">
+          <div className="privacy-card update-card">
+            <div className="update-heading">
+              <div>
+                <div className="privacy-kicker">{updateInfo.force ? '必须更新' : '发现新版本'}</div>
+                <h2 id="update-title">产品与内容经营报告系统 {updateInfo.latestVersion}</h2>
+              </div>
+              <span className={`update-badge${updateInfo.force ? ' force' : ''}`}>
+                {updateInfo.force ? '更新后才能继续' : '可稍后更新'}
+              </span>
+            </div>
+            <div className="update-versions">
+              <div><span>当前版本</span><b>v{updateInfo.currentVersion}</b></div>
+              <div className="update-arrow" aria-hidden="true">→</div>
+              <div><span>最新版本</span><b>v{updateInfo.latestVersion}</b></div>
+            </div>
+            <div className="update-notes">
+              <strong>本次更新</strong>
+              {updateInfo.notes.length ? (
+                <ul>{updateInfo.notes.map((note, index) => <li key={`${index}-${note}`}>{note}</li>)}</ul>
+              ) : (
+                <p>修复问题并提升使用体验。</p>
+              )}
+            </div>
+            {updateBusy === 'download' && (
+              <div className="update-progress" aria-live="polite">
+                <div><span>正在下载更新包</span><b>{updateProgress?.percent === undefined ? '请稍候' : `${updateProgress.percent}%`}</b></div>
+                <progress max={100} value={updateProgress?.percent ?? undefined} />
+              </div>
+            )}
+            {updateError && <div className="privacy-error">{updateError}</div>}
+            <div className="privacy-actions update-actions">
+              {!updateInfo.force && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={updateBusy !== 'idle'}
+                  onClick={() => setUpdateDismissed(true)}
+                >
+                  稍后更新
+                </button>
+              )}
+              <button className="btn primary" disabled={updateBusy !== 'idle'} onClick={() => void handleApplyUpdate()}>
+                {updateBusy === 'download'
+                  ? '正在下载…'
+                  : updateBusy === 'install'
+                    ? '正在启动安装…'
+                    : updateError
+                      ? '重新更新'
+                      : '立即更新'}
+              </button>
+            </div>
+            <div className="update-safety-note">点击后会自动下载并校验安装包，校验通过才会启动安装。</div>
+          </div>
+        </div>
+      )}
 
       {needsPrivacyConsent && (
         <div className="privacy-mask" role="dialog" aria-modal="true" aria-labelledby="privacy-title">
           <div className="privacy-card">
             <div className="privacy-kicker">首次使用确认</div>
-            <h2 id="privacy-title">上传资料会发送到当前配置的 AI 模型服务商</h2>
+            <h2 id="privacy-title">上传资料会发送到 AI 分析服务</h2>
             <p>
-              本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给当前模型接口处理。
-              请确认你有权使用这些资料，并已了解相关商业数据会进入你配置的 AI 服务。
+              本工具会读取你上传的自有数据、竞品数据、截图、表格、PDF 等资料，并把用于分析的文本或图片发送给 AI 分析服务处理。
+              请确认你有权使用这些资料，并已了解相关商业数据会进入 AI 分析服务。
             </p>
             <div className="privacy-endpoint">
-              <span>当前模型服务</span>
-              <b>{active ? `${active.name} · ${active.baseURL}` : '尚未配置，稍后将在设置中选择模型服务'}</b>
+              <span>当前分析服务</span>
+              <b>
+                {managed
+                  ? managed.configured
+                    ? '软件分析服务已就绪'
+                    : '分析服务配置异常，请联系软件管理员'
+                  : active
+                    ? '自定义分析服务已就绪'
+                    : '尚未配置，请先完成分析服务设置'}
+              </b>
             </div>
             <ul className="privacy-list">
-              <li>软件会尽量在本机保存配置，但 AI 分析需要调用你配置的模型接口。</li>
+              <li>AI 分析需要联网调用分析服务。</li>
               <li>如果资料包含客户隐私、合同、价格政策等敏感信息，请先确认是否允许上传分析。</li>
-              <li>你可以在设置中更换模型服务商或 API Key。</li>
+              <li>{managed ? '服务授权由软件统一管理，你不需要填写或保存 API Key。' : '你可以在设置中更换分析服务或 API Key。'}</li>
             </ul>
             {privacyError && <div className="privacy-error">{privacyError}</div>}
             <div className="privacy-actions">
-              <button className="btn" onClick={() => setSettingsOpen(true)}>
-                先去设置模型
-              </button>
+              {!managed?.configured && (
+                <button className="btn" onClick={() => setSettingsOpen(true)}>
+                  {managed ? '查看服务状态' : '先去设置模型'}
+                </button>
+              )}
               <button
                 className="btn primary"
-                disabled={privacySaving || !active}
-                title={active ? '' : '请先完成模型设置'}
+                disabled={privacySaving || !modelConfigured}
+                title={modelConfigured ? '' : managed ? 'AI 服务暂不可用' : '请先完成分析服务设置'}
                 onClick={() => void acceptPrivacy()}
               >
-                {privacySaving ? '保存中…' : active ? '我已知晓，继续使用' : '请先设置模型'}
+                {privacySaving ? '保存中…' : modelConfigured ? '我已知晓，继续使用' : managed ? '服务暂不可用' : '请先设置模型'}
               </button>
             </div>
           </div>

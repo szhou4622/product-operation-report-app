@@ -1,0 +1,29 @@
+[Unit]
+Description=ProductOperationReport AI and points proxy
+After=network-online.target license.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=product-report-proxy
+Group=product-report-proxy
+EnvironmentFile=/etc/product-operation-report/proxy.env
+ExecStart=/usr/bin/python3 /opt/product-operation-report/product_report_proxy.py
+Restart=on-failure
+RestartSec=3
+TasksMax=128
+MemoryHigh=768M
+MemoryMax=1G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/product-operation-report
+ReadOnlyPaths=/etc/product-operation-report
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

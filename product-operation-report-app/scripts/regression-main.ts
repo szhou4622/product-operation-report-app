@@ -1,19 +1,87 @@
 import { strict as assert } from 'node:assert'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createCipheriv, createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { app, BrowserWindow } from 'electron'
 import JSZip from 'jszip'
 import Papa from 'papaparse'
 import iconv from 'iconv-lite'
+import * as XLSX from 'xlsx'
 import type { SavedProject } from '../src/shared/types'
 import { parseArchive, parseFile } from '../src/main/ingest'
-import { chatStream, listModels, testModel } from '../src/main/model'
-import { loadLastProject, saveLastProject } from '../src/main/project'
-import { getActivationStatus } from '../src/main/activation'
-import { ACTIVATION_CODE_HASHES } from '../src/main/activationCodes'
-import { loadSettings, saveSettings } from '../src/main/settings'
+import { chatStream, listModels, normalizeProviderUsage, testModel } from '../src/main/model'
+import { archiveProject, loadLastProject, preflightProjectStorage, pruneOrphanBlobs, saveLastProject } from '../src/main/project'
+import {
+  activateWithCode,
+  activationInternals,
+  canStartLicensedAnalysis,
+  deactivateCurrentDevice,
+  getActivationStatus,
+  getActivationStatusWithServerCheck,
+  getDeviceId,
+  revalidateSavedActivationCode,
+  revealCurrentActivationCode,
+  redeemPointsWithCode
+} from '../src/main/activation'
+import { writeLicenseVault } from '../src/main/licenseVault'
+import { buildActivationDiagnostic } from '../src/main/activationDiagnostics'
+import { clearAiProxySession, clearProxyWalletSnapshot, fetchProxyWallet } from '../src/main/aiProxy'
+import { ExclusiveOperationGate } from '../src/main/exclusiveOperationGate'
+import {
+  getActiveProfile,
+  getActiveProfiles,
+  loadRendererSettings,
+  loadSettings,
+  saveRendererSettings,
+  saveSettings
+} from '../src/main/settings'
+import { getManagedModelState, managedModelInternals } from '../src/main/managedModel'
+import { runModelFallbackSequence, shouldTryModelFallback } from '../src/main/modelFallback'
+import {
+  ChatRequestRegistry,
+  validateChatStartPayload
+} from '../src/main/chatAdmission'
 import { readBundledSopRules } from '../src/main/sopRules'
+import { checkForUpdates, compareVersions, downloadUpdate } from '../src/main/updater'
+import { canonicalUpdateManifest, verifyUpdateManifestSignature } from '../src/main/updateSignature'
+import {
+  contactInternals,
+  getCachedContactState,
+  refreshContactConfig
+} from '../src/main/contact'
+import {
+  appendTokenUsageRecord,
+  buildTokenUsageDashboard,
+  classifyModelFailure,
+  estimateRequestTokens,
+  readTokenUsageRecords,
+  sanitizeModelTaskContext,
+  tokenUsageInternals,
+  tokenUsageLogPath
+} from '../src/main/tokenUsage'
+import {
+  clearSourceCleanCache,
+  getSourceCleanCacheStats,
+  lookupSourceCleanCache,
+  sourceCleanCacheInternals,
+  sourceCleanCacheKey,
+  storeSourceCleanCache
+} from '../src/main/sourceCleanCache'
+import {
+  clearReportResultCache,
+  getReportResultCacheStats,
+  lookupReportResultCache,
+  reportResultCacheInternals,
+  reportResultCacheKey,
+  storeReportResultCache
+} from '../src/main/reportResultCache'
+import {
+  appendCostOptimizationEvent,
+  costOptimizationInternals,
+  costOptimizationLogPath,
+  getTokenOptimizationMetrics
+} from '../src/main/costOptimization'
 import {
   buildHtmlReportPresentation,
   markdownToHtmlDocument,
@@ -21,16 +89,49 @@ import {
   sanitizeHtmlFragment,
   stripProductVisualBrief
 } from '../src/main/htmlReport'
+
 import {
   buildProjectSnapshot,
   friendlyError,
   inspectImageHeader,
   MAX_CLEANING_CONCURRENCY,
+  mergeRevisionParts,
+  priorOutputsForStep,
+  selectRevisionParts,
   useStore
 } from '../src/renderer/src/store'
-import type { ChatStreamEvent, ModelProfile } from '../src/shared/types'
+import {
+  buildExtractMessages,
+  buildEvidenceDigestMessages,
+  buildFinalReportPartMessages,
+  buildSummaryGroupMessages,
+  buildSummaryMergeMessages,
+  buildStepMessages,
+  buildSummaryMessages,
+  COMPACT_RUNTIME_RULES,
+  planSummaryDetailGroups
+} from '../src/renderer/src/sop'
+import { FINAL_REPORT_PARTS } from '../src/renderer/src/reportTemplate'
+import { buildLocalTableCleanDetail, preprocessTableForModel } from '../src/renderer/src/tablePreprocess'
+import {
+  buildSourceCleanBatchPlan,
+  combineSourceCleanBatchOutputs,
+  sourceCleanBatchInternals
+} from '../src/renderer/src/sourceCleanBatches'
+import type { ChatStreamEvent, ModelProfile, TokenUsageRecord } from '../src/shared/types'
+
+function encryptV032StoredCode(code: string, deviceId: string): string {
+  const key = createHash('sha256')
+    .update(`product-operation-report:server-code:v1:${deviceId}`, 'utf8')
+    .digest()
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(code, 'utf8'), cipher.final()])
+  return `v1:${iv.toString('base64url')}:${cipher.getAuthTag().toString('base64url')}:${encrypted.toString('base64url')}`
+}
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
+app.disableHardwareAcceleration()
 app.setPath('userData', tempUserData)
 let topbarAuditWindow: BrowserWindow | null = null
 
@@ -54,34 +155,426 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   await saveLastProject(snapshot(1, '旧报告'))
   await saveLastProject(snapshot(2, ''))
   await saveLastProject(snapshot(1, '迟到的旧快照'))
-  assert.equal(loadLastProject()?.revision, 2)
-  assert.equal(loadLastProject()?.reportMarkdown, '')
+  assert.equal((await loadLastProject())?.revision, 2)
+  assert.equal((await loadLastProject())?.reportMarkdown, '')
 
   writeFileSync(join(tempUserData, 'last-project.json'), '{broken', 'utf8')
-  assert.equal(loadLastProject()?.revision, 2)
-  assert.equal(loadLastProject()?.reportMarkdown, '')
+  assert.equal((await loadLastProject())?.revision, 2)
+  assert.equal((await loadLastProject())?.reportMarkdown, '')
 
   writeFileSync(join(tempUserData, 'last-project.json'), '{}', 'utf8')
-  assert.equal(loadLastProject()?.revision, 2)
+  assert.equal((await loadLastProject())?.revision, 2)
 
   writeFileSync(join(tempUserData, 'last-project.json'), JSON.stringify(snapshot(3, '主文件')), 'utf8')
   writeFileSync(join(tempUserData, 'last-project.json.bak'), JSON.stringify(snapshot(5, '更新备份')), 'utf8')
-  assert.equal(loadLastProject()?.revision, 5)
-  assert.equal(loadLastProject()?.reportMarkdown, '更新备份')
+  assert.equal((await loadLastProject())?.revision, 5)
+  assert.equal((await loadLastProject())?.reportMarkdown, '更新备份')
+  const billingSnapshot = { ...snapshot(6, 'billing-id'), analysisSessionId: 'stable-billing-session' }
+  await saveLastProject(billingSnapshot)
+  assert.equal((await loadLastProject())?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
+
+  const largeText = `中段唯一证据-${'资料'.repeat(50_000)}-最后唯一证据`
+  const chunkedSnapshot: SavedProject = {
+    ...snapshot(7, ''),
+    sources: [{
+      id: 'large-source',
+      name: '大项目资料.md',
+      kind: 'doc',
+      text: largeText,
+      warning: '表格分隔结构不规则，请重点核对。',
+      topLevelId: 'large-source'
+    }],
+    taskJournal: {
+      'session:source_clean:large-source:1': {
+        kind: 'source_clean',
+        status: 'complete',
+        output: `POR-T-12345678-000001\n${largeText}`,
+        updatedAt: new Date().toISOString()
+      }
+    }
+  }
+  const preflight = preflightProjectStorage(chunkedSnapshot)
+  assert.equal(preflight.ok, true, preflight.message)
+  await saveLastProject(chunkedSnapshot)
+  const manifest = readFileSync(join(tempUserData, 'last-project.json'), 'utf8')
+  assert.match(manifest, /"storageVersion": 2/u)
+  assert.doesNotMatch(manifest, /中段唯一证据/u, 'large project content is externalized from the small manifest')
+  const restoredChunked = await loadLastProject()
+  assert.equal(restoredChunked?.sources[0]?.text, largeText)
+  assert.equal(restoredChunked?.sources[0]?.warning, '表格分隔结构不规则，请重点核对。')
+  assert.equal(restoredChunked?.taskJournal?.['session:source_clean:large-source:1']?.output?.endsWith(largeText), true)
+  const parsedManifest = JSON.parse(manifest) as { project: { sources: { text: { $blob: string } }[] } }
+  const missingBlobPath = join(tempUserData, 'project-data', 'blobs', `${parsedManifest.project.sources[0].text.$blob}.txt`)
+  rmSync(missingBlobPath, { force: true })
+  const partiallyRestored = await loadLastProject()
+  assert.ok(partiallyRestored, 'one missing blob must not erase the whole project')
+  assert.match(partiallyRestored?.sources[0]?.text || '', /资料块丢失/u)
+  assert.deepEqual(partiallyRestored?.missingBlobs, ['大项目资料.md'])
+  await saveLastProject({ ...chunkedSnapshot, revision: 8, updatedAt: new Date().toISOString() })
+  await archiveProject(snapshot(8, '上一份项目'))
+  const orphanBlob = join(tempUserData, 'project-data', 'blobs', `${'f'.repeat(64)}.txt`)
+  writeFileSync(orphanBlob, 'orphan', 'utf8')
+  const pruned = await pruneOrphanBlobs()
+  assert.deepEqual(pruned, { skipped: false, deleted: 1 })
+  assert.equal(existsSync(orphanBlob), false)
+}
+
+async function testDeviceIdentityPersistsAcrossAuthorizationReset(): Promise<void> {
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const deviceVault = join(tempUserData, 'device-vault.bin')
+  const deviceVaultBackup = `${deviceVault}.bak`
+  const files = [
+    activationFile,
+    activationBackup,
+    licenseVault,
+    licenseVaultBackup,
+    deviceVault,
+    deviceVaultBackup
+  ]
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+    const compatible = activationInternals.compatibleDeviceIdsForTests()
+    const canonical = compatible[0]
+    const historical = compatible.find((deviceId) => deviceId !== canonical)
+    assert.ok(historical, 'the migration test requires a historical compatible machine code')
+
+    const historicalRecord = {
+      version: 3,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256').update('historical-device-code').digest('hex'),
+      deviceId: historical,
+      activatedAt: new Date().toISOString(),
+      licenseId: 'historical-device-license',
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 100,
+      bindingStatus: 'active'
+    }
+    writeFileSync(activationFile, JSON.stringify(historicalRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(historicalRecord), 'utf8')
+
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(getDeviceId(), historical, 'an existing server binding keeps its historical machine code')
+    assert.equal(existsSync(deviceVault), true, 'the selected machine code is persisted separately from authorization')
+
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(licenseVault, { force: true })
+    rmSync(licenseVaultBackup, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(
+      getDeviceId(),
+      historical,
+      'clearing or unbinding authorization must not change the physical device identity'
+    )
+    activationInternals.resetDeviceIdentityForTests()
+    assert.equal(getDeviceId(), historical, 'a simulated application restart keeps the same machine code')
+  } finally {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetDeviceIdentityForTests()
+  }
+}
+
+async function testHistoricalCredentialRefreshRetry(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const files = [activationFile, activationBackup, licenseVault, licenseVaultBackup]
+  const enteredCode = 'HISTORICAL-CREDENTIAL-REFRESH-CODE'
+  const requestBodies: Record<string, unknown>[] = []
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const deviceId = getDeviceId()
+    const staleRecord = {
+      version: 3,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256').update('different-stale-local-code').digest('hex'),
+      deviceId,
+      activatedAt: new Date().toISOString(),
+      licenseId: 'stale-local-license',
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 20,
+      bindingStatus: 'active',
+      requiresRevalidation: true,
+      revokedReason: '设备凭证已失效，请重新输入原激活码验证。',
+      serverMessage: '设备凭证已失效，请重新输入原激活码验证。'
+    }
+    writeFileSync(activationFile, JSON.stringify(staleRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(staleRecord), 'utf8')
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      requestBodies.push(body)
+      if (requestBodies.length === 1) {
+        return new Response(JSON.stringify({
+          ok: false,
+          error_code: 'credential_refresh_required',
+          error: '旧授权首次升级设备凭证时必须设置 credential_refresh=true。'
+        }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'recovered-historical-license',
+        license_type: 'credits',
+        remaining_credits: 100,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: deviceId,
+        device_credential: 'recovered-device-credential',
+        device_session: 'recovered-device-session',
+        message: '历史授权凭证升级成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const recovered = await activateWithCode(enteredCode)
+    assert.equal(recovered.ok, true, 'an explicit server credential-upgrade requirement is retried once')
+    assert.equal(requestBodies.length, 2)
+    assert.equal(requestBodies[0].credential_refresh, undefined)
+    assert.equal(requestBodies[1].credential_refresh, true)
+    assert.equal(requestBodies[1].confirm_merge, undefined, 'credential recovery must never opt into points merging')
+    assert.equal(requestBodies[1].current_code_id, undefined, 'a mismatched stale local id must not be asserted as authority')
+    assert.equal(recovered.status.licenseId, 'recovered-historical-license')
+    assert.equal(revealCurrentActivationCode().activationCode, enteredCode)
+
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    let genericFailureCalls = 0
+    globalThis.fetch = (async () => {
+      genericFailureCalls += 1
+      return new Response(JSON.stringify({ ok: false, error: '激活码无效' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' }
+      })
+    }) as typeof fetch
+    const rejected = await activateWithCode('INVALID-NON-HISTORICAL-CODE')
+    assert.equal(rejected.ok, false)
+    assert.equal(genericFailureCalls, 1, 'ordinary activation failures must not be retried as credential upgrades')
+
+    let technicalFailureCalls = 0
+    globalThis.fetch = (async () => {
+      technicalFailureCalls += 1
+      return new Response(JSON.stringify({
+        ok: false,
+        error_code: 'credential_refresh_required',
+        error: '旧授权首次升级设备凭证时必须设置 credential_refresh=true。'
+      }), { status: 400, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const friendlyFailure = await activateWithCode('TECHNICAL-ERROR-REDACTION-CODE')
+    assert.equal(friendlyFailure.ok, false)
+    assert.equal(technicalFailureCalls, 2, 'the controlled credential refresh is attempted only once')
+    assert.doesNotMatch(friendlyFailure.message, /credential_refresh|\/api\/license/i)
+    assert.match(friendlyFailure.message, /旧版授权|设备码/)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testSavedActivationRecovery(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const files = [activationFile, activationBackup, licenseVault, licenseVaultBackup]
+  const savedCode = 'SAVED-PRIMARY-RECOVERY-CODE'
+  try {
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    writeLicenseVault({ activationCode: savedCode })
+    const waiting = getActivationStatus()
+    assert.equal(waiting.activated, false)
+    assert.equal(waiting.activationCodeAvailable, true, 'an orphaned secure code must remain recoverable')
+    assert.equal(waiting.requiresRevalidation, true)
+    assert.equal(waiting.maskedActivationCode?.includes('SAVE'), true)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: true,
+      app_name: 'ProductOperationReport',
+      code_id: 'saved-recovery-primary',
+      license_type: 'credits',
+      remaining_credits: 80,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: getDeviceId(),
+      device_credential: 'saved-recovery-credential',
+      device_session: 'saved-recovery-session',
+      message: '重新验证成功'
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+
+    const recovered = await revalidateSavedActivationCode()
+    assert.equal(recovered.ok, true)
+    assert.equal(recovered.status.activated, true)
+    assert.equal(recovered.status.creditsRemaining, 80)
+    assert.equal('activationCode' in recovered, false, 'the saved code must not be returned to the renderer')
+
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    writeLicenseVault({
+      activationCode: savedCode,
+      deviceCredential: 'existing-recovery-credential',
+      deviceSession: 'existing-recovery-session'
+    })
+    let recoveryBody: Record<string, unknown> = {}
+    let recoveryHeaders = new Headers()
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      recoveryBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      recoveryHeaders = new Headers(init?.headers)
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'saved-recovery-primary',
+        license_type: 'credits',
+        remaining_credits: 80,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getDeviceId(),
+        device_credential: 'rotated-recovery-credential',
+        device_session: 'rotated-recovery-session',
+        message: '已有凭证重新验证成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const credentialRecovered = await revalidateSavedActivationCode()
+    assert.equal(credentialRecovered.ok, true)
+    assert.equal(recoveryBody.credential_refresh, true)
+    assert.equal(recoveryBody.current_code_id, undefined, 'missing public summary must not invent a code id')
+    assert.equal(recoveryBody.confirm_merge, undefined)
+    assert.equal(recoveryHeaders.get('authorization'), 'Bearer existing-recovery-session')
+    assert.equal(recoveryHeaders.get('x-device-credential'), 'existing-recovery-credential')
+    assert.equal(revealCurrentActivationCode().activationCode, savedCode)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of files) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testActivationAdmissionAndSafeDiagnostics(): Promise<void> {
+  const gate = new ExclusiveOperationGate()
+  let releaseFirst: (() => void) | undefined
+  const first = gate.run(
+    () => new Promise<string>((resolve) => { releaseFirst = () => resolve('first') }),
+    () => 'unexpected-busy'
+  )
+  const duplicate = await gate.run(async () => 'duplicate-ran', () => 'busy')
+  assert.equal(duplicate, 'busy', 'a second activation operation must be rejected before it can run')
+  releaseFirst?.()
+  assert.equal(await first, 'first')
+  assert.equal(await gate.run(async () => 'next', () => 'busy'), 'next', 'the gate releases after completion')
+
+  const diagnostic = buildActivationDiagnostic({
+    activated: false,
+    deviceId: 'b38301cafa771234567890abcdef1234',
+    activationCodeAvailable: true,
+    maskedActivationCode: 'PRO-••••-SECRET',
+    codeCount: 1,
+    appName: 'ProductOperationReport',
+    unlimited: false,
+    offline: false,
+    requiresRevalidation: true,
+    licenseId: 'private-license-id',
+    message: 'server echoed PRO-REAL-ACTIVATION-CODE'
+  }, '0.3.6', 'win32-x64', '2026-08-17T00:00:00.000Z')
+  assert.match(diagnostic, /B38301CAFA77/)
+  assert.doesNotMatch(diagnostic, /SECRET|private-license|REAL-ACTIVATION|PRO-/i)
 }
 
 async function testActivationAndSettingsBackup(): Promise<void> {
   const deviceId = getActivationStatus().deviceId
   const activationRecord = {
     version: 1,
-    codeHash: ACTIVATION_CODE_HASHES[0],
+    codeHash: '0'.repeat(64),
     deviceId,
     activatedAt: new Date().toISOString()
   }
   writeFileSync(join(tempUserData, 'activation.json'), '{broken', 'utf8')
   writeFileSync(join(tempUserData, 'activation.json.bak'), JSON.stringify(activationRecord), 'utf8')
-  assert.equal(getActivationStatus().activated, true)
+  const activationStatus = getActivationStatus()
+  assert.equal(activationStatus.activated, false)
+  assert.equal(activationStatus.appName, 'ProductOperationReport')
+  assert.equal(activationStatus.source, 'legacy')
+  assert.equal(activationStatus.licenseType, 'credits')
+  assert.equal(activationStatus.unlimited, false)
+  assert.equal(activationStatus.creditsRemaining, undefined)
+  assert.equal(activationStatus.offline, false)
+  const refreshedLegacyStatus = await getActivationStatusWithServerCheck()
+  assert.equal(refreshedLegacyStatus.activated, false, 'local hash lists no longer grant model access')
+  assert.equal(refreshedLegacyStatus.source, 'legacy')
+  assert.equal(refreshedLegacyStatus.unlimited, false)
+  assert.equal(refreshedLegacyStatus.creditsRemaining, undefined)
 
+  const previouslyStoredUnlimited = {
+    version: 2,
+    appName: 'ProductOperationReport',
+    source: 'server',
+    codeHash: '0'.repeat(64),
+    encryptedCode: '',
+    deviceId,
+    activatedAt: new Date().toISOString(),
+    licenseId: 'old-server-unlimited-id',
+    licenseType: 'unlimited',
+    unlimited: true,
+    usedOperationIds: [],
+    lastValidatedAt: new Date().toISOString(),
+    offlineUntil: new Date(Date.now() + 72 * 60 * 60 * 1_000).toISOString()
+  }
+  writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(previouslyStoredUnlimited), 'utf8')
+  const migratedUnlimited = getActivationStatus()
+  assert.equal(migratedUnlimited.licenseType, 'unlimited')
+  assert.equal(migratedUnlimited.unlimited, true)
+  assert.equal(migratedUnlimited.requiresRevalidation, false, 'a recent server validation remains usable during offline grace')
+  assert.equal(migratedUnlimited.licenseId, 'old-server-unlimited-id')
+
+  const recoveryCode = 'PRO-LEGACY-RECOVERY-TEST'
+  const malformedLegacyRecord = {
+    version: 2,
+    appName: 'ProductOperationReport',
+    source: 'server',
+    codeHash: createHash('sha256')
+      .update(`product-operation-report:activation:v1:${recoveryCode.replace(/[^A-Z0-9]/g, '')}`, 'utf8')
+      .digest('hex'),
+    encryptedCode: encryptV032StoredCode(recoveryCode, deviceId),
+    deviceId,
+    activatedAt: new Date().toISOString(),
+    licenseId: 'malformed-v2-recovery-id',
+    licenseType: 'credits',
+    unlimited: false,
+    creditsRemaining: 100,
+    bindingStatus: 'active'
+  }
+  rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+  rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+  const malformedText = JSON.stringify(malformedLegacyRecord, null, 2).replace(
+    /\n}$/, ',\n  "serverMessage": "truncated legacy text\n}'
+  )
+  writeFileSync(join(tempUserData, 'activation.json'), malformedText, 'utf8')
+  writeFileSync(join(tempUserData, 'activation.json.bak'), malformedText, 'utf8')
+  const recoveredMalformedRecord = getActivationStatus()
+  assert.equal(recoveredMalformedRecord.activated, true, 'a v2 record with only a corrupt trailing serverMessage is recovered')
+  assert.equal(recoveredMalformedRecord.licenseId, 'malformed-v2-recovery-id')
+  assert.equal(revealCurrentActivationCode().activationCode, recoveryCode)
+  const recoveredJson = JSON.parse(readFileSync(join(tempUserData, 'activation.json'), 'utf8')) as Record<string, unknown>
+  assert.equal(recoveredJson.version, 3, 'recovered v2 records are rewritten in the non-secret v3 format')
+  assert.equal(recoveredJson.encryptedCode, undefined)
+
+  rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+  rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+  writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(activationRecord), 'utf8')
   const firstSettings = {
     profiles: [{ ...profile, name: '第一配置', apiKey: ' key-one ' }],
     activeProfileId: profile.id,
@@ -107,6 +600,1217 @@ async function testActivationAndSettingsBackup(): Promise<void> {
       }),
     /https/
   )
+}
+
+async function testServerActivationAndCredits(): Promise<void> {
+  const liveActivationEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    action: 'activated',
+    grant_score: 100,
+    data: {
+      app_name: 'ProductOperationReport'
+    },
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'live-envelope-primary',
+      primary_code_id: 'live-envelope-primary',
+      license_type: 'standard',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456',
+      device_credential: 'live-device-credential',
+      device_session: 'live-device-session',
+      action: 'activated'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(liveActivationEnvelope.ok, true, 'the production activation envelope must be accepted')
+  assert.equal(liveActivationEnvelope.licenseId, 'live-envelope-primary')
+  assert.equal(liveActivationEnvelope.creditsRemaining, 100)
+
+  const liveMergedEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    action: 'balance_merged',
+    grant_score: 0,
+    primary_code_id: 'live-envelope-primary',
+    merged_code_id: 'live-envelope-recharge',
+    data: { app_name: 'ProductOperationReport' },
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'live-envelope-recharge',
+      primary_code_id: 'live-envelope-primary',
+      merged_code_id: 'live-envelope-recharge',
+      action: 'balance_merged',
+      grant_score: 100,
+      license_type: 'standard',
+      remaining_credits: 110,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(liveMergedEnvelope.ok, true, 'a completed production merge must not be reported as failed')
+  assert.equal(liveMergedEnvelope.grantScore, 0, 'the top-level transaction grant is authoritative')
+  assert.equal(liveMergedEnvelope.primaryLicenseId, 'live-envelope-primary')
+  assert.equal(liveMergedEnvelope.creditsRemaining, 110)
+
+  const conflictingEnvelope = activationInternals.parseServerLicense({
+    ok: true,
+    app_name: 'AnotherApp',
+    license: {
+      app_name: 'ProductOperationReport',
+      code_id: 'conflicting-envelope',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(conflictingEnvelope.ok, false, 'conflicting top-level and license identities must fail closed')
+  assert.equal(conflictingEnvelope.contractInvalid, true)
+
+  const requestEchoOnly = activationInternals.parseServerLicense({
+    ok: true,
+    data: {
+      app_name: 'ProductOperationReport',
+      code_id: 'request-echo-must-not-be-trusted',
+      remaining_credits: 100,
+      unlimited: false,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: 'ABCDEF123456'
+    }
+  }, 200, 'abcdef123456')
+  assert.equal(requestEchoOnly.ok, false, 'request echo data must never become an authorization result')
+  assert.equal(requestEchoOnly.contractInvalid, true)
+
+  const originalFetch = globalThis.fetch
+  const code = 'SERVER-POINTS-TEST-CODE'
+  let requestBody: Record<string, unknown> = {}
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes('/device/status')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'license-test-points',
+          license_type: 'credits',
+          remaining_credits: 150,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getActivationStatus().deviceId.toUpperCase(),
+          message: '后台补发积分后余额已刷新'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'license-test-points',
+        license_type: 'credits',
+        remaining_credits: 100,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'points-device-credential',
+        device_session: 'points-device-session',
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.licenseType, 'credits')
+    assert.equal(activated.status.creditsRemaining, 100)
+    assert.equal(requestBody.app_name, 'ProductOperationReport')
+    assert.equal(requestBody.license_protocol_version, 2)
+    assert.equal(requestBody.activation_code, code)
+    assert.equal(requestBody.machine_code, activated.status.deviceId)
+    assert.equal(typeof requestBody.client_version, 'string')
+    assert.equal(requestBody.software_version, undefined)
+    assert.equal(requestBody.platform, undefined)
+    assert.doesNotMatch(readFileSync(join(tempUserData, 'activation.json'), 'utf8'), new RegExp(code))
+
+    const firstUse = canStartLicensedAnalysis()
+    assert.equal(firstUse.ok, true)
+    assert.equal(firstUse.status.creditsRemaining, 100, 'the client never subtracts authoritative server credits')
+    const repeatedUse = canStartLicensedAnalysis()
+    assert.equal(repeatedUse.status.creditsRemaining, 100)
+
+    const refreshed = await getActivationStatusWithServerCheck()
+    assert.equal(refreshed.activated, true)
+    assert.equal(refreshed.creditsRemaining, 150)
+    assert.equal(refreshed.offline, false)
+
+    globalThis.fetch = (async () => { throw new TypeError('network unavailable') }) as typeof fetch
+    const offline = await getActivationStatusWithServerCheck()
+    assert.equal(offline.activated, true)
+    assert.equal(offline.offline, true)
+    assert.equal(offline.requiresRevalidation, false, 'temporary network failure keeps the last successful validation')
+    assert.equal(canStartLicensedAnalysis().ok, true, 'offline grace must not interrupt an in-progress report')
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: false,
+      error: '激活码已禁用'
+    }), { status: 403, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const disabled = await getActivationStatusWithServerCheck()
+    assert.equal(disabled.activated, false)
+    assert.match(disabled.message || '', /禁用/)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: true,
+      app_name: 'ProductOperationReport',
+      code_id: 'license-test-unlimited',
+      license_type: 'unlimited',
+      remaining_credits: 0,
+      unlimited: true,
+      binding_status: 'active',
+      transfer_count: 0,
+      machine_code: getActivationStatus().deviceId,
+      device_credential: 'unlimited-device-credential',
+      device_session: 'unlimited-device-session',
+      message: '激活成功'
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const unlimited = await activateWithCode('SERVER-UNLIMITED-TEST-CODE')
+    assert.equal(unlimited.ok, true)
+    assert.equal(unlimited.status.licenseType, 'unlimited')
+    assert.equal(unlimited.status.unlimited, true)
+    const unlimitedUse = canStartLicensedAnalysis()
+    assert.equal(unlimitedUse.ok, true)
+    assert.equal(unlimitedUse.status.unlimited, true)
+
+    const wrongDeviceRecord = JSON.parse(readFileSync(join(tempUserData, 'activation.json'), 'utf8')) as Record<string, unknown>
+    wrongDeviceRecord.deviceId = 'another-machine'
+    writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify(wrongDeviceRecord), 'utf8')
+    writeFileSync(join(tempUserData, 'activation.json.bak'), JSON.stringify(wrongDeviceRecord), 'utf8')
+    assert.equal(getActivationStatus().activated, false)
+  } finally {
+    globalThis.fetch = originalFetch
+    const deviceId = getActivationStatus().deviceId
+    writeFileSync(join(tempUserData, 'activation.json'), JSON.stringify({
+      version: 1,
+      codeHash: '0'.repeat(64),
+      deviceId,
+      activatedAt: new Date().toISOString()
+    }), 'utf8')
+  }
+}
+
+async function testProxyWalletBridge(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const code = 'PROXY-WALLET-BRIDGE-CODE'
+  let sessionCount = 0
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/activate')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'wallet-primary',
+          license_type: 'credits',
+          remaining_credits: 201,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getDeviceId(),
+          device_credential: 'wallet-device-credential',
+          device_session: 'wallet-device-session',
+          message: '激活成功'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/session')) {
+        sessionCount += 1
+        return new Response(JSON.stringify({ ok: true, access_token: `proxy-token-${sessionCount}`, expires_in: 900 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      if (url.endsWith('/wallet')) {
+        assert.equal(new Headers(init?.headers).get('authorization'), `Bearer proxy-token-${sessionCount}`)
+        return new Response(JSON.stringify({
+          ok: true,
+          wallet: {
+            balancePoints: 201,
+            unlimited: false,
+            totalTopupPoints: 250,
+            totalCostPoints: 49,
+            totalChargedPoints: 49,
+            unbilledUsageCount: 0,
+            pricing: {
+              model: 'gpt-5.5', currency: 'USD', inputUsdPerMillion: 1.25,
+              outputUsdPerMillion: 7.5, cachedInputUsdPerMillion: 0.125,
+              cacheCreationUsdPerMillion: 0.8, usdCnyRate: 7.2, pointsPerCny: 100,
+              cnyPerCostPoint: 0.01, costRate: 0.5, chargeMultiplier: 2
+            },
+            ledger: [{
+              id: 'ledger-1', createdAt: '2026-08-19T00:00:00Z', kind: 'usage',
+              description: '资料清洗', pointsDelta: -3.25, balanceAfter: 201,
+              reportSessionId: 'report-ledger', taskType: 'source_clean'
+            }]
+          }
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      throw new Error(`unexpected URL ${url}`)
+    }) as typeof fetch
+    assert.equal((await activateWithCode(code)).ok, true)
+    const wallet = await fetchProxyWallet()
+    assert.equal(wallet.balancePoints, 201)
+    assert.equal(wallet.ledger[0]?.description, '资料清洗')
+    assert.equal(wallet.ledger[0]?.reportSessionId, 'report-ledger')
+
+    globalThis.fetch = (async () => { throw new TypeError('network unavailable') }) as typeof fetch
+    const stale = await fetchProxyWallet()
+    assert.equal(stale.balancePoints, 201)
+    assert.equal(stale.stale, true)
+    assert.match(stale.warning || '', /network unavailable/u)
+  } finally {
+    globalThis.fetch = originalFetch
+    clearAiProxySession()
+    clearProxyWalletSnapshot()
+  }
+}
+
+async function testExplicitZeroServerBalanceDoesNotReissueGrantedCredits(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  let activationCalls = 0
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+    globalThis.fetch = (async () => {
+      activationCalls += 1
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'standard-code-with-points',
+        license_type: 'standard',
+        remaining_credits: 0,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        ...(activationCalls === 1
+          ? {
+              device_credential: 'standard-points-credential',
+              device_session: 'standard-points-session'
+            }
+          : {}),
+        message: activationCalls === 1 ? '激活成功' : '该激活码已绑定本机，授权仍然有效。'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.licenseType, 'credits')
+    assert.equal(activated.status.creditsRemaining, 0)
+
+    const repeated = await activateWithCode('STANDARD-CODE-WITH-100-POINTS')
+    assert.equal(repeated.ok, true, 'same-device activation may reuse locally encrypted device credentials')
+    assert.equal(repeated.status.creditsRemaining, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+  }
+}
+
+async function testDeviceUnbindAndRebind(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'SERVER-DEVICE-REBIND-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  let mode: 'initial' | 'server-error' | 'wrong-machine' | 'cooldown' | 'limit' | 'unbind' | 'rebind' = 'initial'
+  let unbindBody: Record<string, unknown> = {}
+  let unbindHeaders = new Headers()
+  let activationCalls = 0
+  let statusMethod = ''
+  let statusHeaders = new Headers()
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/device/status')) {
+        statusMethod = init?.method || 'GET'
+        statusHeaders = new Headers(init?.headers)
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          binding_status: 'active',
+          code_id: 'license-device-rebind',
+          license_type: 'credits',
+          remaining_credits: 2_000,
+          unlimited: false,
+          transfer_count: 0,
+          machine_code: getActivationStatus().deviceId,
+          message: '设备授权有效'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.endsWith('/device/unbind')) {
+        unbindBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+        unbindHeaders = new Headers(init?.headers)
+        if (mode === 'server-error') {
+          return new Response(JSON.stringify({ ok: false, error: '服务暂时不可用' }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        if (mode === 'wrong-machine') {
+          return new Response(JSON.stringify({ ok: false, error: '机器码不匹配，未解除绑定' }), {
+            status: 409,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        if (mode === 'cooldown') {
+          return new Response(JSON.stringify({ ok: false, error: '成功换机后24小时内不能再次解绑' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        if (mode === 'limit') {
+          return new Response(JSON.stringify({ ok: false, error: '每个激活码30天内最多自助换机3次' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          binding_status: 'unbound',
+          unbind_id: 'unbind-test-001',
+          message: '本机已解除绑定'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      activationCalls += 1
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'license-device-rebind',
+        license_type: 'credits',
+        remaining_credits: mode === 'rebind' ? 1_234.5 : 2_000,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: mode === 'rebind' ? 1 : 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'fake-device-credential',
+        device_session: 'fake-device-session',
+        ...(mode === 'rebind' ? { action: 'rebound', grant_score: 0 } : {}),
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    const storedText = readFileSync(activationFile, 'utf8')
+    assert.equal(storedText.includes('fake-device-credential'), false, 'device credential must be encrypted at rest')
+    assert.equal(storedText.includes('fake-device-session'), false, 'device session must be encrypted at rest')
+    const storedJson = JSON.parse(storedText) as Record<string, unknown>
+    assert.equal(storedJson.encryptedCode, undefined, 'activation.json must not contain the activation code ciphertext')
+    assert.equal(storedJson.encryptedDeviceCredential, undefined)
+    assert.equal(storedJson.encryptedDeviceSession, undefined)
+    const vaultBytes = readFileSync(join(tempUserData, 'license-vault.bin'))
+    assert.equal(vaultBytes.includes(Buffer.from(code)), false, 'the secure vault must not contain plaintext activation codes')
+    assert.equal((await getActivationStatusWithServerCheck()).activated, true)
+    assert.equal(statusMethod, 'GET')
+    assert.equal(statusHeaders.get('authorization'), 'Bearer fake-device-session')
+    assert.equal(activationCalls, 1, 'startup validation must use device/status instead of activating again')
+
+    const oldClientRecord = JSON.parse(readFileSync(activationFile, 'utf8')) as Record<string, unknown>
+    oldClientRecord.encryptedCode = encryptV032StoredCode(code, activated.status.deviceId)
+    delete oldClientRecord.encryptedDeviceCredential
+    delete oldClientRecord.encryptedDeviceSession
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+    writeFileSync(activationFile, JSON.stringify(oldClientRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(oldClientRecord), 'utf8')
+
+    mode = 'server-error'
+    const unavailable = await deactivateCurrentDevice()
+    assert.equal(unavailable.ok, false)
+    assert.equal(activationCalls, 2, 'a v0.3.2 activation must refresh device credentials before unbinding')
+    assert.equal(existsSync(activationFile), true, 'server failure must keep the local activation')
+
+    mode = 'wrong-machine'
+    const mismatch = await deactivateCurrentDevice()
+    assert.equal(mismatch.ok, false)
+    assert.match(mismatch.message, /机器码不匹配/)
+    assert.equal(existsSync(activationFile), true, 'machine mismatch must keep the local activation')
+
+    mode = 'cooldown'
+    const cooldown = await deactivateCurrentDevice()
+    assert.equal(cooldown.ok, false)
+    assert.match(cooldown.message, /24小时/)
+    assert.equal(existsSync(activationFile), true, 'cooldown rejection must keep the local activation')
+
+    mode = 'limit'
+    const limited = await deactivateCurrentDevice()
+    assert.equal(limited.ok, false)
+    assert.match(limited.message, /30天内最多自助换机3次/)
+    assert.equal(existsSync(activationFile), true, '30-day limit rejection must keep the local activation')
+
+    mode = 'unbind'
+    const unbound = await deactivateCurrentDevice()
+    assert.equal(unbound.ok, true)
+    assert.equal(unbound.unbindId, 'unbind-test-001')
+    assert.equal(unbindBody.app_name, 'ProductOperationReport')
+    assert.equal(unbindBody.machine_code, activated.status.deviceId)
+    assert.equal(unbindBody.device_credential, undefined, 'credentials belong in authenticated headers, not the JSON body')
+    assert.equal(unbindBody.current_code_id, 'license-device-rebind')
+    assert.equal(unbindBody.license_protocol_version, 2)
+    assert.equal(unbindHeaders.get('authorization'), 'Bearer fake-device-session')
+    assert.equal(unbindBody.activation_code, undefined, 'unbind must not submit the activation code')
+    assert.equal(unbindBody.points_balance, undefined, 'server keeps the authoritative points balance')
+    assert.equal(unbindBody.transfer_code, undefined, 'unbind does not use a transfer code')
+    assert.equal(existsSync(activationFile), false)
+    assert.equal(existsSync(activationBackup), false)
+    assert.equal(getActivationStatus().activated, false)
+
+    assert.equal((await deactivateCurrentDevice()).ok, false, 'repeated unbind is rejected safely')
+
+    mode = 'rebind'
+    const reactivated = await activateWithCode(code)
+    assert.equal(reactivated.ok, true)
+    assert.equal(reactivated.status.bindingStatus, 'active')
+    assert.equal(reactivated.status.transferCount, 1)
+    assert.equal(reactivated.status.creditsRemaining, 1_234.5)
+
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+    const deviceId = getActivationStatus().deviceId
+    const v1Record = {
+      version: 1,
+      codeHash: '0'.repeat(64),
+      deviceId,
+      activatedAt: new Date().toISOString()
+    }
+    writeFileSync(activationFile, JSON.stringify(v1Record), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(v1Record), 'utf8')
+    const activationCallsBeforeLegacyUnbind = activationCalls
+    const legacyDirectUnbind = await deactivateCurrentDevice()
+    assert.equal(legacyDirectUnbind.ok, true, 'v1 local-only authorization can be removed without entering the code')
+    assert.equal(
+      activationCalls,
+      activationCallsBeforeLegacyUnbind,
+      'a v1 local-only record has no server binding and must not call activate during local removal'
+    )
+    assert.equal(existsSync(activationFile), false)
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+  }
+}
+
+async function testRemoteAdminUnbindReturnsToActivation(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const code = 'REMOTE-ADMIN-UNBIND-CODE'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  let statusMode: 'active' | 'unbound' | 'unauthorized' = 'active'
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) {
+      rmSync(file, { force: true })
+    }
+    activationInternals.resetRuntimeValidationForTests()
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      const machineCode = getActivationStatus().deviceId
+      if (url.includes('/device/status')) {
+        if (statusMode === 'unauthorized') {
+          return new Response(JSON.stringify({ ok: false, error: '设备凭证已撤销' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          binding_status: statusMode === 'unbound' ? 'unbound' : 'active',
+          code_id: 'remote-admin-unbind-license',
+          license_type: 'credits',
+          remaining_credits: 130,
+          unlimited: false,
+          transfer_count: statusMode === 'unbound' ? 1 : 0,
+          machine_code: machineCode,
+          message: statusMode === 'unbound'
+            ? '当前设备已在服务器解除绑定，请重新输入激活码。'
+            : '设备授权有效'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'remote-admin-unbind-license',
+        license_type: 'credits',
+        remaining_credits: 130,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 1,
+        machine_code: machineCode,
+        device_credential: 'remote-admin-device-credential',
+        device_session: 'remote-admin-device-session',
+        action: 'rebound',
+        grant_score: 0,
+        message: '重新绑定成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.activated, true)
+
+    statusMode = 'unbound'
+    const unbound = await getActivationStatusWithServerCheck()
+    assert.equal(unbound.activated, false, 'a server-side unbind must leave the active application state')
+    assert.equal(unbound.bindingStatus, 'unbound')
+    assert.equal(unbound.activationCodeAvailable, true, 'the original code remains recoverable from secure storage')
+    assert.match(unbound.message || '', /解除绑定/)
+    assert.equal(revealCurrentActivationCode().activationCode, code)
+
+    statusMode = 'active'
+    const rebound = await activateWithCode(code)
+    assert.equal(rebound.ok, true, 'the original code can explicitly bind the machine again')
+    assert.equal(rebound.status.activated, true)
+
+    statusMode = 'unauthorized'
+    const revokedCredential = await getActivationStatusWithServerCheck()
+    assert.equal(revokedCredential.activated, false, 'a revoked device credential must return to activation')
+    assert.equal(revokedCredential.requiresRevalidation, true)
+    assert.equal(revokedCredential.activationCodeAvailable, true)
+    assert.match(revokedCredential.message || '', /重新输入原激活码/)
+
+    statusMode = 'active'
+    const revalidated = await activateWithCode(code)
+    assert.equal(revalidated.ok, true)
+    assert.equal(revalidated.status.activated, true)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) {
+      rmSync(file, { force: true })
+    }
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const primaryCode = 'PRIMARY-A-CODE'
+  const rechargeCode = 'RECHARGE-B-CODE'
+  const mergedWithoutLocalPrimaryCode = 'MERGED-WITHOUT-LOCAL-PRIMARY'
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  let rechargeCalls = 0
+  try {
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      const code = String(body.activation_code || '')
+      const isRecharge = code === rechargeCode
+      const isMergedWithoutLocalPrimary = code === mergedWithoutLocalPrimaryCode
+      if (isRecharge) rechargeCalls += 1
+      if ((isRecharge && rechargeCalls === 1) || isMergedWithoutLocalPrimary) {
+        return new Response(JSON.stringify({
+          ok: true,
+          action: 'balance_merged',
+          primary_code_id: 'license-a-primary',
+          merged_code_id: 'license-b-recharge',
+          message: 'balance merged',
+          data: { app_name: 'ProductOperationReport' },
+          license: {
+            app_name: 'ProductOperationReport',
+            code_id: 'license-b-recharge',
+            primary_code_id: 'license-a-primary',
+            merged_code_id: 'license-b-recharge',
+            action: 'balance_merged',
+            license_type: 'credits',
+            remaining_credits: 120,
+            unlimited: false,
+            binding_status: 'active',
+            transfer_count: 0,
+            machine_code: getActivationStatus().deviceId
+          }
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (isRecharge && rechargeCalls > 1) {
+        return new Response(JSON.stringify({ ok: false, error: '这个积分码已经合并过' }), {
+          status: 409,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'license-a-primary',
+        license_type: 'credits',
+        remaining_credits: isRecharge ? 120 : 20,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        ...(!isRecharge ? { device_credential: 'credential-a', device_session: 'session-a' } : {}),
+        message: '激活成功'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const missingPrimaryRecovery = await activateWithCode(mergedWithoutLocalPrimaryCode)
+    assert.equal(missingPrimaryRecovery.ok, false)
+    assert.match(missingPrimaryRecovery.message, /主激活码/)
+    assert.equal(existsSync(activationFile), false, 'a merged recharge code must never replace the missing primary')
+
+    const primary = await activateWithCode(primaryCode)
+    assert.equal(primary.ok, true)
+    assert.equal(primary.status.activationCodeAvailable, true)
+    assert.equal(primary.status.creditsRemaining, 20)
+    assert.equal(revealCurrentActivationCode().activationCode, primaryCode)
+
+    const grant = await redeemPointsWithCode(rechargeCode)
+    assert.equal(grant.ok, true)
+    assert.equal(grant.grantId, 'license-a-primary')
+    assert.equal(grant.points, 100)
+    assert.equal(grant.status.creditsRemaining, 120)
+    assert.equal(getActivationStatus().licenseId, 'license-a-primary')
+    assert.equal(revealCurrentActivationCode().activationCode, primaryCode, 'B code must not replace the primary code')
+
+    const repeatedGrant = await redeemPointsWithCode(rechargeCode)
+    assert.equal(repeatedGrant.ok, false)
+    assert.equal(getActivationStatus().creditsRemaining, 120)
+    const primaryAsRecharge = await redeemPointsWithCode(primaryCode)
+    assert.equal(primaryAsRecharge.ok, false)
+    assert.match(primaryAsRecharge.message, /主激活码/)
+    const stored = readFileSync(activationFile, 'utf8')
+    assert.equal(stored.includes(primaryCode), false, 'primary code must be encrypted at rest')
+    assert.equal(stored.includes(rechargeCode), false, 'recharge code must never be stored in activation state')
+  } finally {
+    globalThis.fetch = originalFetch
+    rmSync(activationFile, { force: true })
+    rmSync(activationBackup, { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
+    rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+  }
+}
+
+async function testLicenseProtocolV2StrictContract(): Promise<void> {
+  const successfulStatusWithoutMessage = activationInternals.parseServerLicense({
+    ok: true,
+    app_name: 'ProductOperationReport',
+    code_id: 'status-without-message',
+    remaining_credits: 100,
+    unlimited: false,
+    binding_status: 'active',
+    transfer_count: 0,
+    machine_code: 'ABCDEF123456'
+  }, 200, 'abcdef123456')
+  assert.equal(successfulStatusWithoutMessage.ok, true)
+  assert.equal(successfulStatusWithoutMessage.message, '授权验证成功。')
+
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const vaultFile = join(tempUserData, 'license-vault.bin')
+  const vaultBackup = `${vaultFile}.bak`
+  const code = 'STRICT-V2-PRIMARY-CODE'
+  let mode: 'active' | 'unauthorized' | 'conflict' = 'active'
+  let balance = 100
+  let activationBody: Record<string, unknown> = {}
+  let activationHeaders = new Headers()
+  try {
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/device/status')) {
+        if (mode === 'unauthorized') {
+          return new Response(JSON.stringify({ ok: false, error: 'device credential expired' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'strict-v2-primary',
+          license_type: 'credits',
+          remaining_credits: balance,
+          ...(mode === 'conflict' ? { remaining_points: balance + 1 } : {}),
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: getActivationStatus().deviceId,
+          message: 'status refreshed'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      activationBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      activationHeaders = new Headers(init?.headers)
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'strict-v2-primary',
+        license_type: 'credits',
+        remaining_credits: balance,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: getActivationStatus().deviceId,
+        device_credential: 'strict-device-credential-rotated',
+        device_session: 'strict-device-session-rotated',
+        grant_score: 9_999,
+        message: 'activated'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.creditsRemaining, 100, 'grant_score must never replace the authoritative balance')
+    assert.equal('activationCode' in activated.status, false, 'normal status must never expose the full activation code')
+    assert.equal(revealCurrentActivationCode().activationCode, code)
+    assert.deepEqual(
+      Object.keys(activationBody).sort(),
+      ['activation_code', 'app_name', 'client_version', 'license_protocol_version', 'machine_code'].sort(),
+      'first activation sends only the canonical v2 fields'
+    )
+
+    balance = 42
+    const reduced = await getActivationStatusWithServerCheck()
+    assert.equal(reduced.creditsRemaining, 42, 'administrator deductions overwrite the local display immediately')
+    assert.equal(reduced.requiresRevalidation, false)
+
+    mode = 'unauthorized'
+    const unauthorized = await getActivationStatusWithServerCheck()
+    assert.equal(unauthorized.activated, false, '401 returns the UI to activation while project files remain untouched')
+    assert.equal(unauthorized.requiresRevalidation, true)
+    assert.equal(canStartLicensedAnalysis().ok, false, '401 blocks new cloud work')
+    assert.equal(revealCurrentActivationCode().activationCode, code, '401 must not delete the original activation code')
+
+    mode = 'active'
+    const refreshed = await activateWithCode(code)
+    assert.equal(refreshed.ok, true)
+    assert.equal(activationBody.credential_refresh, true)
+    assert.equal(activationBody.current_code_id, 'strict-v2-primary')
+    assert.equal(activationHeaders.get('authorization'), null, 'a revoked device session must not be reused during revalidation')
+    assert.equal(refreshed.status.creditsRemaining, 42, 'credential rotation must not add credits')
+
+    mode = 'conflict'
+    const conflicted = await getActivationStatusWithServerCheck()
+    assert.equal(conflicted.activated, true)
+    assert.equal(conflicted.creditsRemaining, 42, 'conflicting aliases must not overwrite the last trusted balance')
+    assert.equal(conflicted.requiresRevalidation, true)
+    assert.match(conflicted.message || '', /冲突/)
+
+    const json = readFileSync(activationFile, 'utf8')
+    const storedSummary = JSON.parse(json) as Record<string, unknown>
+    assert.equal(storedSummary.activationCodeStored, true, 'the non-secret summary records vault availability')
+    assert.equal(typeof storedSummary.maskedActivationCode, 'string', 'the default UI uses a non-secret masked summary')
+    for (const secret of [code, 'strict-device-credential-rotated', 'strict-device-session-rotated']) {
+      assert.equal(json.includes(secret), false, 'activation.json must never contain full secrets')
+    }
+    assert.equal(json.includes('encryptedCode'), false, 'legacy embedded secret fields are removed after migration')
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+function testUpdateVersionComparison(): void {
+  assert.equal(compareVersions('0.3.0', '0.2.5'), 1)
+  assert.equal(compareVersions('v1.0.0', '1.0'), 0)
+  assert.equal(compareVersions('1.0.0-beta.2', '1.0.0-beta.11'), -1)
+  assert.equal(compareVersions('1.0.0', '1.0.0-rc.1'), 1)
+  assert.equal(compareVersions('2.0.0', '10.0.0'), -1)
+}
+
+function testUpdateManifestSignature(): void {
+  const keys = generateKeyPairSync('ed25519')
+  const publicKey = keys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
+  const manifest: Record<string, unknown> = {
+    app_name: 'ProductOperationReport',
+    version: '9.9.9',
+    download_url: { windows_x64: 'https://update.dadaozixun.com/test.exe' },
+    sha256: { windows_x64: 'a'.repeat(64) },
+    notes: ['安全更新'],
+    force: false
+  }
+  manifest.signature = sign(null, canonicalUpdateManifest(manifest), keys.privateKey).toString('base64')
+  assert.equal(verifyUpdateManifestSignature(manifest, publicKey), true)
+  assert.equal(verifyUpdateManifestSignature({ ...manifest, version: '9.9.10' }, publicKey), false)
+  assert.equal(verifyUpdateManifestSignature({ ...manifest, signature: '' }, publicKey), false)
+}
+
+async function testUpdateConfigAndChecksum(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const payload = Buffer.from('verified-update-payload', 'utf8')
+  const correctChecksum = createHash('sha256').update(payload).digest('hex')
+  const assetKey = process.platform === 'win32' ? 'windows_x64' : process.arch === 'arm64' ? 'mac_arm64' : 'mac_x64'
+  const assetUrl = process.platform === 'win32'
+    ? 'https://update.dadaozixun.com/POR-test-update.exe'
+    : `https://update.dadaozixun.com/POR-test-update-${process.arch}.dmg`
+  const expectedExtension = process.platform === 'win32' ? /\.exe/u : /\.dmg/u
+  let requestedUrl = ''
+  try {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      requestedUrl = String(input)
+      return new Response(JSON.stringify({
+        app_name: 'ProductOperationReport',
+        version: '999.0.0',
+        min_supported_version: '998.0.0',
+        download_url: { [assetKey]: assetUrl },
+        sha256: { [assetKey]: '0'.repeat(64) },
+        notes: ['测试更新'],
+        force: false
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    const forced = await checkForUpdates()
+    assert.equal(new URL(requestedUrl).searchParams.get('app_name'), 'ProductOperationReport')
+    assert.equal(forced.available, true)
+    assert.equal(forced.force, true)
+    assert.equal(forced.latestVersion, '999.0.0')
+
+    globalThis.fetch = (async () => {
+      const response = new Response(payload, {
+        status: 200,
+        headers: { 'content-length': String(payload.length) }
+      })
+      Object.defineProperty(response, 'url', { value: assetUrl })
+      return response
+    }) as typeof fetch
+    const rejected = await downloadUpdate()
+    assert.equal(rejected.ok, false)
+    assert.match(rejected.message, /校验失败/)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'ProductOperationReport',
+      version: '999.0.1',
+      download_url: { [assetKey]: assetUrl },
+      sha256: { [assetKey]: correctChecksum },
+      notes: '通过校验',
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    const offered = await checkForUpdates()
+    assert.equal(offered.available, true)
+    assert.equal(offered.force, false)
+
+    globalThis.fetch = (async () => {
+      const response = new Response(payload, {
+        status: 200,
+        headers: { 'content-length': String(payload.length) }
+      })
+      Object.defineProperty(response, 'url', { value: assetUrl })
+      return response
+    }) as typeof fetch
+    const accepted = await downloadUpdate()
+    assert.equal(accepted.ok, true)
+    assert.equal(existsSync(accepted.info?.downloadPath || ''), true)
+
+    globalThis.fetch = (async () => new Response('{}', { status: 404 })) as typeof fetch
+    const noConfig = await checkForUpdates()
+    assert.equal(noConfig.available, false)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'ProductOperationReport',
+      version: '999.0.2',
+      download_url: { [assetKey]: 'https://update.dadaozixun.com/not-an-installer.html' },
+      sha256: { [assetKey]: correctChecksum },
+      notes: [],
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await assert.rejects(checkForUpdates(), expectedExtension)
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      app_name: 'AnotherProduct',
+      version: '999.0.3',
+      download_url: { [assetKey]: assetUrl },
+      sha256: { [assetKey]: correctChecksum },
+      notes: [],
+      force: false
+    }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await assert.rejects(checkForUpdates(), /软件标识不匹配/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+function testManagedModelIsolation(): void {
+  const secret = 'managed-secret-never-rendered'
+  const validConfig = {
+    version: 1,
+    enabled: true,
+    name: '内置 AI 服务',
+    baseURL: 'https://managed.example.com/v1/',
+    apiKey: secret,
+    model: 'managed-model',
+    supportsVision: true,
+    temperature: 0.3,
+    fallbackModels: ['claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+  }
+  const parsed = managedModelInternals.parseConfig(validConfig)
+  assert.equal(parsed.enabled, true)
+  assert.equal(parsed.profile?.apiKey, secret)
+  assert.equal(parsed.profile?.baseURL, 'https://managed.example.com/v1')
+  assert.deepEqual(parsed.profiles.map((item) => item.model), [
+    'managed-model', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6'
+  ])
+  assert.equal(parsed.profiles[0].temperature, 0.3)
+  assert.equal(parsed.profiles[1].temperature, undefined)
+  assert.equal(parsed.profiles.every((item) => item.apiKey === secret), true)
+  assert.equal(JSON.stringify(parsed.info).includes(secret), false)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, apiKey: '' }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, baseURL: 'http://remote.example.com/v1' }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, enabled: false }).enabled, false)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, fallbackModels: ['managed-model'] }).profile, null)
+  assert.equal(managedModelInternals.parseConfig({ ...validConfig, fallbackModels: ['a', 'b', 'c', 'd'] }).profile, null)
+  assert.deepEqual(
+    managedModelInternals.parseConfig({ ...validConfig, model: 'gpt-5.5', fallbackModels: undefined }).profiles.map((item) => item.model),
+    ['gpt-5.5', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6']
+  )
+
+  process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON = JSON.stringify(validConfig)
+  assert.equal(getManagedModelState().mode, 'proxy', 'normal development startup must exercise the production proxy path')
+  assert.notEqual(getActiveProfile()?.apiKey, secret, '开发开关未启用时必须忽略模型环境变量')
+  const proxyRendererSettings = loadRendererSettings()
+  assert.equal(proxyRendererSettings.profiles.length, 0)
+  const proxyStoredSettings = JSON.parse(readFileSync(join(tempUserData, 'settings.json'), 'utf8')) as Record<string, unknown>
+  const proxyBackupSettings = JSON.parse(readFileSync(join(tempUserData, 'settings.json.bak'), 'utf8')) as Record<string, unknown>
+  assert.deepEqual(proxyStoredSettings.profiles, [], '代理模式必须清除主设置中的历史本地模型密钥')
+  assert.deepEqual(proxyBackupSettings.profiles, [], '代理模式必须清除备份设置中的历史本地模型密钥')
+  process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES = '1'
+  try {
+    const rendererSettings = loadRendererSettings()
+    assert.equal(rendererSettings.profiles.length, 0)
+    assert.equal(rendererSettings.managedModel?.configured, true)
+    assert.equal(JSON.stringify(rendererSettings).includes(secret), false)
+    assert.equal(getActiveProfile()?.apiKey, secret)
+    assert.deepEqual(getActiveProfiles().map((item) => item.model), [
+      'managed-model', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6'
+    ])
+
+    const saved = saveRendererSettings({
+      ...rendererSettings,
+      profiles: [
+        {
+          id: 'injected',
+          name: '恶意替换',
+          baseURL: 'https://attacker.example.com/v1',
+          apiKey: 'attacker-key',
+          model: 'attacker-model',
+          supportsVision: false
+        }
+      ],
+      activeProfileId: 'injected',
+      privacyAccepted: true,
+      privacyEndpoint: 'https://attacker.example.com/v1'
+    })
+    assert.equal(saved.profiles.length, 0)
+    assert.equal(saved.privacyEndpoint, 'https://managed.example.com/v1')
+    assert.equal(getActiveProfile()?.id, 'managed-model')
+  } finally {
+    delete process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON
+    delete process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES
+  }
+}
+
+function testModelFallbackSafety(): void {
+  assert.equal(classifyModelFailure('HTTP 429 Too Many Requests', 'error'), 'rate_limited')
+  assert.equal(classifyModelFailure('HTTP 401 Unauthorized', 'error'), 'authentication')
+  assert.equal(classifyModelFailure('模型因内容安全限制提前停止', 'error'), 'safety')
+  assert.equal(
+    classifyModelFailure('HTTP 503 {"message":"provider_route_unavailable"}', 'error'),
+    'provider_route_unavailable'
+  )
+  assert.equal(shouldTryModelFallback({ failureKind: 'rate_limited', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'network', outputChars: 1, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'authentication', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'safety', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: true, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: false, hasNext: false }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_error', outputChars: 0, aborted: false, hasNext: true }), false)
+  assert.equal(shouldTryModelFallback({ failureKind: 'model_unavailable', outputChars: 0, aborted: false, hasNext: true }), true)
+  assert.equal(shouldTryModelFallback({ failureKind: 'provider_route_unavailable', outputChars: 0, aborted: false, hasNext: true }), true)
+}
+
+function testChatAdmissionSecurity(): void {
+  const id = 'b4f81b86-1a5b-4e39-830e-1271165bb8ee'
+  const context = {
+    reportSessionId: 'report-security-test',
+    taskType: 'summary' as const,
+    taskKey: 'summary:1',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 1,
+    imageCount: 0
+  }
+  const valid = validateChatStartPayload({
+    id,
+    messages: [{ role: 'user', content: '请总结资料。' }],
+    context
+  })
+  assert.equal(valid.id, id)
+  assert.throws(
+    () => validateChatStartPayload({ id, messages: [{ role: 'user', content: 'x'.repeat(2_000_001) }], context }),
+    /过大/
+  )
+  assert.throws(
+    () => validateChatStartPayload({
+      id,
+      messages: [{ role: 'user', content: [{ type: 'image', dataUrl: 'https://127.0.0.1/private.png' }] }],
+      context: { ...context, isVision: true, imageCount: 1 }
+    }),
+    /图片/
+  )
+
+  const registry = new ChatRequestRegistry(4)
+  const first = new AbortController()
+  registry.claim(id, 101, first)
+  assert.equal(registry.hasOwner(101), true)
+  assert.equal(registry.hasOwner(202), false)
+  assert.throws(() => registry.claim(id, 101, new AbortController()), /重复/)
+  assert.equal(registry.abort(id, 202), false)
+  assert.equal(first.signal.aborted, false)
+  assert.equal(registry.abort(id, 101), true)
+  assert.equal(first.signal.aborted, true)
+  registry.release(id, 101, first)
+  assert.equal(registry.size, 0)
+  assert.equal(registry.hasOwner(101), false)
+
+  const second = new AbortController()
+  const third = new AbortController()
+  registry.claim('5f26ccac-8b0d-49eb-a49e-53d044098a52', 101, second)
+  registry.claim('30c33d60-7d4a-4676-b48b-d81febc34ac1', 202, third)
+  registry.abortAll()
+  assert.equal(second.signal.aborted, true)
+  assert.equal(third.signal.aborted, true)
+  assert.equal(registry.size, 0)
+}
+
+function testCloseDuringActiveWorkContract(): void {
+  const mainSource = readFileSync(join(process.cwd(), 'src', 'main', 'index.ts'), 'utf8')
+  const preloadSource = readFileSync(join(process.cwd(), 'src', 'preload', 'index.ts'), 'utf8')
+  const rendererSource = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'), 'utf8')
+  assert.match(mainSource, /hasParsingForOwner\(ownerId\)/)
+  assert.match(mainSource, /chatRequests\.hasOwner\(ownerId\)/)
+  assert.match(mainSource, /停止任务并退出/)
+  assert.match(mainSource, /cancelParsingForOwner\(ownerId, '软件正在关闭/)
+  assert.match(mainSource, /chatRequests\.abortOwner\(ownerId\)/)
+  assert.match(mainSource, /setTimeout\(\(\) => app\.exit\(0\), 4_000\)/)
+  assert.match(mainSource, /chatRequests\.abortAll\(\)/)
+  assert.match(mainSource, /app\.on\('before-quit'/)
+  const parseServiceSource = readFileSync(join(process.cwd(), 'src', 'main', 'parseService.ts'), 'utf8')
+  assert.match(parseServiceSource, /process\.kill\(pid, 'SIGKILL'\)/)
+  assert.match(parseServiceSource, /for \(const item of waiting\) settleItem\(item, serviceBlockedError\)\s+finish\(\)/)
+  assert.doesNotMatch(mainSource, /app:before-close/)
+  assert.doesNotMatch(preloadSource, /app:close-ready|app:close-guard-state|app:before-close/)
+  assert.doesNotMatch(rendererSource, /onBeforeClose/)
+}
+
+function testRepairPlanStaticContracts(): void {
+  const main = readFileSync(join(process.cwd(), 'src', 'main', 'index.ts'), 'utf8')
+  const preload = readFileSync(join(process.cwd(), 'src', 'preload', 'index.ts'), 'utf8')
+  const store = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'store.ts'), 'utf8')
+  const table = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'tablePreprocess.ts'), 'utf8')
+  const sop = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'sop.ts'), 'utf8')
+  const contact = readFileSync(join(process.cwd(), 'src', 'main', 'contact.ts'), 'utf8')
+  const builder = readFileSync(join(process.cwd(), 'electron-builder.yml'), 'utf8')
+  const packageScan = readFileSync(join(process.cwd(), 'scripts', 'verify-package-secrets.cjs'), 'utf8')
+  const workflow = readFileSync(join(process.cwd(), '..', '.github', 'workflows', 'build-desktop.yml'), 'utf8')
+  assert.doesNotMatch(main, /function authorizationWallet/u)
+  assert.match(main, /fetchProxyWallet/u)
+  assert.equal((main.match(/getActivationStatusWithServerCheck\(/gu) || []).length, 1, 'only throttled refresh calls device status')
+  assert.match(main, /async function getActivationStatusWithSavedCodeRecovery\(\)/u)
+  assert.match(main, /status\.activated \|\| !status\.activationCodeAvailable/u)
+  assert.match(main, /automaticSavedCodeRecoveryKey === recoveryKey/u)
+  assert.match(main, /ipcMain\.handle\('activation:status', \(\) => getActivationStatusWithSavedCodeRecovery\(\)\)/u)
+  assert.doesNotMatch(preload, /license:canStartAnalysis|license:consumeAnalysisCredit/u)
+  assert.equal(existsSync(join(process.cwd(), 'src', 'main', 'pointsWallet.ts')), false)
+  assert.doesNotMatch(table, /sourceForModel/u)
+  assert.doesNotMatch(sop, /buildCleanMessages/u)
+  assert.match(store, /scheduleCleaningCheckpointSave\(get\)/u)
+  assert.ok(
+    store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)') < store.indexOf('for (const step of SOP_STEPS)'),
+    'analysis evidence groups are planned once before the step loop'
+  )
+  assert.match(store, /:evidence_digest:v1:/u)
+  assert.match(store, /cleanedData: analysisInput/u)
+  assert.match(workflow, /npm run test:regression/u)
+  assert.match(workflow, /npm run test:update-release/u)
+  assert.match(workflow, /npm run test:html-visual/u)
+  assert.match(main, /ipcMain\.handle\('contact:get'/u)
+  assert.match(preload, /getContact|onContactChanged/u)
+  assert.match(contact, /CONTACT_CONFIG_URL|contact-config\.json|contact-image\.bin/u)
+  assert.match(builder, /files:[\s\S]*- out\/\*\*\/\*[\s\S]*- assets\/\*\*\/\*/u)
+  assert.doesNotMatch(builder, /win:[\s\S]*files:|mac:[\s\S]*files:/u)
+  assert.match(packageScan, /legacyContactPattern/u)
+  assert.equal(reportResultCacheInternals.MAX_CACHE_BYTES, 100 * 1024 * 1024)
+}
+
+async function testModelFallbackSequence(): Promise<void> {
+  const profiles = ['gpt-5.5', 'claude-sonnet-4-6', 'gemini-3-flash'].map((model, index) => ({
+    id: `fallback-test-${index}`,
+    name: model,
+    baseURL: 'https://example.invalid/v1',
+    apiKey: 'secret',
+    model,
+    supportsVision: true
+  }))
+  const attempts: string[] = []
+  const usageModels: string[] = []
+  const recovered = await runModelFallbackSequence(profiles, async (current, index) => {
+    attempts.push(current.model)
+    usageModels.push(current.model)
+    if (index === 0) {
+      return {
+        terminal: { type: 'error' as const, message: 'HTTP 429', usage: { source: 'missing' as const, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: current.model } },
+        failureKind: 'model_unavailable',
+        outputChars: 0,
+        hasVisibleOutput: false,
+        aborted: false
+      }
+    }
+    return {
+      terminal: { type: 'done' as const, full: '完整报告', usage: { source: 'provider' as const, inputTokens: 10, outputTokens: 2, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 12, model: current.model } },
+      outputChars: 4,
+      hasVisibleOutput: true,
+      aborted: false
+    }
+  })
+  assert.deepEqual(attempts, ['gpt-5.5', 'claude-sonnet-4-6'])
+  assert.deepEqual(usageModels, attempts)
+  assert.equal(recovered.profile.model, 'claude-sonnet-4-6')
+  assert.equal(recovered.outcome.terminal.type, 'done')
+
+  const partialAttempts: string[] = []
+  const partial = await runModelFallbackSequence(profiles, async (current) => {
+    partialAttempts.push(current.model)
+    return {
+      terminal: { type: 'error' as const, message: '网络中断', usage: { source: 'missing' as const, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, totalTokens: 0, model: current.model } },
+      failureKind: 'network',
+      outputChars: 2,
+      hasVisibleOutput: true,
+      aborted: false
+    }
+  })
+  assert.deepEqual(partialAttempts, ['gpt-5.5'])
+  assert.equal(partial.outcome.terminal.type, 'error')
 }
 
 async function testSourceInvalidation(): Promise<void> {
@@ -284,6 +1988,7 @@ async function testIdleGoalAndLateSessionIsolation(): Promise<void> {
     api: {
       sendChat: (
         _messages: unknown,
+        _context: unknown,
         handlers: { onError?: (message: string) => void }
       ) => ({
         abort: () => {
@@ -322,7 +2027,7 @@ async function testReportRollbackAndExportGuard(): Promise<void> {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     api: {
-      sendChat: (_messages: unknown, handlers: { onChunk?: (value: string) => void; onError?: (value: string) => void }) => {
+      sendChat: (_messages: unknown, _context: unknown, handlers: { onChunk?: (value: string) => void; onError?: (value: string) => void }) => {
         queueMicrotask(() => {
           handlers.onChunk?.('不完整的新报告')
           handlers.onError?.('模拟中断')
@@ -386,8 +2091,8 @@ async function testDoubleExportGuard(): Promise<void> {
   }
   useStore.setState({
     phase: 'done',
-    artifacts: { 9: '最终报告' },
-    reportMarkdown: '最终报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false,
     exportStatus: ''
   })
@@ -402,19 +2107,42 @@ async function testDoubleExportGuard(): Promise<void> {
 
 async function testFeedbackArrivingDuringRevision(): Promise<void> {
   let calls = 0
+  const taskContexts: Array<Record<string, unknown>> = []
   ;(globalThis as typeof globalThis & { window: unknown }).window = {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
     api: {
       sendChat: (
         _messages: unknown,
+        context: Record<string, unknown>,
         handlers: { onChunk?: (value: string) => void; onDone?: (value: string) => void }
       ) => {
+        taskContexts.push(context)
         const call = ++calls
+        const part = FINAL_REPORT_PARTS.find((candidate) => candidate.id === context.partId)
+        assert.ok(part)
+        const fixtureLines = HTML_REPORT_FIXTURE.split(/\r?\n/u)
+        const selected: string[] = []
+        if (part.includeTitle) {
+          const firstSection = fixtureLines.findIndex((line) => /^##\s+0[.、：:\s]/u.test(line.trim()))
+          selected.push(...fixtureLines.slice(0, firstSection))
+        }
+        for (const section of part.sections) {
+          const start = fixtureLines.findIndex((line) => new RegExp(`^##\\s+${section}(?:[.、：:\\s]|$)`, 'u').test(line.trim()))
+          assert.ok(start >= 0)
+          const relativeEnd = fixtureLines.slice(start + 1).findIndex((line) => /^##\s+(?:10|11|[0-9])(?:[.、：:\s]|$)/u.test(line.trim()))
+          const end = relativeEnd >= 0 ? start + 1 + relativeEnd : fixtureLines.length
+          selected.push(...fixtureLines.slice(start, end))
+        }
+        if (part.includeFooter && !selected.some((line) => line.includes('内容由 AI 生成'))) {
+          const footer = fixtureLines.find((line) => line.includes('内容由 AI 生成'))
+          if (footer) selected.push(footer)
+        }
+        const output = `${selected.join('\n').trim()}\n\n修订批次${call}`
         queueMicrotask(() => {
-          handlers.onChunk?.(`第${call}段`)
+          handlers.onChunk?.(output)
           if (call === 1) useStore.setState({ steering: '第一条要求\n修订期间的新要求' })
-          handlers.onDone?.(`第${call}段`)
+          handlers.onDone?.(output)
         })
         return { abort: () => undefined }
       }
@@ -433,8 +2161,22 @@ async function testFeedbackArrivingDuringRevision(): Promise<void> {
   })
   await useStore.getState()._rerunReport()
   assert.equal(calls, 8)
+  assert.equal(taskContexts.every((context) => context.taskType === 'revision_part'), true)
+  assert.deepEqual([...new Set(taskContexts.slice(0, 4).map((context) => context.partId))].sort(), [
+    'part-0-4',
+    'part-10-11',
+    'part-5-8',
+    'part-9'
+  ])
+  assert.equal(taskContexts.every((context) => context.attempt === 1), true)
+  assert.equal(new Set(taskContexts.slice(0, 4).map((context) => String(context.taskKey).split(':').slice(0, -1).join(':'))).size, 1)
+  assert.equal(new Set(taskContexts.slice(4).map((context) => String(context.taskKey).split(':').slice(0, -1).join(':'))).size, 1)
+  assert.notEqual(
+    String(taskContexts[0].taskKey).split(':').slice(0, -1).join(':'),
+    String(taskContexts[4].taskKey).split(':').slice(0, -1).join(':')
+  )
   assert.equal(useStore.getState().phase, 'checkpoint2')
-  assert.match(useStore.getState().reportMarkdown, /第5段/)
+  assert.match(useStore.getState().reportMarkdown, /修订批次5/u)
   assert.equal(useStore.getState().artifacts[9], useStore.getState().reportMarkdown)
 }
 
@@ -480,15 +2222,38 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.match(truncated.message, /不完整/)
 
     const normalEvents: ChatStreamEvent[] = []
-    globalThis.fetch = (async () =>
-      responseStream([
+    let streamingRequestBody: Record<string, unknown> | undefined
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      streamingRequestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      return responseStream([
         'data: {"choices":[{"delta":{"content":"完"}}]}\n',
         '\ndata: {"choices":[{"delta":{"content":"整"},"finish_reason":"stop"}]}\n\n',
+        'data: {"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":40,"cache_creation_tokens":10},"completion_tokens_details":{"reasoning_tokens":12}}}\n\n',
         'data: [DONE]\n\n'
-      ])) as typeof fetch
+      ])
+    }) as typeof fetch
     await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => normalEvents.push(event))
+    assert.deepEqual(streamingRequestBody?.stream_options, { include_usage: true })
+    assert.equal('temperature' in (streamingRequestBody || {}), false)
+    const usageEvent = normalEvents.find((event) => event.type === 'usage')
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.inputTokens : 0, 120)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.cachedInputTokens : 0, 40)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.cacheCreationInputTokens : 0, 10)
+    assert.equal(usageEvent?.type === 'usage' ? usageEvent.usage.reasoningTokens : 0, 12)
     assert.equal(normalEvents.at(-1)?.type, 'done')
     assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.full : '', '完整')
+    assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.usage.totalTokens : 0, 150)
+
+    const jsonEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        model: 'gpt-5.5-json',
+        choices: [{ message: { content: '普通响应' }, finish_reason: 'stop' }],
+        usage: { input_tokens: 90, output_tokens: 15, total_tokens: 105, input_tokens_details: { cached_tokens: 20 } }
+      }), { headers: { 'content-type': 'application/json' } })) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => jsonEvents.push(event))
+    assert.equal(jsonEvents.at(-1)?.type === 'done' ? jsonEvents.at(-1)?.usage.totalTokens : 0, 105)
+    assert.equal(jsonEvents.at(-1)?.type === 'done' ? jsonEvents.at(-1)?.usage.model : '', 'gpt-5.5-json')
 
     const earlyEofEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
@@ -496,6 +2261,63 @@ async function testStrictModelCompletion(): Promise<void> {
     await chatStream(profile, [{ role: 'user', content: '测试' }], (event) => earlyEofEvents.push(event))
     assert.equal(earlyEofEvents.at(-1)?.type, 'error')
     assert.match(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.message || '' : '', /提前结束/)
+    assert.equal(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.usage.source : '', 'missing')
+
+    const normalized = normalizeProviderUsage(
+      { prompt_tokens: 12.9, completion_tokens: 3, cache_read_input_tokens: 5, cache_creation_input_tokens: 7 },
+      'fallback'
+    )
+    assert.deepEqual(normalized, {
+      source: 'provider',
+      inputTokens: 12,
+      outputTokens: 3,
+      reasoningTokens: 0,
+      cachedInputTokens: 5,
+      cacheCreationInputTokens: 7,
+      totalTokens: 15,
+      model: 'fallback'
+    })
+
+    const reasoningFallbackBodies: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      reasoningFallbackBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>)
+      if (reasoningFallbackBodies.length === 1) return new Response('{"error":"unsupported reasoning_effort"}', { status: 400 })
+      return responseStream([
+        'data: {"choices":[{"delta":{"content":"兼容"},"finish_reason":"stop"}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    }) as typeof fetch
+    const fallbackEvents: ChatStreamEvent[] = []
+    await chatStream(profile, [{ role: 'user', content: '测试低推理兼容' }], (event) => fallbackEvents.push(event), undefined, { reasoningEffort: 'low' })
+    assert.equal(reasoningFallbackBodies.length, 2)
+    assert.equal(reasoningFallbackBodies[0].reasoning_effort, 'low')
+    assert.equal(reasoningFallbackBodies[1].reasoning_effort, undefined)
+    assert.equal(fallbackEvents.at(-1)?.type, 'done')
+
+    const cacheBodies: Record<string, unknown>[] = []
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      cacheBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>)
+      if (cacheBodies.length === 1) return new Response('{"error":"cache_control unsupported"}', { status: 400 })
+      return responseStream([
+        'data: {"choices":[{"delta":{"content":"缓存兼容"},"finish_reason":"stop"}]}\n\n',
+        'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    }) as typeof fetch
+    const cacheEvents: ChatStreamEvent[] = []
+    await chatStream(
+      { ...profile, model: 'claude-sonnet-4-6' },
+      [{ role: 'system', content: '稳定公共前缀' }, { role: 'user', content: '当前任务' }],
+      (event) => cacheEvents.push(event),
+      undefined,
+      { promptCacheKey: 'analysis:test-report:evidence-digest-v1' }
+    )
+    assert.equal(cacheBodies[0].prompt_cache_key, 'analysis:test-report:evidence-digest-v1')
+    assert.match(JSON.stringify(cacheBodies[0].messages), /cache_control/u)
+    assert.equal(cacheBodies[1].prompt_cache_key, undefined, 'unsupported cache extensions retry once without caching')
+    assert.doesNotMatch(JSON.stringify(cacheBodies[1].messages), /cache_control/u)
+    assert.equal(cacheEvents.at(-1)?.type, 'done')
 
     const lengthEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
@@ -530,6 +2352,24 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.equal(rateLimitEvents.at(-1)?.type, 'error')
     assert.match(rateLimitEvents.at(-1)?.type === 'error' ? rateLimitEvents.at(-1)?.message || '' : '', /等待 2 秒/)
 
+    const insufficientPointsEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({
+        ok: false,
+        message: '积分不足：当前可用 100 积分，本批最多需要暂时预留 117.074 积分。系统尚未扣费。'
+      }), {
+        status: 402,
+        statusText: 'Payment Required',
+        headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试积分提示' }], (event) => insufficientPointsEvents.push(event))
+    assert.equal(insufficientPointsEvents.at(-1)?.type, 'error')
+    const pointsMessage = insufficientPointsEvents.at(-1)?.type === 'error'
+      ? insufficientPointsEvents.at(-1)?.message || ''
+      : ''
+    assert.match(pointsMessage, /当前可用 100 积分/)
+    assert.doesNotMatch(pointsMessage, /\{"ok"/)
+
     globalThis.fetch = (async () =>
       new Response(
         JSON.stringify({ data: Array.from({ length: 650 }, (_, index) => ({ id: `model-${index}` })) }),
@@ -541,6 +2381,666 @@ async function testStrictModelCompletion(): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch
   }
+}
+
+function makeTokenRecord(overrides: Partial<TokenUsageRecord> = {}): TokenUsageRecord {
+  const totalTokens = overrides.totalTokens ?? 100
+  const inputTokens = overrides.inputTokens ?? Math.max(0, totalTokens - 20)
+  const outputTokens = overrides.outputTokens ?? Math.max(0, totalTokens - inputTokens)
+  return {
+    schemaVersion: 1,
+    eventType: 'final',
+    requestId: crypto.randomUUID(),
+    reportSessionId: 'report-default',
+    taskType: 'analysis_step',
+    taskKey: 'report-default:analysis_step:1',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 7,
+    imageCount: 1,
+    stepId: '1',
+    model: 'gpt-5.5',
+    status: 'success',
+    startedAt: '2026-08-09T01:00:00.000Z',
+    endedAt: '2026-08-09T01:00:01.000Z',
+    durationMs: 1_000,
+    outputChars: 60,
+    usageSource: 'provider',
+    inputTokens,
+    outputTokens,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    totalTokens,
+    ...overrides
+  }
+}
+
+async function testTokenUsageMeasurement(): Promise<void> {
+  const estimate = estimateRequestTokens([
+    { role: 'system', content: '短提示' },
+    { role: 'user', content: [{ type: 'text', text: '文本资料' }, { type: 'image', dataUrl: 'data:image/png;base64,SECRET_IMAGE' }] }
+  ], 30)
+  assert.equal(estimate.inputTokens >= 2_000, true)
+  assert.equal(estimate.outputTokens, 10)
+  const stableContext = sanitizeModelTaskContext({
+    reportSessionId: 'report-1',
+    taskType: 'source_clean',
+    taskKey: 'report-1:source_clean:file-1',
+    billingRequestId: 'report-1:source_clean:file-1',
+    attempt: 1,
+    isVision: true,
+    sourceCount: 3,
+    imageCount: 1,
+    sourceId: 'file-1'
+  })
+  assert.equal(stableContext?.isVision, true)
+  assert.equal(stableContext?.billingRequestId, 'report-1:source_clean:file-1')
+  assert.equal(sanitizeModelTaskContext({
+    reportSessionId: 'bad id with spaces',
+    taskType: 'summary',
+    taskKey: 'bad',
+    attempt: 1,
+    isVision: false,
+    sourceCount: 1,
+    imageCount: 0
+  }), undefined)
+
+  const records: TokenUsageRecord[] = []
+  const reportTotals = [1_000, 2_000, 3_000, 4_000]
+  const sourceCounts = [3, 7, 15, 25]
+  const parts = ['part-0-4', 'part-5-8', 'part-9', 'part-10-11']
+  reportTotals.forEach((reportTotal, reportIndex) => {
+    parts.forEach((partId, partIndex) => {
+      const partTotal = reportTotal / parts.length
+      records.push(makeTokenRecord({
+        requestId: `report-${reportIndex + 1}-part-${partIndex + 1}`,
+        reportSessionId: `report-${reportIndex + 1}`,
+        taskType: 'final_part',
+        taskKey: `report-${reportIndex + 1}:final_part:${partId}`,
+        partId,
+        sourceCount: sourceCounts[reportIndex],
+        imageCount: reportIndex,
+        totalTokens: partTotal,
+        inputTokens: partTotal - 50,
+        outputTokens: 50
+      }))
+    })
+  })
+  records.push(makeTokenRecord({
+    requestId: 'missing-retry',
+    reportSessionId: 'report-missing',
+    taskType: 'source_clean',
+    taskKey: 'report-missing:source_clean:file-1',
+    sourceId: 'file-1',
+    attempt: 2,
+    status: 'error',
+    failureKind: 'network',
+    usageSource: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedInputTokens: 500,
+    estimatedOutputTokens: 0,
+    estimatedTotalTokens: 500
+  }))
+  const dashboard = buildTokenUsageDashboard(records, true, 'test-token-usage.jsonl')
+  assert.deepEqual(dashboard.percentiles, { sampleSize: 4, p50: 2_000, p75: 3_000, p95: 4_000 })
+  assert.equal(dashboard.buckets.every((bucket) => bucket.exactCompletedCount === 1), true)
+  assert.equal(dashboard.missingUsageRecordCount, 1)
+  for (const report of dashboard.reports.filter((item) => item.completed)) {
+    assert.equal(report.totalTokens, report.stages.reduce((sum, stage) => sum + stage.totalTokens, 0))
+    assert.equal(report.totalTokens, report.successfulTokens + report.failedTokens + report.abortedTokens)
+  }
+
+  const path = tokenUsageLogPath()
+  rmSync(path, { force: true })
+  tokenUsageInternals.resetForTests()
+  const started = makeTokenRecord({
+    eventType: 'started',
+    requestId: 'local-request-1',
+    reportSessionId: 'local-report',
+    taskKey: 'local-report:summary',
+    taskType: 'summary',
+    status: 'started',
+    usageSource: 'missing',
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedInputTokens: 123,
+    estimatedOutputTokens: 0,
+    estimatedTotalTokens: 123
+  })
+  const final = makeTokenRecord({
+    requestId: 'local-request-1',
+    reportSessionId: 'local-report',
+    taskKey: 'local-report:summary',
+    taskType: 'summary',
+    totalTokens: 222,
+    inputTokens: 200,
+    outputTokens: 22
+  })
+  assert.equal(await appendTokenUsageRecord(started), true)
+  assert.equal(await appendTokenUsageRecord(final), true)
+  assert.equal(await appendTokenUsageRecord(final), false)
+  const crashStart = makeTokenRecord({
+    eventType: 'started',
+    requestId: 'crashed-request',
+    reportSessionId: 'crashed-report',
+    taskKey: 'crashed-report:source_clean:file-1',
+    taskType: 'source_clean',
+    sourceId: 'file-1',
+    status: 'started',
+    usageSource: 'missing',
+    totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedTotalTokens: 321
+  })
+  await appendTokenUsageRecord(crashStart)
+  appendFileSync(path, '{"truncated":', 'utf8')
+  const reloaded = await readTokenUsageRecords(path)
+  assert.equal(reloaded.length, 3)
+  const recovered = buildTokenUsageDashboard(reloaded)
+  const crashed = recovered.reports.find((report) => report.reportSessionId === 'crashed-report')
+  assert.equal(crashed?.abortedAttempts, 1)
+  assert.equal(crashed?.missingUsageAttempts, 1)
+  const rawLog = readFileSync(path, 'utf8')
+  assert.doesNotMatch(rawLog, /SECRET_IMAGE|prompt|activation_code|apiKey|sk-/i)
+  rmSync(path, { force: true })
+  for (const file of readdirSync(tempUserData).filter((name) => /^token-usage-.*\.archive$/u.test(name))) {
+    rmSync(join(tempUserData, file), { force: true })
+  }
+  writeFileSync(path, Buffer.alloc(tokenUsageInternals.ROTATE_LOG_BYTES + 1, 0x20))
+  await tokenUsageInternals.rotateTokenLogIfNeeded(path, 1)
+  assert.equal(existsSync(path), false, 'oversized current log is rotated before the next append')
+  assert.equal(readdirSync(tempUserData).some((name) => /^token-usage-.*\.archive$/u.test(name)), true)
+  tokenUsageInternals.resetForTests()
+  const afterRotation = makeTokenRecord({ requestId: 'after-log-rotation', reportSessionId: 'rotation-report' })
+  assert.equal(await appendTokenUsageRecord(afterRotation), true)
+  assert.equal((await readTokenUsageRecords(path)).some((record) => record.requestId === 'after-log-rotation'), true)
+}
+
+async function testCostOptimizationPrimitives(): Promise<void> {
+  await clearSourceCleanCache()
+  await sourceCleanCacheInternals.resetForTests()
+  const source = {
+    name: '画像.csv',
+    kind: 'table' as const,
+    text: '标签类型,标签,占比\n年龄,30-39,45%',
+    attribution: '自有数据',
+    platform: '视频号',
+    purpose: '人群画像数据',
+    note: '近30天'
+  }
+  const key = sourceCleanCacheKey(source, 'gpt-5.5')
+  assert.equal(key.length, 64)
+  assert.notEqual(sourceCleanCacheKey({ ...source, note: '近7天' }, 'gpt-5.5'), key)
+  assert.notEqual(sourceCleanCacheKey({ ...source, text: `${source.text}\n年龄,40-49,20%` }, 'gpt-5.5'), key)
+  const stored = await storeSourceCleanCache(source, 'gpt-5.5', '清洗结果')
+  assert.equal(stored.stored, true, 'cache store')
+  const hit = await lookupSourceCleanCache(source, 'gpt-5.5')
+  assert.equal(hit.hit, true, 'cache hit')
+  assert.equal(hit.text, '清洗结果')
+  assert.equal(hit.stats.totalHits, 1)
+  assert.equal((await lookupSourceCleanCache({ ...source, platform: '抖音' }, 'gpt-5.5')).hit, false)
+  assert.notEqual(sourceCleanCacheKey(source, 'gpt-5.4'), key)
+  const warmSources = Array.from({ length: 7 }, (_, index) => ({
+    ...source,
+    name: `复用资料-${index + 1}.csv`,
+    text: `${source.text}\n序号,${index + 1},${index + 1}%`
+  }))
+  for (const [index, item] of warmSources.entries()) {
+    assert.equal((await storeSourceCleanCache(item, 'gpt-5.5', `清洗结果-${index + 1}`)).stored, true)
+  }
+  const warmHits = await Promise.all(warmSources.map((item) => lookupSourceCleanCache(item, 'gpt-5.5')))
+  assert.equal(warmHits.filter((item) => item.hit).length, 7)
+
+  const now = new Date('2026-08-09T00:00:00.000Z')
+  const entries = Array.from({ length: 205 }, (_, index) => ({
+    key: index.toString(16).padStart(64, '0'),
+    createdAt: '2026-08-01T00:00:00.000Z',
+    lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+    expiresAt: index === 204 ? '2026-08-08T00:00:00.000Z' : '2026-09-01T00:00:00.000Z',
+    model: 'gpt-5.5',
+    bytes: 6
+  }))
+  const pruned = sourceCleanCacheInternals.pruneCache({ version: 2, totalHits: 3, entries }, now)
+  assert.equal(pruned.entries.length, 200)
+  assert.equal(pruned.entries.some((entry) => entry.expiresAt < now.toISOString()), false)
+
+  const oversized = sourceCleanCacheInternals.pruneCache({
+    version: 2,
+    totalHits: 0,
+    entries: Array.from({ length: 30 }, (_, index) => ({
+      key: (index + 1).toString(16).padStart(64, '0'),
+      createdAt: '2026-08-09T00:00:00.000Z',
+      lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+      expiresAt: '2026-09-01T00:00:00.000Z',
+      model: 'gpt-5.5',
+      bytes: 2_000_000
+    }))
+  }, now)
+  assert.ok(oversized.entries.length < 30, 'cache byte-cap evicts LRU entries')
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversized), 'utf8') + oversized.entries.reduce((sum, entry) => sum + entry.bytes, 0) <=
+      sourceCleanCacheInternals.MAX_CACHE_BYTES
+  )
+
+  const profileText = [
+    '标签类型,标签,占比',
+    ...Array.from({ length: 80 }, (_, index) => `${index < 40 ? '年龄' : '地区'},标签${index}${'说明'.repeat(100)},${80 - index}%`)
+  ].join('\n')
+  const profile = preprocessTableForModel(profileText)
+  assert.equal(
+    profile.applied,
+    true,
+    `profile preprocessing: applied=${profile.applied} mode=${profile.mode} rows=${profile.originalRows}`
+  )
+  assert.equal(profile.mode, 'profile')
+  assert.equal(profile.retainedRows, 80, 'structured preprocessing must preserve every profile row')
+  assert.equal(profile.canSkipModel, true, 'reliable profile tables are completed locally')
+  assert.match(profile.text, /标签79/u)
+
+  const materialText = [
+    '原视频,完整文案,前三秒文案,素材类型,视角分析,内容形式,场景标签,卖点排序,豆包,豆包.思考过程,豆包.输出结果',
+    ...Array.from({ length: 200 }, (_, index) => {
+      const wrapper = `旧AI包装${index}-${'冗余'.repeat(20)}`
+      return `video-${index}.mp4,${`内容${index}`.repeat(20)},开头${index},3.2,用户视角,产品展示型,家庭,卖点${index},${wrapper},秘密推理${index},${wrapper}`
+    })
+  ].join('\n')
+  const material = preprocessTableForModel(materialText)
+  assert.equal(material.applied, true, `material preprocessing: ${JSON.stringify(material)}`)
+  assert.equal(material.mode, 'material')
+  assert.equal(material.canSkipModel, true)
+  assert.equal(material.retainedRows, 200, 'material preprocessing must never rank or sample rows')
+  assert.doesNotMatch(material.text, /秘密推理|旧AI包装|思考过程|输出结果/u)
+  assert.match(material.text, /视角分析/u)
+  assert.ok(material.text.indexOf('video-0.mp4') < material.text.indexOf('video-199.mp4'))
+  assert.match(material.text, /开头199/u)
+
+  for (const recordCount of [2, 59, 121, 437]) {
+    const rows = [
+      ['原视频', '3秒开头原文', '完整文案', '素材类型', '产品'],
+      ...Array.from({ length: recordCount }, (_, index) => [
+        `video-${index + 1}.mp4`,
+        `开头${index + 1}`,
+        `第${index + 1}条完整文案\n${'长文案'.repeat(90)}`,
+        index % 2 ? '口播' : '场景展示',
+        index % 3 ? '产品A' : '产品B'
+      ])
+    ]
+    const source = {
+      name: `浮动条数-${recordCount}.xlsx`,
+      kind: 'table' as const,
+      text: `### 工作表：素材\n${Papa.unparse(rows, { newline: '\n' })}`,
+      attribution: '竞品数据'
+    }
+    const plan = buildSourceCleanBatchPlan(source)
+    assert.equal(plan.mode, 'table_rows')
+    assert.equal(plan.originalRecordCount, recordCount)
+    assert.equal(plan.scheduledRecordCount, recordCount)
+    assert.equal(plan.isMaterialTable, true)
+    const sentText = plan.batches.map((batch) => batch.source.text || '').join('\n')
+    for (let index = 0; index < recordCount; index++) {
+      assert.equal(
+        sentText.split(`video-${index + 1}.mp4`).length - 1,
+        1,
+        `record ${index + 1}/${recordCount} must enter exactly one cleaning batch`
+      )
+    }
+    assert.ok(
+      plan.batches.every((batch) => (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT),
+      `normal table batches stay within the model-safe limit for ${recordCount} rows`
+    )
+    const combined = combineSourceCleanBatchOutputs(
+      plan,
+      plan.batches.map((batch, index) =>
+        `分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 第${index + 1}批\n\n` +
+          (batch.source.text || '')
+      )
+    )
+    assert.match(combined, new RegExp(`已覆盖素材数量：${recordCount} 条`, 'u'))
+    assert.match(combined, /全部有效记录均已送入清洗|未做抽样/u)
+    const answerSheet = plan.batches.map((batch, index) =>
+      `分类：竞品数据 | 抖音 | 素材数据 | 第${index + 1}批\n${'摘要内容'.repeat(900)}\n` +
+        batch.context.evidenceIds.join('\n')
+    )
+    assert.throws(
+      () => combineSourceCleanBatchOutputs(plan, answerSheet),
+      /未覆盖/u,
+      'copying the answer sheet at the end cannot pass row coverage'
+    )
+    const shortRows = plan.batches.map((batch, index) => {
+      const rows = Papa.parse<string[]>(batch.source.text || '', { skipEmptyLines: 'greedy' }).data
+      return `分类：竞品数据 | 抖音 | 素材数据 | 第${index + 1}批\n${Papa.unparse(rows.slice(0, -1))}`
+    })
+    assert.throws(
+      () => combineSourceCleanBatchOutputs(plan, shortRows),
+      /未覆盖/u,
+      'fewer output rows than evidence IDs cannot pass coverage'
+    )
+    const extractionPrompt = String(buildExtractMessages(plan.batches[0].source, plan.batches[0].context)[1].content)
+    for (const id of plan.batches[0].context.evidenceIds) {
+      assert.equal(extractionPrompt.split(id).length - 1, 1, 'table prompt must not repeat the evidence answer sheet')
+    }
+  }
+
+  assert.ok(
+    sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT < sourceCleanBatchInternals.SOURCE_TEXT_COMPATIBILITY_LIMIT,
+    'cleaning batches must remain below the source compaction threshold'
+  )
+  const tooWideTable = Papa.unparse([
+    Array.from({ length: 201 }, (_, index) => `列${index + 1}`),
+    Array.from({ length: 201 }, (_, index) => `值${index + 1}`)
+  ])
+  const degraded = buildSourceCleanBatchPlan({ name: '超宽表格.csv', kind: 'table', text: tooWideTable })
+  assert.equal(degraded.mode, 'single')
+  assert.equal(degraded.degradedReason, 'too_wide')
+
+  const longDocument = `文档开头-${'A'.repeat(70_000)}-文档中段-${'B'.repeat(70_000)}-文档结尾`
+  const documentPlan = buildSourceCleanBatchPlan({ name: '长文档.md', kind: 'doc', text: longDocument })
+  assert.ok(documentPlan.batches.length > 1)
+  assert.equal(
+    documentPlan.batches
+      .map((batch) => (batch.source.text || '').replace(/^【证据片段ID】POR-T-[A-F0-9]{8}-\d{6}\n/u, ''))
+      .join(''),
+    longDocument
+  )
+  assert.match(documentPlan.batches[0].source.text || '', /文档开头/u)
+  assert.match(documentPlan.batches[documentPlan.batches.length - 1].source.text || '', /文档结尾/u)
+  assert.throws(
+    () => combineSourceCleanBatchOutputs(documentPlan, ['只完成一批']),
+    /清洗批次不完整/u,
+    'partial batch output must never be marked complete'
+  )
+
+  const flexiblePrompt = buildExtractMessages(
+    { name: '不规则资料.json', kind: 'doc', text: '{"未知字段":"必须保留"}' },
+    documentPlan.batches[0].context
+  )
+  assert.match(String(flexiblePrompt[1].content), /不要硬套同一种模板|保留原有层级和字段|不得.*抽样/u)
+  assert.match(String(flexiblePrompt[1].content), /未知字段/u)
+
+  const summarySource = [
+    '分类：竞品数据 | 抖音 | 素材数据 | 需补充 | 表格 | 多批资料',
+    '## 系统完整性核对\n- 动态清洗批次：4 批',
+    ...Array.from({ length: 4 }, (_, index) =>
+      `### 清洗批次 ${index + 1}/4\n批次标记-${index + 1}\n${String(index + 1).repeat(5_000)}`
+    )
+  ].join('\n\n')
+  const summaryMessages = buildSummaryMessages([{ name: '多批素材.csv', text: summarySource }])
+  const summaryPayload = String(summaryMessages[1].content)
+  assert.match(summaryPayload, /批次标记-1/u)
+  assert.match(summaryPayload, /批次标记-4/u)
+  assert.match(summaryPayload, /完整结果仍保存在来源清洗明细/u)
+  assert.doesNotMatch(summaryPayload, /本文件清洗结果过长，已截断/u)
+
+  const allCoverageText = [
+    `超大资料开头-${'甲'.repeat(90_000)}`,
+    `超大资料中段-${'乙'.repeat(90_000)}`,
+    `超大资料结尾-${'丙'.repeat(90_000)}`
+  ].join('\n')
+  const summaryGroups = planSummaryDetailGroups([
+    { name: '超大经营资料.txt', text: allCoverageText },
+    { name: '小型补充资料.md', text: '补充证据-必须进入汇总' }
+  ])
+  assert.ok(summaryGroups.length > 1, 'oversized clean details use hierarchical summary groups')
+  const reconstructed = summaryGroups
+    .flatMap((group) => group.parts)
+    .filter((part) => part.sourceName === '超大经营资料.txt')
+    .map((part) => part.text)
+    .join('')
+  assert.equal(reconstructed, allCoverageText, 'every character enters exactly one hierarchical summary group')
+  const groupPayloads = summaryGroups.map((group, index) =>
+    String(buildSummaryGroupMessages(group, index + 1, summaryGroups.length)[1].content)
+  )
+  assert.match(groupPayloads.join('\n'), /超大资料开头/u)
+  assert.match(groupPayloads.join('\n'), /超大资料中段/u)
+  assert.match(groupPayloads.join('\n'), /超大资料结尾/u)
+  assert.match(groupPayloads.join('\n'), /补充证据-必须进入汇总/u)
+  const mergedSummaryPrompt = String(buildSummaryMergeMessages(['中间汇总A', '中间汇总B'])[1].content)
+  assert.match(mergedSummaryPrompt, /中间汇总A[\s\S]*中间汇总B/u)
+
+  const unknownText = ['甲列,乙列', ...Array.from({ length: 800 }, (_, index) => `${index},${'未知'.repeat(20)}`)].join('\n')
+  const unknown = preprocessTableForModel(unknownText)
+  assert.equal(unknown.applied, false)
+  assert.equal(unknown.text, unknownText)
+
+  const productText = [
+    '统计周期,商品名称,商品编码,成交金额,成交订单数,投放消耗（店铺被投）,完全无关字段',
+    ...Array.from({ length: 160 }, (_, index) => `2026-08,商品${index},SKU-${index},${index * 10},${index},${index * 2},${'冗余'.repeat(60)}`)
+  ].join('\n')
+  const product = preprocessTableForModel(productText)
+  assert.equal(product.applied, true)
+  assert.equal(product.mode, 'product')
+  assert.match(product.text, /商品名称|成交金额|成交订单数/u)
+  assert.match(product.text, /完全无关字段/u, 'unknown business columns are preserved instead of guessed away')
+  const unrankableProductText = [
+    '商品名称,商品编码,完全未知字段',
+    ...Array.from({ length: 200 }, (_, index) => `商品${index},SKU-${index},${'未知'.repeat(80)}`)
+  ].join('\n')
+  const unrankableProduct = preprocessTableForModel(unrankableProductText)
+  assert.equal(unrankableProduct.canSkipModel, true, 'reliable structured product rows do not require a ranking metric')
+  assert.equal(unrankableProduct.retainedRows, 200)
+  assert.match(unrankableProduct.text, /商品199/u)
+
+  const localTableSource = {
+    name: '可靠成交数据.csv',
+    kind: 'table' as const,
+    text: '商品名称,成交金额,成交订单数\n产品A,1200,12\n产品B,800,8\n产品B,800,8\n,,',
+    attribution: '自有数据',
+    platform: '视频号',
+    purpose: '商品成交数据',
+    note: '近30天'
+  }
+  const localTable = preprocessTableForModel(localTableSource.text)
+  assert.equal(localTable.confidence, 'high')
+  assert.equal(localTable.canSkipModel, true)
+  assert.equal(localTable.retainedRows, 3, 'identical rows are preserved because they may represent separate records')
+  const localDetail = buildLocalTableCleanDetail(localTableSource, localTable)
+  assert.ok(localDetail)
+  assert.match(localDetail!, /未调用模型|以下内容只来自原表格|产品A/u)
+  assert.equal((localDetail!.match(/产品B,800,8/gu) || []).length, 2)
+  const semanticTable = preprocessTableForModel('标题,脚本文案,成交金额\n测试,这是一段内容,100')
+  assert.equal(semanticTable.canSkipModel, true, 'reliable semantic rows are passed intact to later analysis without a cleaning rewrite')
+  assert.ok(buildLocalTableCleanDetail({ ...localTableSource, text: '标题,脚本文案,成交金额\n测试,内容,100' }, semanticTable))
+  assert.equal(preprocessTableForModel('not a reliable table').canSkipModel, false)
+
+  const sharedData = '固定资料'.repeat(1_000)
+  const digestMessages = buildEvidenceDigestMessages({
+    evidenceGroup: '事实A POR-R-ABCDEF12-000001',
+    groupIndex: 1,
+    groupCount: 2
+  })
+  assert.match(String(digestMessages[1].content), /POR-R-ABCDEF12-000001/u)
+  assert.match(String(digestMessages[1].content), /全部分析步骤|证据ID/u)
+  const step1 = buildStepMessages({ stepId: 1, stepTitle: '确定产品', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
+  const step2 = buildStepMessages({ stepId: 2, stepTitle: '卖点拆解', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
+  assert.deepEqual(step1[0], step2[0])
+  assert.equal(String(step1[1].content).indexOf(sharedData) < String(step1[1].content).indexOf('当前任务'), true, 'step prompt prefix')
+  const fullSkillSentinel = 'THIS_FULL_SKILL_MUST_NOT_BE_SENT'
+  const compactStep = buildStepMessages({ stepId: 8, stepTitle: '执行选题', sopRules: fullSkillSentinel.repeat(1_000), cleanedData: sharedData, priorOutputs: [] })
+  assert.doesNotMatch(String(compactStep[0].content), /THIS_FULL_SKILL_MUST_NOT_BE_SENT/u)
+  assert.ok(COMPACT_RUNTIME_RULES.length < 5_000, 'compact runtime rules stay materially smaller than the full skill')
+  assert.match(COMPACT_RUNTIME_RULES, /12维|3\.1=|0—11章|不同平台/u)
+  const allArtifacts = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [index + 1, `产出${index + 1}`]))
+  assert.deepEqual(priorOutputsForStep(2, allArtifacts).map((item) => item.id), [1])
+  assert.deepEqual(priorOutputsForStep(5, allArtifacts).map((item) => item.id), [1, 4])
+  assert.deepEqual(priorOutputsForStep(8, allArtifacts).map((item) => item.id), [5, 6, 7])
+  const finalA = buildFinalReportPartMessages({ part: FINAL_REPORT_PARTS[0], cleanedData: sharedData, priorOutputs: [] })
+  const finalB = buildFinalReportPartMessages({ part: FINAL_REPORT_PARTS[1], cleanedData: sharedData, priorOutputs: [] })
+  assert.deepEqual(finalA[0], finalB[0])
+  assert.equal(String(finalA[1].content).indexOf(sharedData) < String(finalA[1].content).indexOf('本次只生成'), true, 'final prompt prefix')
+
+  const previous = [
+    '# 测试产品经营报告',
+    '生成日期：2026-08-09',
+    ...Array.from({ length: 12 }, (_, index) => `## ${index}. 章节${index}\n旧内容${index}`),
+    '> (注：内容由 AI 生成，请谨慎参考）'
+  ].join('\n\n')
+  const selectedNine = selectRevisionParts('请修改第9章脚本选题')
+  assert.deepEqual(selectedNine.map((part) => part.id), ['part-9'])
+  const merged = mergeRevisionParts(previous, '## 9. 章节9\n新内容9', selectedNine)
+  assert.ok(merged)
+  assert.match(merged!, /## 9\. 章节9\n新内容9/u)
+  assert.match(merged!, /## 8\. 章节8\n旧内容8/u)
+  assert.match(merged!, /## 10\. 章节10\n旧内容10/u)
+  assert.equal(mergeRevisionParts(previous, '缺少章节标题', selectedNine), null)
+  assert.deepEqual(selectRevisionParts('把人群和风险建议一起调整').map((part) => part.id), ['part-5-8', 'part-10-11'])
+  assert.equal(selectRevisionParts('整体再专业一点').length, FINAL_REPORT_PARTS.length)
+
+  await clearReportResultCache()
+  await reportResultCacheInternals.resetForTests()
+  const reportInput = {
+    sources: [localTableSource, { ...source, name: '画像.csv' }],
+    userRequirements: '经营建议更具体'
+  }
+  const completeReport = [
+    '# 测试产品经营报告',
+    ...Array.from({ length: 12 }, (_, index) => `## ${index}. 章节${index}\n内容${index}`)
+  ].join('\n\n')
+  const reportSnapshot = {
+    cleanedData: '归一数据',
+    cleanDetails: reportInput.sources.map((item) => ({ name: item.name, text: `清洗：${item.name}` })),
+    artifacts: Object.fromEntries(Array.from({ length: 9 }, (_, index) => [index + 1, index === 8 ? completeReport : `步骤${index + 1}`])),
+    reportMarkdown: completeReport
+  }
+  const reportKey = reportResultCacheKey(reportInput, 'gpt-5.5')
+  assert.equal(reportKey.length, 64)
+  assert.notEqual(reportResultCacheKey({ ...reportInput, sources: [...reportInput.sources].reverse() }, 'gpt-5.5'), reportKey)
+  assert.notEqual(reportResultCacheKey({ ...reportInput, userRequirements: '换一个要求' }, 'gpt-5.5'), reportKey)
+  assert.equal((await storeReportResultCache(reportInput, 'gpt-5.5', reportSnapshot)).stored, true)
+  const reportHit = await lookupReportResultCache(reportInput, 'gpt-5.5')
+  assert.equal(reportHit.hit, true)
+  assert.equal(reportHit.snapshot?.reportMarkdown, completeReport)
+  assert.equal(reportHit.stats.totalHits, 1)
+  for (let index = 0; index < 24; index++) {
+    await storeReportResultCache(
+      { ...reportInput, userRequirements: `要求-${index}` },
+      'gpt-5.5',
+      reportSnapshot
+    )
+  }
+  assert.equal((await getReportResultCacheStats()).entryCount, 20, 'report cache uses the 20-entry LRU cap')
+  const oversizedReportCache = reportResultCacheInternals.pruneCache({
+    version: 2,
+    totalHits: 0,
+    entries: Array.from({ length: 4 }, (_, index) => ({
+      key: (index + 100).toString(16).padStart(64, '0'),
+      createdAt: '2026-08-09T00:00:00.000Z',
+      lastUsedAt: new Date(now.getTime() - index * 1_000).toISOString(),
+      expiresAt: '2026-09-01T00:00:00.000Z',
+      model: 'gpt-5.5',
+      bytes: 6_000_000
+    }))
+  }, now)
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(oversizedReportCache), 'utf8') +
+      oversizedReportCache.entries.reduce((sum, entry) => sum + entry.bytes, 0) <=
+      reportResultCacheInternals.MAX_CACHE_BYTES
+  )
+
+  await costOptimizationInternals.resetForTests()
+  await appendCostOptimizationEvent({
+    schemaVersion: 1,
+    id: 'local-clean:test-session:source-1',
+    reportSessionId: 'test-session',
+    type: 'local_source_clean',
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: 1,
+    sourceCacheHits: 0,
+    skippedModelRequests: 1,
+    reusedReports: 0
+  })
+  await appendCostOptimizationEvent({
+    schemaVersion: 1,
+    id: 'report-reuse:test-cache-key',
+    reportSessionId: 'test-session',
+    type: 'report_cache_reuse',
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: 0,
+    sourceCacheHits: 0,
+    skippedModelRequests: 15,
+    reusedReports: 1
+  })
+  const optimization = await getTokenOptimizationMetrics()
+  assert.deepEqual(optimization, {
+    localCompletedFiles: 1,
+    sourceCacheHits: 0,
+    skippedModelRequests: 16,
+    reusedReports: 1
+  })
+  assert.doesNotMatch(readFileSync(costOptimizationLogPath(), 'utf8'), /API Key|activation_code|提示词|产品A/u)
+
+  let modelOrBillingCalls = 0
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      preflightProjectStorage: async () => ({
+        ok: true,
+        estimatedBytes: 1,
+        freeBytes: 1024 * 1024 * 1024,
+        requiredBytes: 2,
+        message: '可安全保存'
+      }),
+      lookupReportResultCache: async () => reportHit,
+      canStartPointsReport: async () => {
+        modelOrBillingCalls++
+        throw new Error('points check must not run for a cache offer')
+      },
+      recordCostOptimization: async () => true,
+      sendChat: () => {
+        modelOrBillingCalls++
+        return { abort: () => undefined }
+      },
+      getReportPointsCharge: async () => {
+        modelOrBillingCalls++
+        return { chargedPoints: 1 }
+      }
+    }
+  }
+  useStore.setState({
+    reportReuseOffer: null,
+    analysisSessionId: 'reuse-session',
+    sources: reportInput.sources.map((item, index) => ({ ...item, id: `source-${index}` })),
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    phase: 'idle'
+  })
+  await useStore.getState().startGeneration()
+  assert.equal(modelOrBillingCalls, 0, 'cache lookup happens before model and points checks')
+  assert.equal(useStore.getState().reportReuseOffer?.cacheKey, reportHit.cacheKey)
+  await useStore.getState().acceptReportReuse()
+  assert.equal(modelOrBillingCalls, 0, 'full report reuse does not call model or points billing')
+  assert.equal(useStore.getState().phase, 'checkpoint2')
+  assert.equal(useStore.getState().reportMarkdown, completeReport)
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /已恢复上次的完整报告/u)
+  assert.doesNotMatch(useStore.getState().messages.at(-1)?.text || '', /Token|扣除|计费|毛利/u)
+
+  const reuseModalSource = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'components', 'ReportReuseModal.tsx'), 'utf8')
+  assert.match(reuseModalSource, /直接使用上次报告/u)
+  assert.match(reuseModalSource, /重新生成一份/u)
+  assert.doesNotMatch(reuseModalSource, /Token|扣积分|毛利|每百万/u)
+
+  await clearReportResultCache()
+  writeFileSync(join(tempUserData, 'report-result-cache.json'), '{broken', 'utf8')
+  writeFileSync(join(tempUserData, 'report-result-cache.json.bak'), 'also broken', 'utf8')
+  assert.equal((await getReportResultCacheStats()).entryCount, 0, 'corrupt report cache is ignored')
+
+  await clearSourceCleanCache()
+  assert.equal((await getSourceCleanCacheStats()).entryCount, 0)
+  writeFileSync(join(tempUserData, 'source-clean-cache.json'), '{broken', 'utf8')
+  writeFileSync(join(tempUserData, 'source-clean-cache.json.bak'), 'also broken', 'utf8')
+  assert.equal((await getSourceCleanCacheStats()).entryCount, 0, 'corrupt cache is ignored')
+  await clearSourceCleanCache()
+  await clearReportResultCache()
+  await costOptimizationInternals.resetForTests()
 }
 
 async function testCsvAndArchiveGuards(): Promise<void> {
@@ -584,13 +3084,217 @@ async function testCsvAndArchiveGuards(): Promise<void> {
   assert.equal(utf16WithoutBomParsed.ok, true)
   assert.match(utf16WithoutBomParsed.text, /你好/)
 
+  const utf8Markdown = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from('# 产品手卡\n\n- 核心卖点：中文 Markdown 可解析\n', 'utf8')
+  ])
+  const utf8MarkdownParsed = await parseFile(
+    '产品手卡.MD',
+    utf8Markdown.buffer.slice(
+      utf8Markdown.byteOffset,
+      utf8Markdown.byteOffset + utf8Markdown.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(utf8MarkdownParsed.ok, true)
+  assert.match(utf8MarkdownParsed.text, /中文 Markdown 可解析/)
+
+  const gbMarkdown = iconv.encode('# 竞品说明\n\n价格带：100-199元\n', 'gb18030')
+  const gbMarkdownParsed = await parseFile(
+    '竞品说明.markdown',
+    gbMarkdown.buffer.slice(gbMarkdown.byteOffset, gbMarkdown.byteOffset + gbMarkdown.byteLength) as ArrayBuffer
+  )
+  assert.equal(gbMarkdownParsed.ok, true)
+  assert.match(gbMarkdownParsed.text, /竞品说明/)
+  assert.match(gbMarkdownParsed.text, /价格带/)
+
+  const utf16Markdown = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('# 用户画像\n\n已育女性为核心人群', 'utf16le')
+  ])
+  const utf16MarkdownParsed = await parseFile(
+    '用户画像.md',
+    utf16Markdown.buffer.slice(
+      utf16Markdown.byteOffset,
+      utf16Markdown.byteOffset + utf16Markdown.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(utf16MarkdownParsed.ok, true)
+  assert.match(utf16MarkdownParsed.text, /已育女性为核心人群/)
+
+  const tsv = Buffer.from('字段\t数值\n成交金额\t1234\n素材数\t59\n', 'utf8')
+  const tsvParsed = await parseFile(
+    '经营数据.tsv',
+    tsv.buffer.slice(tsv.byteOffset, tsv.byteOffset + tsv.byteLength) as ArrayBuffer
+  )
+  assert.equal(tsvParsed.ok, true)
+  assert.equal(tsvParsed.kind, 'table')
+  assert.match(tsvParsed.text, /成交金额,1234/u)
+
+  const yaml = Buffer.from('产品: 酸菜\n经营指标:\n  成交金额: 1234\n', 'utf8')
+  const yamlParsed = await parseFile(
+    '经营资料.yaml',
+    yaml.buffer.slice(yaml.byteOffset, yaml.byteOffset + yaml.byteLength) as ArrayBuffer
+  )
+  assert.equal(yamlParsed.ok, true)
+  assert.match(yamlParsed.text, /成交金额: 1234/u)
+
+  const log = Buffer.from('[2026-08-18] 直播成交金额=1234，退款=12\n', 'utf8')
+  const logParsed = await parseFile(
+    '经营记录.log',
+    log.buffer.slice(log.byteOffset, log.byteOffset + log.byteLength) as ArrayBuffer
+  )
+  assert.equal(logParsed.ok, true)
+  assert.match(logParsed.text, /退款=12/u)
+
+  const rtf = Buffer.from('{\\rtf1\\ansi\\ansicpg936 Product benefit: \\u37240?\\u40092?\\par GMV 1234}', 'latin1')
+  const rtfParsed = await parseFile(
+    '产品说明.rtf',
+    rtf.buffer.slice(rtf.byteOffset, rtf.byteOffset + rtf.byteLength) as ArrayBuffer
+  )
+  assert.equal(rtfParsed.ok, true)
+  assert.doesNotMatch(rtfParsed.text, /\\rtf1|\\par/u)
+  assert.match(rtfParsed.text, /Product benefit:[\s\S]*GMV 1234/u)
+
+  const json = Buffer.from(JSON.stringify({ 产品: '酸菜', 指标: { 成交金额: 1234 }, 素材: [1, 2, 3] }), 'utf8')
+  const jsonParsed = await parseFile(
+    '经营资料.json',
+    json.buffer.slice(json.byteOffset, json.byteOffset + json.byteLength) as ArrayBuffer
+  )
+  assert.equal(jsonParsed.ok, true)
+  assert.match(jsonParsed.text, /"成交金额": 1234/u)
+
+  const malformedJson = Buffer.from('{"产品":"酸菜", trailing-data', 'utf8')
+  const malformedJsonParsed = await parseFile(
+    '不规则导出.json',
+    malformedJson.buffer.slice(
+      malformedJson.byteOffset,
+      malformedJson.byteOffset + malformedJson.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(malformedJsonParsed.ok, true)
+  assert.match(malformedJsonParsed.warning || '', /完整原文继续清洗/u)
+  assert.match(malformedJsonParsed.text, /trailing-data/u)
+
+  const html = Buffer.from(
+    '<html><body><h1>商品经营数据</h1><table><tr><th>成交金额</th><th>订单</th></tr><tr><td>1234</td><td>12</td></tr></table><script>steal-secret()</script></body></html>',
+    'utf8'
+  )
+  const htmlParsed = await parseFile(
+    '平台网页导出.html',
+    html.buffer.slice(html.byteOffset, html.byteOffset + html.byteLength) as ArrayBuffer
+  )
+  assert.equal(htmlParsed.ok, true)
+  assert.match(htmlParsed.text, /商品经营数据|成交金额|1234/u)
+  assert.doesNotMatch(htmlParsed.text, /steal-secret/u)
+  assert.match(htmlParsed.warning || '', /不会执行/u)
+
+  const xml = Buffer.from('<report><product>酸菜</product><gmv>1234</gmv></report>', 'utf8')
+  const xmlParsed = await parseFile(
+    '平台数据.xml',
+    xml.buffer.slice(xml.byteOffset, xml.byteOffset + xml.byteLength) as ArrayBuffer
+  )
+  assert.equal(xmlParsed.ok, true)
+  assert.match(xmlParsed.text, /<gmv>1234<\/gmv>/u)
+
+  const sparseWorkbook = XLSX.utils.book_new()
+  const sparseSheet = XLSX.utils.aoa_to_sheet([['商品', '成交金额'], ['酸菜', 1234]])
+  sparseSheet.B2.f = 'SUM(1200,34)'
+  sparseSheet.B2.l = { Target: 'https://example.com/source-row' }
+  sparseSheet.B2.c = [{ a: '运营', t: '这是退款后成交金额' }]
+  XLSX.utils.book_append_sheet(sparseWorkbook, sparseSheet, '格式刷过大的工作表')
+  const sparseBase = XLSX.write(sparseWorkbook, { type: 'buffer', bookType: 'xlsx' }) as Buffer
+  const sparseZip = await JSZip.loadAsync(sparseBase)
+  const sparseXmlPath = 'xl/worksheets/sheet1.xml'
+  const sparseXml = await sparseZip.file(sparseXmlPath)!.async('string')
+  sparseZip.file(sparseXmlPath, sparseXml.replace(/<dimension ref="[^"]+"\/>/u, '<dimension ref="A1:XFD1048576"/>'))
+  sparseZip.file('xl/media/image1.png', makePng(12, 12))
+  const sparseBytes = await sparseZip.generateAsync({ type: 'nodebuffer' })
+  const sparseParsed = await parseFile(
+    '平台格式刷.xlsx',
+    sparseBytes.buffer.slice(sparseBytes.byteOffset, sparseBytes.byteOffset + sparseBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(sparseParsed.ok, true, sparseParsed.error)
+  assert.match(sparseParsed.text, /酸菜,1234/u)
+  assert.match(sparseParsed.text, /SUM\(1200,34\)/u)
+  assert.match(sparseParsed.text, /https:\/\/example\.com\/source-row/u)
+  assert.match(sparseParsed.text, /这是退款后成交金额/u)
+  assert.equal(sparseParsed.attachments?.length, 1)
+  assert.match(sparseParsed.warning || '', /内嵌图片/u)
+
+  for (const bookType of ['xlsm', 'xlsb', 'ods'] as const) {
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([['商品', '成交金额'], ['酸菜', 1234]]), '经营数据')
+    const workbookBytes = XLSX.write(workbook, { type: 'buffer', bookType }) as Buffer
+    const parsedWorkbook = await parseFile(
+      `经营数据.${bookType}`,
+      workbookBytes.buffer.slice(
+        workbookBytes.byteOffset,
+        workbookBytes.byteOffset + workbookBytes.byteLength
+      ) as ArrayBuffer
+    )
+    assert.equal(parsedWorkbook.ok, true, `${bookType}: ${parsedWorkbook.error || ''}`)
+    assert.match(parsedWorkbook.text, /酸菜,1234/u)
+  }
+
+  const sharp = (await import('sharp')).default
+  const tiffBytes = await sharp({
+    create: { width: 24, height: 18, channels: 3, background: { r: 20, g: 120, b: 220 } }
+  }).tiff().toBuffer()
+  const tiffParsed = await parseFile(
+    '扫描图片.tiff',
+    tiffBytes.buffer.slice(tiffBytes.byteOffset, tiffBytes.byteOffset + tiffBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(tiffParsed.ok, true, tiffParsed.error)
+  assert.equal(tiffParsed.attachments?.length, 1)
+  assert.match(tiffParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+  assert.match(tiffParsed.warning || '', /自动/u)
+
+  const gifBytes = await sharp({
+    create: { width: 18, height: 18, channels: 4, background: { r: 240, g: 120, b: 20, alpha: 1 } }
+  }).gif().toBuffer()
+  const gifParsed = await parseFile(
+    '素材动图.gif',
+    gifBytes.buffer.slice(gifBytes.byteOffset, gifBytes.byteOffset + gifBytes.byteLength) as ArrayBuffer
+  )
+  assert.equal(gifParsed.ok, true, gifParsed.error)
+  assert.equal(gifParsed.attachments?.length, 1)
+  assert.match(gifParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+
+  const pptx = new JSZip()
+  pptx.file('[Content_Types].xml', '<Types/>')
+  pptx.file(
+    'ppt/slides/slide1.xml',
+    '<p:sld xmlns:p="p" xmlns:a="a"><a:t xml:space="preserve">保留空格的产品卖点</a:t></p:sld>'
+  )
+  pptx.file('ppt/slides/slide2.xml', '<p:sld xmlns:p="p" xmlns:a="a"></p:sld>')
+  pptx.file('ppt/media/image1.png', makePng(10, 10))
+  const pptxBytes = await pptx.generateAsync({ type: 'arraybuffer' })
+  const pptxParsed = await parseFile('产品手卡.pptx', pptxBytes)
+  assert.equal(pptxParsed.ok, true, pptxParsed.error)
+  assert.match(pptxParsed.text, /保留空格的产品卖点/u)
+  assert.match(pptxParsed.warning || '', /第 2 页没有可提取文字/u)
+  assert.match(pptxParsed.warning || '', /1 张内嵌图片/u)
+  assert.equal(pptxParsed.attachments?.length, 1)
+  assert.match(pptxParsed.attachments?.[0]?.dataUrl || '', /^data:image\/png;base64,/u)
+
+  const imageOnlyPptx = new JSZip()
+  imageOnlyPptx.file('[Content_Types].xml', '<Types/>')
+  imageOnlyPptx.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="p" xmlns:a="a"></p:sld>')
+  imageOnlyPptx.file('ppt/media/only.png', makePng(20, 20))
+  const imageOnlyBytes = await imageOnlyPptx.generateAsync({ type: 'arraybuffer' })
+  const imageOnlyParsed = await parseFile('纯图产品手卡.pptx', imageOnlyBytes)
+  assert.equal(imageOnlyParsed.ok, true, imageOnlyParsed.error)
+  assert.equal(imageOnlyParsed.text, '')
+  assert.equal(imageOnlyParsed.attachments?.length, 1)
+
   const malformed = Buffer.from('name,comment\nA,"没有结束\n', 'utf8')
   const malformedParsed = await parseFile(
     'malformed.csv',
     malformed.buffer.slice(malformed.byteOffset, malformed.byteOffset + malformed.byteLength) as ArrayBuffer
   )
-  assert.equal(malformedParsed.ok, false)
-  assert.match(malformedParsed.error || '', /CSV/)
+  assert.equal(malformedParsed.ok, true, 'malformed CSV falls back to complete raw text instead of failing the file')
+  assert.match(malformedParsed.warning || '', /完整原文继续清洗/u)
+  assert.equal(malformedParsed.text, malformed.toString('utf8').trim())
 
   const wrongColumns = Buffer.from('a,b\n1,2,3\n', 'utf8')
   const wrongColumnsParsed = await parseFile(
@@ -601,6 +3305,40 @@ async function testCsvAndArchiveGuards(): Promise<void> {
   assert.match(wrongColumnsParsed.warning || '', /自动兼容/)
   const preservedWrongColumns = Papa.parse<string[]>(wrongColumnsParsed.text).data as string[][]
   assert.deepEqual(preservedWrongColumns[1], ['1', '2', '3'])
+
+  const oversizedExtract = Buffer.from(`name,content\nA,${'x'.repeat(1_000_100)}`, 'utf8')
+  const oversizedExtractParsed = await parseFile(
+    'oversized-extract.csv',
+    oversizedExtract.buffer.slice(
+      oversizedExtract.byteOffset,
+      oversizedExtract.byteOffset + oversizedExtract.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(oversizedExtractParsed.ok, true, 'dynamic cleaning accepts content above the former one-million-character cap')
+  assert.equal(oversizedExtractParsed.text.length, oversizedExtract.toString('utf8').trim().length)
+  const oversizedPlan = buildSourceCleanBatchPlan({
+    name: oversizedExtractParsed.name,
+    kind: 'table',
+    text: oversizedExtractParsed.text
+  })
+  assert.ok(oversizedPlan.batches.length > 1)
+  const oversizedSentText = oversizedPlan.batches.map((batch) => batch.source.text || '').join('\n')
+  assert.equal(
+    (oversizedSentText.match(/x/gu) || []).length,
+    1_000_100,
+    'every character from an oversized table cell enters exactly one cleaning batch'
+  )
+  const beyondSafetyLimit = Buffer.from('z'.repeat(4_000_100), 'utf8')
+  const beyondSafetyParsed = await parseFile(
+    '超过稳定性上限.txt',
+    beyondSafetyLimit.buffer.slice(
+      beyondSafetyLimit.byteOffset,
+      beyondSafetyLimit.byteOffset + beyondSafetyLimit.byteLength
+    ) as ArrayBuffer
+  )
+  assert.equal(beyondSafetyParsed.ok, false)
+  assert.equal(beyondSafetyParsed.text, '')
+  assert.match(beyondSafetyParsed.error || '', /4,000,000|未做截断/u)
 
   const line678Rows = ['a,b']
   for (let index = 2; index <= 677; index++) line678Rows.push(`${index},正常`)
@@ -644,6 +3382,36 @@ async function testCsvAndArchiveGuards(): Promise<void> {
     ['文件夹A/同名.txt', '文件夹B/同名.txt']
   )
 
+  const mixedArchive = new JSZip()
+  mixedArchive.file('数据/成交.tsv', '字段\t数值\nGMV\t1234')
+  mixedArchive.file('数据/画像.json', JSON.stringify({ 人群: '家庭用户' }))
+  mixedArchive.file('说明/网页.html', '<p>用户反馈：包装方便</p>')
+  const mixedBytes = await mixedArchive.generateAsync({ type: 'arraybuffer' })
+  const mixedItems = await parseArchive('混合资料.zip', mixedBytes)
+  assert.equal(mixedItems.length, 3)
+  assert.ok(mixedItems.every((item) => item.ok), JSON.stringify(mixedItems))
+  assert.match(mixedItems.find((item) => item.name.endsWith('成交.tsv'))?.text || '', /GMV,1234/u)
+  assert.match(mixedItems.find((item) => item.name.endsWith('画像.json'))?.text || '', /家庭用户/u)
+  assert.match(mixedItems.find((item) => item.name.endsWith('网页.html'))?.text || '', /包装方便/u)
+
+  const officeArchive = new JSZip()
+  officeArchive.file('手卡/产品手卡.pptx', pptxBytes)
+  const officeArchiveBytes = await officeArchive.generateAsync({ type: 'arraybuffer' })
+  const officeArchiveItems = await parseArchive('Office资料.zip', officeArchiveBytes)
+  assert.match(officeArchiveItems.find((item) => item.name.endsWith('产品手卡.pptx'))?.text || '', /保留空格的产品卖点/u)
+  assert.ok(
+    officeArchiveItems.some((item) => item.kind === 'image' && item.name.includes('产品手卡.pptx/内嵌图片')),
+    JSON.stringify(officeArchiveItems)
+  )
+
+  const crowdedArchive = new JSZip()
+  for (let index = 0; index < 121; index++) crowdedArchive.file(`无关视频-${index}.mp4`, 'x')
+  crowdedArchive.file('zzz-关键产品资料.txt', '这份有效资料必须优先解析')
+  const crowdedBytes = await crowdedArchive.generateAsync({ type: 'arraybuffer' })
+  const crowdedItems = await parseArchive('条目较多.zip', crowdedBytes)
+  assert.match(crowdedItems.find((item) => item.name === 'zzz-关键产品资料.txt')?.text || '', /必须优先解析/u)
+  assert.ok(crowdedItems.some((item) => /数量提示/u.test(item.name)))
+
   const officeBomb = new JSZip()
   officeBomb.file('xl/worksheets/sheet1.xml', '0'.repeat(2 * 1024 * 1024))
   const officeBytes = await officeBomb.generateAsync({
@@ -678,14 +3446,42 @@ async function testFileCountGuard(): Promise<void> {
     reportStale: false,
     analysisSessionId: crypto.randomUUID()
   })
-  const files = Array.from({ length: 201 }, (_, index) => ({
+  const files = Array.from({ length: 51 }, (_, index) => ({
     name: `资料-${index}.txt`,
     size: 2,
     arrayBuffer: async () => new TextEncoder().encode('ok').buffer
   })) as unknown as File[]
   await useStore.getState().addSources(files)
-  assert.equal(useStore.getState().sources.length, 200)
-  assert.match(useStore.getState().messages[0]?.text || '', /最多保留 200/)
+  assert.equal(useStore.getState().sources.length, 50)
+  assert.match(useStore.getState().messages[0]?.text || '', /最多保留 50/)
+
+  useStore.setState({
+    phase: 'idle',
+    sources: [],
+    messages: [],
+    artifacts: {},
+    reportMarkdown: '',
+    cleanedData: '',
+    cleanDetails: [],
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+  const mixedFiles = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      name: `系统附件-${index}.mp4`,
+      size: 2,
+      arrayBuffer: async () => new ArrayBuffer(2)
+    })),
+    ...Array.from({ length: 50 }, (_, index) => ({
+      name: `有效资料-${index}.txt`,
+      size: 2,
+      arrayBuffer: async () => new TextEncoder().encode('ok').buffer
+    }))
+  ] as unknown as File[]
+  await useStore.getState().addSources(mixedFiles)
+  assert.equal(useStore.getState().sources.length, 50)
+  assert.ok(useStore.getState().sources.every((source) => source.name.startsWith('有效资料-')))
+  assert.ok(useStore.getState().sources.every((source) => source.text === 'ok'))
 }
 
 async function testZipExpansionGlobalCountGuard(): Promise<void> {
@@ -720,8 +3516,149 @@ async function testZipExpansionGlobalCountGuard(): Promise<void> {
     arrayBuffer: async () => new ArrayBuffer(8)
   })) as unknown as File[]
   await useStore.getState().addSources(zips)
-  assert.equal(useStore.getState().sources.length, 200)
-  assert.equal(useStore.getState().sources.filter((source) => /数量提示/.test(source.name)).length, 1)
+  assert.equal(useStore.getState().sources.length, 240)
+  assert.equal(new Set(useStore.getState().sources.map((source) => source.topLevelId)).size, 2)
+  assert.equal(useStore.getState().sources.every((source) => source.derivedKind === 'archive-entry'), true)
+  assert.equal(useStore.getState().sources.filter((source) => /数量提示/.test(source.name)).length, 0)
+
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      parseArchive: async () => [
+        ...Array.from({ length: 49 }, (_, index) => ({
+          name: `不支持-${index}.mp4`,
+          kind: 'other' as const,
+          size: 100_000,
+          ok: false,
+          error: '暂不支持'
+        })),
+        { name: '关键经营数据.tsv', kind: 'table' as const, size: 20, text: '字段,数值\nGMV,1234', ok: true },
+        { name: '关键产品手卡.json', kind: 'doc' as const, size: 20, text: '{"产品":"酸菜"}', ok: true }
+      ]
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [],
+    messages: [],
+    artifacts: {},
+    reportMarkdown: '',
+    cleanedData: '',
+    cleanDetails: [],
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+  await useStore.getState().addSources([
+    { name: '混合资料.zip', size: 10, arrayBuffer: async () => new ArrayBuffer(8) } as unknown as File
+  ])
+  assert.ok(useStore.getState().sources.some((source) => source.name === '关键经营数据.tsv'))
+  assert.ok(useStore.getState().sources.some((source) => source.name === '关键产品手卡.json'))
+}
+
+async function testSourceCleaningFailureIsolation(): Promise<void> {
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      lookupSourceCleanCache: async () => {
+        throw new Error('模拟缓存不可用')
+      },
+      storeSourceCleanCache: async () => {
+        throw new Error('模拟缓存写入失败')
+      },
+      saveLastProject: async (project: SavedProject) => project,
+      recordCostOptimization: async () => true,
+      sendChat: (
+        messages: unknown,
+        context: { sourceId?: string },
+        handlers: { onDone?: (value: string) => void; onError?: (value: string) => void }
+      ) => {
+        queueMicrotask(() => {
+          if (context.sourceId === 'broken-source') {
+            // 供应商偶发返回“成功但空内容”时，合并函数会抛错；也必须只影响当前文件。
+            handlers.onDone?.('')
+          } else {
+            const evidenceIds = context.sourceId === 'good-source'
+              ? buildSourceCleanBatchPlan({ name: '可正常处理的资料.json', kind: 'doc', text: '{"产品":"酸菜"}' })
+                  .batches.flatMap((batch) => batch.context.evidenceIds)
+              : [...new Set(JSON.stringify(messages).match(/POR-[RTI]-[A-F0-9]{8}-\d{6}/gu) || [])]
+            handlers.onDone?.(`成功资料的完整清洗结果\n${evidenceIds.join('\n')}`)
+          }
+        })
+        return { abort: () => undefined }
+      }
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [
+      {
+        id: 'broken-source',
+        name: '暂时失败的资料.md',
+        kind: 'doc',
+        text: '# 暂时失败',
+        attribution: '自有数据'
+      },
+      {
+        id: 'good-source',
+        name: '可正常处理的资料.json',
+        kind: 'doc',
+        text: '{"产品":"酸菜"}',
+        attribution: '自有数据'
+      }
+    ],
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    abortFn: null,
+    analysisSessionId: crypto.randomUUID()
+  })
+
+  await useStore.getState()._runCleaning(false)
+
+  assert.deepEqual(useStore.getState().cleanDetails.map((detail) => detail.id), ['good-source'])
+  assert.equal(useStore.getState().cleaningProgress.done, 1)
+  assert.equal(useStore.getState().cleaningProgress.failed, 1)
+  assert.equal(useStore.getState().phase, 'idle')
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /其他资料已继续清洗并保留/u)
+}
+
+async function testParseFailureBlocksGeneration(): Promise<void> {
+  let chatCalls = 0
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      sendChat: () => {
+        chatCalls++
+        return { abort: () => undefined }
+      }
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [
+      { id: 'good', name: '已解析.txt', kind: 'doc', text: '有效资料', attribution: '自有数据' },
+      { id: 'bad', name: '扫描件.pdf', kind: 'doc', error: 'PDF 没有可提取的文本层' }
+    ],
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    analysisSessionId: crypto.randomUUID()
+  })
+
+  await useStore.getState().startGeneration()
+
+  assert.equal(chatCalls, 0)
+  assert.equal(useStore.getState().phase, 'idle')
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /为避免报告漏掉资料，本次没有开始分析/u)
 }
 
 async function testPrivacyMustMatchEndpoint(): Promise<void> {
@@ -902,8 +3839,8 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
     ],
     cleanDetails: [{ id: 'blank', name: '资料一.csv', text: '旧清洗' }],
     cleanedData: '旧清洗',
-    artifacts: { 9: '已完成报告' },
-    reportMarkdown: '已完成报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false
   })
   useStore.getState().setUnconfirmedAttribution('自有数据')
@@ -912,7 +3849,7 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
   assert.equal(afterBulk.sources.find((source) => source.id === 'chosen')?.attribution, '竞品数据')
   assert.equal(afterBulk.sources.find((source) => source.id === 'failed')?.attribution, undefined)
   assert.equal(afterBulk.cleanDetails.length, 0)
-  assert.equal(afterBulk.reportMarkdown, '已完成报告')
+  assert.equal(afterBulk.reportMarkdown, HTML_REPORT_FIXTURE)
   assert.equal(afterBulk.reportStale, true)
 
   let opened = ''
@@ -930,8 +3867,8 @@ async function testBulkAttributionAndExportOpen(): Promise<void> {
   }
   useStore.setState({
     phase: 'done',
-    artifacts: { 9: '已完成报告' },
-    reportMarkdown: '已完成报告',
+    artifacts: { 9: HTML_REPORT_FIXTURE },
+    reportMarkdown: HTML_REPORT_FIXTURE,
     reportStale: false,
     exportStatus: '',
     lastExportPath: ''
@@ -957,6 +3894,22 @@ function testExportButtonContract(): void {
   assert.equal(component.includes('其他格式'), false)
 }
 
+function testOptionalOneClickUpdateContract(): void {
+  const appComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'),
+    'utf8'
+  )
+  assert.match(appComponent, /const handleApplyUpdate = async/u)
+  assert.ok(appComponent.includes('立即更新'))
+  assert.ok(appComponent.includes('稍后更新'))
+  assert.match(appComponent, /downloadUpdate\(\)[\s\S]{0,800}installUpdate\(\)/u)
+  assert.doesNotMatch(appComponent, /handleDownloadUpdate|handleInstallUpdate/u)
+
+  const workflow = readFileSync(join(process.cwd(), '..', '.github', 'workflows', 'build-desktop.yml'), 'utf8')
+  assert.doesNotMatch(workflow, /FORCE_PRODUCT_OPERATION_REPORT_UPDATE|PRODUCT_OPERATION_REPORT_MIN_SUPPORTED_VERSION/u)
+  assert.match(workflow, /body\.force !== false/u)
+}
+
 async function testWorkbenchTopbarContract(): Promise<void> {
   const appComponent = readFileSync(
     join(process.cwd(), 'src', 'renderer', 'src', 'App.tsx'),
@@ -965,12 +3918,78 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   const expectedGuideUrl =
     'https://my.feishu.cn/docx/BTSjddkiXo2IGKxiDCJcTM1qnCe?from=from_copylink'
   assert.ok(appComponent.includes(expectedGuideUrl))
+  assert.ok(appComponent.includes('产品与内容经营报告系统'))
+  assert.ok(appComponent.includes('专业的产品经营与内容分析报告系统'))
   assert.equal(appComponent.includes('FU5FdRkHFoNH7JxUp6wciLksnEe'), false)
-
-  const styles = readFileSync(
-    join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'),
+  assert.equal(appComponent.includes('Token 统计'), false, 'Token statistics are not exposed in the customer UI')
+  assert.equal(appComponent.includes('增加 10000 测试积分'), false, 'development credit controls are hidden')
+  assert.doesNotMatch(appComponent, /毛利|每百万|真实成本|points-pricing-summary/u)
+  assert.match(appComponent, /points-ledger-preview/u, 'the points dialog exposes the real server ledger')
+  assert.equal(appComponent.includes('更换电脑'), false, 'device transfer is not placed in the points dialog')
+  assert.match(appComponent, /AUTHORIZATION_REFRESH_INTERVAL_MS = 60_000/u)
+  assert.match(appComponent, /setInterval\(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS\)/u)
+  assert.match(appComponent, /addEventListener\('focus', handleFocus\)/u)
+  assert.match(appComponent, /addEventListener\('visibilitychange', handleVisibilityChange\)/u)
+  assert.match(
+    appComponent,
+    /autosaveAttempt\.current \+= 1[\s\S]{0,100}setAutosaveError\(''\)[\s\S]{0,120}\[activationStatus\?\.activated, activationStatus\?\.licenseId\]/u,
+    'an authorization change invalidates stale autosave failures from the previous license'
+  )
+  const contactComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'ContactAuthor.tsx'),
     'utf8'
-  ).replace(/<\/style/gi, '<\\/style')
+  )
+  assert.match(appComponent, /<ContactAuthor\s*\/>/u)
+  assert.match(contactComponent, />\s*联系作者\s*<\/button>/u)
+  assert.match(contactComponent, /getContact\(\)|onContactChanged/u)
+  assert.doesNotMatch(`${appComponent}\n${contactComponent}`, /azssph2|微信号|扫码添加微信|wechat-contact/iu)
+  assert.equal(
+    existsSync(join(process.cwd(), 'src', 'renderer', 'src', 'assets', 'contact-author-fallback.png')),
+    true,
+    'generic fallback contact image is bundled with the renderer'
+  )
+  assert.match(
+    appComponent,
+    /if \(!activationStatus\?\.activated \|\| !initialized \|\| !settings \|\| persistencePaused\) return/u,
+    'autosave does not run while the software is unbound or awaiting reactivation'
+  )
+  assert.match(
+    appComponent,
+    /onChange=\{\(event\) => \{[\s\S]{0,180}setActivationCode\([\s\S]{0,100}setActivationError\(''\)/u,
+    'changing the activation code clears an error that belongs to the previous code'
+  )
+  assert.match(
+    appComponent,
+    /placeholder="POR-XXXX-XXXX-XXXX-XXXX"[\s\S]{0,120}disabled=\{activationBusy\}/u,
+    'the activation code cannot change while its request is in flight'
+  )
+  const settingsComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'SettingsModal.tsx'),
+    'utf8'
+  )
+  assert.match(settingsComponent, /typeof cacheApi\.getReportResultCacheStats === 'function'/u)
+  assert.match(settingsComponent, /本机缓存管理（一般不用）/u)
+  assert.match(settingsComponent, /设备授权/u)
+  assert.match(settingsComponent, /更换电脑/u)
+  assert.match(settingsComponent, /deactivateCurrentDevice/u)
+  assert.equal(settingsComponent.includes('刷新余额'), false, 'service status does not expose a manual balance refresh button')
+  assert.equal(settingsComponent.includes('refreshAuthorization'), false, 'manual balance refresh handler is removed with its button')
+  assert.doesNotMatch(settingsComponent, /毛利|每百万|真实成本|按真实 Token/u)
+  assert.equal(/if \(!open\) return null[\s\S]{0,500}getReportResultCacheStats\(/u.test(settingsComponent), false)
+  const phaseTrackerComponent = readFileSync(
+    join(process.cwd(), 'src', 'renderer', 'src', 'components', 'PhaseTracker.tsx'),
+    'utf8'
+  )
+  assert.ok(phaseTrackerComponent.includes('最多上传 50 份资料'))
+
+  const styles = [
+    readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'styles.css'), 'utf8'),
+    readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'styles', 'contact-wallet.css'), 'utf8')
+  ].join('\n').replace(/<\/style/gi, '<\\/style')
+  assert.match(styles, /\.contact-entry:focus-within \.contact-qr-popover/u)
+  assert.match(styles, /\.contact-entry\.pinned \.contact-qr-popover/u)
+  assert.match(styles, /@media \(max-width: 46rem\)[\s\S]*?\.contact-entry\s*\{[\s\S]*?display: none/u)
+  if (process.env.CI) return
   const htmlPath = join(tempUserData, 'topbar-layout.html')
   writeFileSync(
     htmlPath,
@@ -980,9 +3999,15 @@ async function testWorkbenchTopbarContract(): Promise<void> {
           <div class="brand">
             <span class="brand-mark"></span>
             <span class="brand-copy">
-              <span class="brand-main">产品经营报告</span>
-              <span class="sub">专业的产品经营分析与报告系统</span>
+              <span class="brand-main">产品与内容经营报告系统</span>
+              <span class="sub">专业的产品经营与内容分析报告系统</span>
             </span>
+          </div>
+          <div class="contact-entry">
+            <button class="contact-trigger" aria-describedby="contact-author-popover">联系作者</button>
+            <div class="contact-qr-popover" id="contact-author-popover" role="tooltip">
+              <strong>联系作者</strong><img alt="联系作者图片"><span>联系方式图片暂未配置</span>
+            </div>
           </div>
           <a class="tutorial-link" href="${expectedGuideUrl}">
             <span class="tutorial-icon"></span>
@@ -996,6 +4021,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
             <span class="model-pill">模型：ai英雄会（gpt-5.5）</span>
             <button class="btn new-analysis-button"><span class="new-analysis-icon">＋</span><span>新建分析</span></button>
             <button class="btn restore-analysis-button">恢复上一份</button>
+            <button class="license-pill">剩余 8,999,699 积分</button>
             <span class="app-version">v0.2.3</span>
             <button class="btn">设置</button>
           </div>
@@ -1005,10 +4031,12 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     'utf8'
   )
 
+  const width = 1280
   const window = new BrowserWindow({
     show: false,
-    width: 1280,
+    width,
     height: 180,
+    useContentSize: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -1019,64 +4047,55 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   topbarAuditWindow = window
   try {
     await window.loadFile(htmlPath)
-    for (const width of [880, 960, 1005, 1120, 1280, 1536, 1600]) {
-      window.setContentSize(width, 180)
-      let layout: {
-        innerWidth: number
-        scrollWidth: number
-        brand: { left: number; right: number; width: number } | null
-        tutorial: { left: number; right: number; width: number } | null
-        actions: { left: number; right: number; width: number } | null
-        modelDisplay: string
-      }
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await new Promise((resolveWait) => setTimeout(resolveWait, 50))
-        layout = (await window.webContents.executeJavaScript(
-          `(() => {
-            const rect = (selector) => {
-              const element = document.querySelector(selector)
-              if (!(element instanceof HTMLElement)) return null
-              const box = element.getBoundingClientRect()
-              return { left: box.left, right: box.right, width: box.width }
-            }
-            const model = document.querySelector('.model-pill')
-            return {
-              innerWidth: window.innerWidth,
-              scrollWidth: document.documentElement.scrollWidth,
-              brand: rect('.brand'),
-              tutorial: rect('.tutorial-link'),
-              actions: rect('.topbar .right'),
-              modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
-            }
-          })()`
-        )) as typeof layout
-        if (layout.innerWidth === width) break
-      }
-      layout ??= {
-        innerWidth: -1,
-        scrollWidth: -1,
-        brand: null,
-        tutorial: null,
-        actions: null,
-        modelDisplay: ''
-      }
-      assert.equal(layout.innerWidth, width)
-      assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
-      assert.ok(layout.brand && layout.tutorial && layout.actions)
-      assert.ok(
-        layout.brand!.right + 8 <= layout.tutorial!.left,
-        `${width}px 品牌区与教程入口重叠`
-      )
-      assert.ok(
-        layout.tutorial!.right + 8 <= layout.actions!.left,
-        `${width}px 教程入口与操作区重叠`
-      )
-      assert.equal(layout.modelDisplay !== 'none', width >= 1536)
+    await new Promise((resolveWait) => setTimeout(resolveWait, 60))
+    const layout = (await window.webContents.executeJavaScript(
+        `(() => {
+          const rect = (selector) => {
+            const element = document.querySelector(selector)
+            if (!(element instanceof HTMLElement)) return null
+            const box = element.getBoundingClientRect()
+            return { left: box.left, right: box.right, width: box.width }
+          }
+          const model = document.querySelector('.model-pill')
+          return {
+            innerWidth: window.innerWidth,
+            scrollWidth: document.documentElement.scrollWidth,
+            brand: rect('.brand'),
+            contact: rect('.contact-entry'),
+            contactPopover: rect('.contact-qr-popover'),
+            tutorial: rect('.tutorial-link'),
+            actions: rect('.topbar .right'),
+            contactDisplay: getComputedStyle(document.querySelector('.contact-entry')).display,
+            topbarZIndex: getComputedStyle(document.querySelector('.topbar')).zIndex,
+            modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
+          }
+        })()`
+    )) as {
+      innerWidth: number
+      scrollWidth: number
+      brand: { left: number; right: number; width: number } | null
+      contact: { left: number; right: number; width: number } | null
+      contactPopover: { left: number; right: number; width: number } | null
+      tutorial: { left: number; right: number; width: number } | null
+      actions: { left: number; right: number; width: number } | null
+      contactDisplay: string
+      topbarZIndex: string
+      modelDisplay: string
     }
-  } catch (error) {
+    assert.equal(layout.innerWidth, width)
+    assert.ok(layout.scrollWidth <= layout.innerWidth, `${width}px 顶栏出现横向滚动`)
+    assert.ok(layout.brand && layout.contact && layout.tutorial && layout.actions)
+    assert.ok(layout.brand!.right + 8 <= layout.contact!.left, `${width}px 品牌区与联系方式重叠`)
+    assert.ok(layout.contact!.right + 8 <= layout.tutorial!.left, `${width}px 联系方式与教程入口重叠`)
+    assert.ok(layout.contactPopover && layout.contactPopover.left >= 0, `${width}px 二维码浮层超出左侧窗口`)
+    assert.ok(layout.contactPopover!.right <= layout.innerWidth, `${width}px 二维码浮层超出右侧窗口`)
+    assert.ok(layout.contactPopover!.width >= 400, '二维码浮层宽度不足，扫码区域会过小')
+    assert.equal(layout.topbarZIndex, '500', '顶栏层级必须高于内容区')
+    assert.ok(layout.tutorial!.right + 8 <= layout.actions!.left, `${width}px 教程入口与操作区重叠`)
+    assert.equal(layout.modelDisplay, 'none')
+  } finally {
     if (!window.isDestroyed()) window.destroy()
     topbarAuditWindow = null
-    throw error
   }
 }
 
@@ -1628,11 +4647,169 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(bundledRules, /Product visual brief/)
 }
 
+async function testContactConfigurationAndCache(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const png = Uint8Array.from(Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  ))
+  const config = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    app_name: 'ProductOperationReport',
+    enabled: true,
+    qr_image_url: 'https://cdn.example.com/contact.png',
+    updated_at: '2026-08-19T10:00:00Z',
+    ...overrides
+  })
+  const reset = (): void => {
+    contactInternals.resetInFlight()
+    rmSync(contactInternals.cacheDirectory(), { recursive: true, force: true })
+  }
+  try {
+    reset()
+    let calls = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls += 1
+      const url = String(input)
+      if (url.includes('/api/contact')) {
+        return new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } })
+    }) as typeof fetch
+    const [remote, sameRemote] = await Promise.all([refreshContactConfig(), refreshContactConfig()])
+    assert.equal(calls, 2, 'concurrent first interactions share one config and image request')
+    assert.equal(remote.source, 'remote')
+    assert.equal(remote.enabled, true)
+    assert.match(remote.imageDataUrl || '', /^data:image\/png;base64,/u)
+    assert.equal(sameRemote.imageDataUrl, remote.imageDataUrl)
+    const cached = getCachedContactState()
+    assert.equal(cached.source, 'cache')
+    assert.equal(cached.imageDataUrl, remote.imageDataUrl)
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => { throw new Error('offline') }) as typeof fetch
+    const offline = await refreshContactConfig()
+    assert.equal(offline.source, 'cache')
+    assert.equal(offline.imageDataUrl, remote.imageDataUrl)
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config({ enabled: false, qr_image_url: '' })), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const disabled = await refreshContactConfig()
+    assert.equal(disabled.enabled, false)
+    assert.equal(disabled.imageDataUrl, undefined)
+    assert.equal(getCachedContactState().enabled, false, 'disabled tombstone prevents an old image from returning')
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config({ qr_image_url: '' })), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const missingImage = await refreshContactConfig()
+    assert.equal(missingImage.enabled, true)
+    assert.equal(missingImage.configured, true)
+    assert.equal(missingImage.imageDataUrl, undefined)
+    assert.match(missingImage.message, /暂未配置/u)
+
+    reset()
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      return url.includes('/api/contact')
+        ? new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+        : new Response(png, { status: 200, headers: { 'content-type': 'image/png' } })
+    }) as typeof fetch
+    const valid = await refreshContactConfig()
+    for (const invalidConfig of [
+      config({ app_name: 'OtherApp' }),
+      config({ qr_image_url: 'http://cdn.example.com/contact.png' })
+    ]) {
+      contactInternals.resetInFlight()
+      globalThis.fetch = (async () => new Response(JSON.stringify(invalidConfig), {
+        status: 200, headers: { 'content-type': 'application/json' }
+      })) as typeof fetch
+      const rejected = await refreshContactConfig()
+      assert.equal(rejected.source, 'cache')
+      assert.equal(rejected.imageDataUrl, valid.imageDataUrl, 'invalid remote config cannot overwrite a valid cache')
+    }
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response(JSON.stringify(config()), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })) as typeof fetch
+    const wrongContentType = await refreshContactConfig()
+    assert.equal(wrongContentType.source, 'cache', 'a non-image response keeps the valid cache')
+
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async () => new Response('not configured', { status: 404 })) as typeof fetch
+    const notConfigured = await refreshContactConfig()
+    assert.equal(notConfigured.configured, false)
+    assert.equal(notConfigured.imageDataUrl, undefined)
+    assert.equal(getCachedContactState().imageDataUrl, undefined, '404 clears the active remote image state')
+
+    reset()
+    contactInternals.resetInFlight()
+    globalThis.fetch = (async (input: string | URL | Request) => String(input).includes('/api/contact')
+      ? new Response(JSON.stringify(config()), { status: 200, headers: { 'content-type': 'application/json' } })
+      : new Response(png, {
+          status: 200,
+          headers: { 'content-type': 'image/png', 'content-length': String(contactInternals.MAX_IMAGE_BYTES + 1) }
+        })) as typeof fetch
+    const oversized = await refreshContactConfig()
+    assert.equal(oversized.source, 'bundled')
+    assert.equal(oversized.imageDataUrl, undefined)
+  } finally {
+    globalThis.fetch = originalFetch
+    contactInternals.resetInFlight()
+    rmSync(contactInternals.cacheDirectory(), { recursive: true, force: true })
+  }
+}
+
 async function run(): Promise<void> {
   console.log('Regression: project persistence')
   await testProjectRevisionAndBackup()
+  console.log('Regression: device identity survives restart and authorization reset')
+  await testDeviceIdentityPersistsAcrossAuthorizationReset()
+  console.log('Regression: historical authorization credential-upgrade retry')
+  await testHistoricalCredentialRefreshRetry()
+  console.log('Regression: securely saved activation recovery')
+  await testSavedActivationRecovery()
+  console.log('Regression: activation single-flight and safe diagnostics')
+  await testActivationAdmissionAndSafeDiagnostics()
   console.log('Regression: activation and settings backup')
   await testActivationAndSettingsBackup()
+  console.log('Regression: server activation, offline grace and idempotent credits')
+  await testServerActivationAndCredits()
+  console.log('Regression: proxy wallet ledger and stale snapshot fallback')
+  await testProxyWalletBridge()
+  console.log('Regression: explicit zero server balance never reissues granted credits')
+  await testExplicitZeroServerBalanceDoesNotReissueGrantedCredits()
+  console.log('Regression: safe device unbind and original-code rebind')
+  await testDeviceUnbindAndRebind()
+  console.log('Regression: remote administrator unbind returns to activation')
+  await testRemoteAdminUnbindReturnsToActivation()
+  console.log('Regression: primary activation code remains unchanged after points recharge')
+  await testPrimaryActivationAndRechargeCodeSeparation()
+  console.log('Regression: strict License Protocol v2 contract and secure credential vault')
+  await testLicenseProtocolV2StrictContract()
+  console.log('Regression: update version comparison')
+  testUpdateVersionComparison()
+  console.log('Regression: signed update manifest')
+  testUpdateManifestSignature()
+  console.log('Regression: update config and SHA256 guard')
+  await testUpdateConfigAndChecksum()
+  console.log('Regression: lazy contact configuration and cache safety')
+  await testContactConfigurationAndCache()
+  console.log('Regression: managed model secret isolation')
+  testManagedModelIsolation()
+  console.log('Regression: fallback model safety boundaries')
+  testModelFallbackSafety()
+  await testModelFallbackSequence()
+  console.log('Regression: main-process chat admission and request ownership')
+  testChatAdmissionSecurity()
+  console.log('Regression: closing during upload or analysis never waits on a renderer snapshot')
+  testCloseDuringActiveWorkContract()
+  console.log('Regression: repair-plan static safety and CI contracts')
+  testRepairPlanStaticContracts()
   console.log('Regression: source invalidation')
   await testSourceInvalidation()
   console.log('Regression: reset save rollback')
@@ -1651,12 +4828,20 @@ async function run(): Promise<void> {
   await testFeedbackArrivingDuringRevision()
   console.log('Regression: strict model completion')
   await testStrictModelCompletion()
+  console.log('Regression: real token usage measurement and privacy')
+  await testTokenUsageMeasurement()
+  console.log('Regression: cost optimization cache, preprocessing, prompt prefix and targeted revision')
+  await testCostOptimizationPrimitives()
   console.log('Regression: CSV and ZIP guards')
   await testCsvAndArchiveGuards()
   console.log('Regression: file count guard')
   await testFileCountGuard()
   console.log('Regression: ZIP expansion global count guard')
   await testZipExpansionGlobalCountGuard()
+  console.log('Regression: one source cleaning failure does not block other files')
+  await testSourceCleaningFailureIsolation()
+  console.log('Regression: parse failures cannot be silently omitted from a report')
+  await testParseFailureBlocksGeneration()
   console.log('Regression: privacy endpoint guard')
   await testPrivacyMustMatchEndpoint()
   console.log('Regression: image header guards')
@@ -1665,11 +4850,13 @@ async function run(): Promise<void> {
   await testBulkAttributionAndExportOpen()
   console.log('Regression: original export button contract')
   testExportButtonContract()
+  console.log('Regression: optional one-click update contract')
+  testOptionalOneClickUpdateContract()
   console.log('Regression: adaptive workbench topbar')
   await testWorkbenchTopbarContract()
   console.log('Regression: adaptive HTML report renderer')
   await testHtmlReportRenderer()
-  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
+  console.log('Regression checks passed: persistence, restore, reset/session isolation, export guard, strict model completion, real token usage measurement and points billing, cost optimization cache/prompt/revision guards, CSV/TXT encoding, ZIP, image and file limits, adaptive offline HTML rendering.')
 }
 
 void app.whenReady().then(async () => {

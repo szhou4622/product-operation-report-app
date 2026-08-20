@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+server-updates/**/provider-keys.json
+server-updates/**/proxy.env

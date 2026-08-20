@@ -12,7 +12,7 @@ try {
     bundle: true,
     platform: 'node',
     format: 'cjs',
-    external: ['electron'],
+    external: ['electron', '@napi-rs/canvas', 'sharp', 'word-extractor'],
     outfile: output,
     logLevel: 'warning'
   })
@@ -20,6 +20,7 @@ try {
   const electron = require('electron')
   const result = spawnSync(electron, [output], {
     cwd: projectDir,
+    env: { ...process.env, PRODUCT_REPORT_ALLOW_UNSIGNED_DEV_UPDATE: '1' },
     stdio: 'inherit',
     windowsHide: true
   })

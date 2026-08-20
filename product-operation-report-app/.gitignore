@@ -5,4 +5,8 @@ dist/
 *.log
 .vite/
 .codex-runtime/
+.update-staging/
 settings.json
+managed-model.local.json
+managed-model.json
+.secrets/

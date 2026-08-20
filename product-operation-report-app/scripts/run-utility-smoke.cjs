@@ -12,7 +12,7 @@ try {
     bundle: true,
     platform: 'node',
     format: 'cjs',
-    external: ['electron'],
+    external: ['electron', '@napi-rs/canvas', 'sharp', 'word-extractor'],
     outfile: output,
     logLevel: 'warning'
   })

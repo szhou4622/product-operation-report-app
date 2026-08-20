@@ -2,6 +2,7 @@ import { app, safeStorage } from 'electron'
 import { join } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import type { AppSettings, ModelProfile } from '../shared/types'
+import { getManagedModelState } from './managedModel'
 
 const SETTINGS_FILE = () => join(app.getPath('userData'), 'settings.json')
 const SETTINGS_BACKUP_FILE = () => `${SETTINGS_FILE()}.bak`
@@ -25,7 +26,8 @@ function encrypt(value: string): string {
   if (safeStorage.isEncryptionAvailable()) {
     return safeStorage.encryptString(value).toString('base64')
   }
-  // 加密不可用（少见，主要在某些 Linux 环境）时退化为明文存储并打标记
+  if (app.isPackaged) throw new Error('系统安全存储暂不可用，无法保存模型凭证。')
+  // 仅开发态允许退化，正式安装版不会把密钥明文落盘。
   return PLAIN_PREFIX + Buffer.from(value, 'utf8').toString('base64')
 }
 
@@ -144,7 +146,84 @@ export function saveSettings(settings: AppSettings): AppSettings {
 }
 
 export function getActiveProfile(): ModelProfile | null {
+  return getActiveProfiles()[0] ?? null
+}
+
+/** 内置模式按既定顺序返回主模型与备用模型；普通用户配置仍只使用当前选中模型。 */
+export function getActiveProfiles(): ModelProfile[] {
+  const managed = getManagedModelState()
+  if (managed.enabled) return managed.profiles
   const s = loadSettings()
-  if (!s.activeProfileId) return s.profiles[0] ?? null
-  return s.profiles.find((p) => p.id === s.activeProfileId) ?? s.profiles[0] ?? null
+  const profile = !s.activeProfileId
+    ? s.profiles[0]
+    : s.profiles.find((p) => p.id === s.activeProfileId) ?? s.profiles[0]
+  return profile ? [profile] : []
+}
+
+/** 返回给界面的设置；内置模式下绝不暴露任何本地或内置 API Key。 */
+export function loadRendererSettings(): AppSettings {
+  let settings = loadSettings()
+  const managed = getManagedModelState()
+  if (!managed.enabled) return settings
+  if (managed.mode === 'proxy') {
+    const endpoint = managed.info?.baseURL
+    const privacyAccepted = Boolean(settings.privacyAccepted && endpoint && settings.privacyEndpoint === endpoint)
+    const nextPrivacyEndpoint = privacyAccepted ? endpoint : undefined
+    if (
+      settings.profiles.length || settings.activeProfileId ||
+      settings.privacyAccepted !== privacyAccepted || settings.privacyEndpoint !== nextPrivacyEndpoint
+    ) {
+      settings = saveSettings({
+        ...settings,
+        profiles: [],
+        activeProfileId: null,
+        privacyAccepted,
+        privacyEndpoint: nextPrivacyEndpoint
+      })
+      // saveSettings 会先保留旧文件作为备份；代理模式不再需要任何本地模型密钥，
+      // 立即用已清理的新文件覆盖备份，避免旧密钥继续留在 userData。
+      copyFileSync(SETTINGS_FILE(), SETTINGS_BACKUP_FILE())
+    }
+  }
+  return {
+    ...settings,
+    profiles: [],
+    activeProfileId: null,
+    managedModel: managed.info
+  }
+}
+
+/** 内置模式只允许界面保存非密钥设置，模型配置始终由主进程掌管。 */
+export function saveRendererSettings(settings: AppSettings): AppSettings {
+  const managed = getManagedModelState()
+  if (!managed.enabled) return saveSettings(settings)
+
+  const current = loadSettings()
+  if (managed.mode === 'proxy') {
+    saveSettings({
+      ...current,
+      profiles: [],
+      activeProfileId: null,
+      projectsDir: typeof settings.projectsDir === 'string' ? settings.projectsDir : current.projectsDir,
+      privacyAccepted: Boolean(settings.privacyAccepted),
+      privacyEndpoint: settings.privacyAccepted ? managed.info?.baseURL : undefined
+    })
+    copyFileSync(SETTINGS_FILE(), SETTINGS_BACKUP_FILE())
+    return loadRendererSettings()
+  }
+  const validProfiles = current.profiles.filter(
+    (profile) => profile.apiKey.trim() && profile.baseURL.trim() && profile.model.trim()
+  )
+  const activeProfileId = validProfiles.some((profile) => profile.id === current.activeProfileId)
+    ? current.activeProfileId
+    : validProfiles[0]?.id ?? null
+  saveSettings({
+    ...current,
+    profiles: validProfiles,
+    activeProfileId,
+    projectsDir: typeof settings.projectsDir === 'string' ? settings.projectsDir : current.projectsDir,
+    privacyAccepted: Boolean(settings.privacyAccepted),
+    privacyEndpoint: settings.privacyAccepted ? managed.info?.baseURL : undefined
+  })
+  return loadRendererSettings()
 }

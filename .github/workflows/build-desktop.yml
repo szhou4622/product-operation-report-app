@@ -7,13 +7,13 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   package:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: product-operation-report-app
@@ -40,35 +40,118 @@ jobs:
             artifact: product-operation-report-macos-x64
             path: product-operation-report-app/dist/*.dmg
 
-    env:
-      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: product-operation-report-app/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit packaged dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Type check
         run: npm run typecheck
 
-      - name: Build installer
+      - name: Lint TypeScript
+        run: npm run lint
+
+      - name: Run fast unit tests
+        run: npm run test:unit
+
+      - name: Run core regression suite
+        run: npm run test:regression
+
+      - name: Verify update release workflow
+        if: matrix.os == 'windows-latest'
+        run: npm run test:update-release
+
+      - name: Verify adaptive HTML rendering
+        if: matrix.os == 'windows-latest'
+        run: npm run test:html-visual
+
+      - name: Build Windows installer
+        if: matrix.os == 'windows-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run ${{ matrix.script }} -- --${{ matrix.arch }}
+
+      - name: Build, sign, and notarize macOS installer
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+        run: |
+          set -euo pipefail
+          : "${CSC_LINK:?Missing MAC_CSC_LINK secret}"
+          : "${CSC_KEY_PASSWORD:?Missing MAC_CSC_KEY_PASSWORD secret}"
+          : "${APPLE_ID:?Missing APPLE_ID secret}"
+          : "${APPLE_APP_SPECIFIC_PASSWORD:?Missing APPLE_APP_SPECIFIC_PASSWORD secret}"
+          : "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID secret}"
+          npm run "${{ matrix.script }}" -- --${{ matrix.arch }}
+
+      - name: Verify installer contains no model provider secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            package_root="dist/win-unpacked"
+          else
+            package_root="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
+          fi
+          [[ -n "${package_root}" && -e "${package_root}" ]]
+          node scripts/verify-package-secrets.cjs "${package_root}"
 
       - name: Verify packaged Windows runtime
         if: matrix.os == 'windows-latest'
         run: npm run test:packaged-utility
 
+      - name: Verify packaged macOS app
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
+          if [[ -z "${app_path}" ]]; then
+            echo "No packaged .app bundle found" >&2
+            exit 1
+          fi
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Contents/Info.plist")"
+          executable_path="${app_path}/Contents/MacOS/${executable_name}"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          signature_details="$(codesign -dvvv "${app_path}" 2>&1)"
+          printf '%s\n' "${signature_details}"
+          grep -q 'Authority=Developer ID Application' <<<"${signature_details}"
+          grep -q 'TeamIdentifier=SC3VT47K6J' <<<"${signature_details}"
+          if grep -q 'Signature=adhoc' <<<"${signature_details}"; then
+            echo 'macOS app is still ad-hoc signed' >&2
+            exit 1
+          fi
+          xcrun stapler validate "${app_path}"
+          spctl --assess --type execute --verbose=4 "${app_path}"
+          binary_details="$(file "${executable_path}")"
+          printf '%s\n' "${binary_details}"
+          if [[ "${{ matrix.arch }}" == "x64" ]]; then
+            expected_arch="x86_64"
+          else
+            expected_arch="arm64"
+          fi
+          grep -q "${expected_arch}" <<<"${binary_details}"
+
       - name: Upload installer
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
@@ -81,10 +164,12 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
 
     steps:
       - name: Download all installers
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-assets
           merge-multiple: true
@@ -98,3 +183,110 @@ jobs:
           --repo "${GITHUB_REPOSITORY}"
           --title "产品经营报告 ${GITHUB_REF_NAME}"
           --generate-notes
+
+  publish-update-server:
+    name: Publish automatic update
+    if: startsWith(github.ref, 'refs/tags/v') && vars.AUTO_PUBLISH_UPDATE_SERVER == 'true'
+    needs:
+      - package
+      - release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+      UPDATE_SERVER_USER: ${{ secrets.UPDATE_SERVER_USER }}
+      UPDATE_SERVER_PORT: ${{ vars.UPDATE_SERVER_PORT }}
+      UPDATE_SERVER_SSH_PRIVATE_KEY: ${{ secrets.UPDATE_SERVER_SSH_PRIVATE_KEY }}
+      UPDATE_SERVER_KNOWN_HOSTS: ${{ secrets.UPDATE_SERVER_KNOWN_HOSTS }}
+      UPDATE_MANIFEST_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_MANIFEST_SIGNING_PRIVATE_KEY }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Download all installers
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${UPDATE_MANIFEST_SIGNING_PRIVATE_KEY:?Missing UPDATE_MANIFEST_SIGNING_PRIVATE_KEY secret}"
+          install -d -m 0700 "${RUNNER_TEMP}/update-signing"
+          printf '%s\n' "${UPDATE_MANIFEST_SIGNING_PRIVATE_KEY}" > "${RUNNER_TEMP}/update-signing/private.pem"
+          chmod 0600 "${RUNNER_TEMP}/update-signing/private.pem"
+          version="${GITHUB_REF_NAME#v}"
+          args=(
+            product-operation-report-app/scripts/prepare-update-release.cjs
+            --version "${version}"
+            --artifacts-dir release-assets
+            --notes-file product-operation-report-app/release-notes.txt
+            --output update-package/latest.json
+            --signing-key "${RUNNER_TEMP}/update-signing/private.pem"
+          )
+          node "${args[@]}"
+          cp product-operation-report-app/scripts/deploy-update-release.sh update-package/
+          cp release-assets/* update-package/
+          (cd update-package && zip -q "../ProductOperationReport-update-${version}.zip" ./*)
+
+      - name: Configure update server SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${UPDATE_SERVER_HOST:?Missing UPDATE_SERVER_HOST secret}"
+          : "${UPDATE_SERVER_USER:?Missing UPDATE_SERVER_USER secret}"
+          : "${UPDATE_SERVER_SSH_PRIVATE_KEY:?Missing UPDATE_SERVER_SSH_PRIVATE_KEY secret}"
+          : "${UPDATE_SERVER_KNOWN_HOSTS:?Missing UPDATE_SERVER_KNOWN_HOSTS secret}"
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${UPDATE_SERVER_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/update_server"
+          chmod 0600 "${HOME}/.ssh/update_server"
+          printf '%s\n' "${UPDATE_SERVER_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 0600 "${HOME}/.ssh/known_hosts"
+
+      - name: Deploy update atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          port="${UPDATE_SERVER_PORT:-22}"
+          archive="ProductOperationReport-update-${version}.zip"
+          remote_archive="/tmp/${archive}"
+          remote_stage="/tmp/ProductOperationReport-update-${version}"
+          ssh_args=(-i "${HOME}/.ssh/update_server" -p "${port}" -o BatchMode=yes)
+          scp -i "${HOME}/.ssh/update_server" -P "${port}" -o BatchMode=yes \
+            "${archive}" "${UPDATE_SERVER_USER}@${UPDATE_SERVER_HOST}:${remote_archive}"
+          ssh "${ssh_args[@]}" "${UPDATE_SERVER_USER}@${UPDATE_SERVER_HOST}" \
+            "set +e; rm -rf -- '${remote_stage}'; mkdir -p -- '${remote_stage}'; unzip -q '${remote_archive}' -d '${remote_stage}'; rc=\$?; if [ \$rc -eq 0 ]; then bash '${remote_stage}/deploy-update-release.sh'; rc=\$?; fi; rm -f -- '${remote_archive}'; rm -rf -- '${remote_stage}'; exit \$rc"
+
+      - name: Verify public update endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          curl --fail --silent --show-error \
+            'https://update.dadaozixun.com/api/update/latest?app_name=ProductOperationReport' \
+            --output published-update.json
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("published-update.json", "utf8"));
+            const expectedManifest = JSON.parse(fs.readFileSync("update-package/latest.json", "utf8"));
+            const expected = process.argv[1];
+            const canonical = (value) => {
+              if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+              if (value && typeof value === "object") {
+                return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+              }
+              return JSON.stringify(value);
+            };
+            if (body.app_name !== "ProductOperationReport" || body.version !== expected) process.exit(1);
+            if (body.force !== false || typeof body.signature !== "string" || body.signature.length < 32) process.exit(1);
+            if (canonical(body) !== canonical(expectedManifest)) process.exit(1);
+          ' "${version}"

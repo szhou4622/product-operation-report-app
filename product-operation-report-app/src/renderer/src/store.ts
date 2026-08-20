@@ -1,8 +1,44 @@
 import { create } from 'zustand'
-import type { AppSettings, ChatMessage, ProjectPhase, SavedProject } from '../../shared/types'
+import type {
+  AppSettings,
+  CostOptimizationEvent,
+  ProjectCleanDetailSnapshot,
+  ReportResultCacheInput,
+  ReportResultCacheLookupResult,
+  ReportResultCacheSnapshot,
+  SavedProject,
+  SourceCleanCacheInput,
+  StepDependencyMap,
+  ProjectTaskSnapshot
+} from '../../shared/types'
 import { SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
-import { buildExtractMessages, buildFinalReportPartMessages, buildStepMessages, buildSummaryMessages, type PriorOutput } from './sop'
+import {
+  buildExtractMessages,
+  buildEvidenceDigestConsolidationMessages,
+  buildEvidenceDigestMessages,
+  buildStepMessages,
+  buildSummaryGroupMessages,
+  buildSummaryMergeMessages,
+  planSummaryDetailGroups,
+  planAnalysisEvidenceGroups,
+  type PriorOutput
+} from './sop'
+import { buildLocalTableCleanDetail, preprocessTableForModel } from './tablePreprocess'
+import {
+  buildSourceCleanBatchPlan,
+  combineSourceCleanBatchOutputs,
+  missingSourceCleanEvidenceIds
+} from './sourceCleanBatches'
+import { validateReportEvidenceLinks, validateReportStructure } from './validate'
+import { friendlyError } from './store/errors'
+import { buildProjectSnapshot } from './store/persistence'
+import { mergeRevisionParts, runFinalReportInParts, runModelRetry, selectRevisionParts } from './store/analysis'
+import { isTemporaryReservationContention, planCleaningConcurrency } from './store/cleaning'
+
+export { friendlyError } from './store/errors'
+export { buildProjectSnapshot } from './store/persistence'
+export { mergeRevisionParts, selectRevisionParts } from './store/analysis'
 
 export interface Source {
   id: string
@@ -18,17 +54,67 @@ export interface Source {
   platform?: string // 用户指定平台/来源：巨量云图 / 抖店罗盘 / 视频号 / 抖音 / 有米云...
   purpose?: string // 用户指定信息类型：人群画像数据 / 内容素材数据 / 交易数据 / 产品手卡...
   note?: string // 用户对这份文件的补充信息（平台/时间/内容/文件外说明）
+  topLevelId?: string // 用户主动选择的顶层文件；派生页/图片/ZIP条目共享该ID
+  derivedKind?: 'archive-entry' | 'embedded-image' | 'rendered-page' | 'converted-page'
 }
 
-const PARSE_CONCURRENCY = 1
+const PARSE_CONCURRENCY = 2
 export const MAX_CLEANING_CONCURRENCY = 4
 const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 const CLEAN_DETAIL_MARKER = '\n\n---\n## 各来源清洗明细'
-const FINAL_PRIOR_OUTPUT_LIMIT = 7000
 const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
-const MAX_SOURCE_FILES = 200
+const MAX_SOURCE_FILES = 50
+let cleaningCheckpointSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+function formatPointsValue(value: number): string {
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })
+}
+
+function scheduleCleaningCheckpointSave(getState: () => StoreState): void {
+  if (cleaningCheckpointSaveTimer) clearTimeout(cleaningCheckpointSaveTimer)
+  cleaningCheckpointSaveTimer = setTimeout(() => {
+    cleaningCheckpointSaveTimer = null
+    void window.api.saveLastProject(buildProjectSnapshot(getState())).catch(() => undefined)
+  }, 500)
+}
+
+export function topLevelSourceCount(sources: Pick<Source, 'id' | 'topLevelId'>[]): number {
+  return new Set(sources.map((source) => source.topLevelId || source.id)).size
+}
+
+export function derivedSourceCount(sources: Pick<Source, 'derivedKind'>[]): number {
+  return sources.filter((source) => Boolean(source.derivedKind)).length
+}
+
+export function evidenceScopeStats(
+  sources: Pick<Source, 'kind' | 'text' | 'dataUrl'>[],
+  cleanDetails: Pick<ProjectCleanDetailSnapshot, 'text'>[] = []
+): { worksheets: number; pages: number; images: number; records: number } {
+  const worksheets = sources.reduce((sum, source) =>
+    sum + (source.text?.match(/^###\s*工作表：/gmu)?.length || 0), 0)
+  const pages = sources.reduce((sum, source) =>
+    sum + (source.text?.match(/^---\s*第\s*\d+\s*页\s*---/gmu)?.length || 0), 0)
+  const images = sources.filter((source) => Boolean(source.dataUrl) || source.kind === 'image').length
+  const records = cleanDetails.reduce((sum, detail) => {
+    const match = detail.text.match(/原始有效记录[：:]\s*(\d+)\s*条/u) ||
+      detail.text.match(/逐行生成并核对\s*(\d+)\s*个/u)
+    return sum + (match ? Number(match[1]) : 0)
+  }, 0)
+  return { worksheets, pages, images, records }
+}
+
+export const STEP_DEPENDENCY_MAP: StepDependencyMap = Object.freeze({
+  1: Object.freeze([]),
+  2: Object.freeze([1]),
+  3: Object.freeze([1, 2]),
+  4: Object.freeze([1, 2, 3]),
+  5: Object.freeze([1, 4]),
+  6: Object.freeze([4, 5]),
+  7: Object.freeze([4, 5, 6]),
+  8: Object.freeze([5, 6, 7])
+})
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)}MB`
@@ -50,43 +136,107 @@ export interface CleaningProgress {
   done: number
   running: string[]
   failed: number
+  startedAt?: number
 }
 
 const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0 })
 const isRunningPhase = (phase: Phase): boolean => phase === 'cleaning' || phase === 'analyzing'
 
-export function friendlyError(value: unknown): string {
-  const raw = (value instanceof Error ? value.message : String(value || '')).replace(/\s+/g, ' ').trim()
-  if (!raw) return '操作没有完成，请重试。'
-  if (/已停止|aborted|aborterror/i.test(raw)) return '已停止。'
-  if (/enospc|no space left|磁盘空间不足|磁盘已满/i.test(raw)) {
-    return '磁盘空间不足，无法保存文件。请清理空间或改存到其他磁盘后重试。'
+function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
+  return {
+    name: source.name,
+    kind: source.kind,
+    text: source.text,
+    dataUrl: source.dataUrl,
+    attribution: source.attribution,
+    platform: source.platform,
+    purpose: source.purpose,
+    note: source.note
   }
-  if (/ebusy|resource busy|being used|另一个程序正在使用|文件.*占用/i.test(raw)) {
-    return '文件正在被其他程序占用。请关闭同名的 Word 或浏览器文件后重试。'
+}
+
+function reportResultCacheInput(sources: Source[], userRequirements: string): ReportResultCacheInput {
+  return {
+    sources: sources.filter((source) => source.dataUrl || source.text).map(toSourceCleanCacheInput),
+    userRequirements
   }
-  if (/eperm|eacces|permission denied|access denied|operation not permitted|拒绝访问/i.test(raw)) {
-    return '文件可能正在被占用，或保存位置没有权限。请关闭同名文件，或改存到桌面后重试。'
+}
+
+function hasCompleteReportSections(markdown: string): boolean {
+  return Array.from({ length: 12 }, (_, section) =>
+    new RegExp(`^##\\s+${section}(?:\\.|、|\\s)`, 'mu').test(markdown)
+  ).every(Boolean)
+}
+
+function validReportCacheSnapshot(snapshot: ReportResultCacheSnapshot | undefined): snapshot is ReportResultCacheSnapshot {
+  if (!snapshot?.cleanedData.trim() || !snapshot.reportMarkdown.trim()) return false
+  if (!hasCompleteReportSections(snapshot.reportMarkdown)) return false
+  return Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => snapshot.artifacts[id]?.trim())
+}
+
+function snapshotForReportCache(state: StoreState): ReportResultCacheSnapshot | null {
+  if (!hasCompleteReportSections(state.reportMarkdown)) return null
+  if (!Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => state.artifacts[id]?.trim())) return null
+  const detailsById = new Map(state.cleanDetails.map((detail) => [detail.id, detail]))
+  const cleanDetails = state.sources.flatMap((source) => {
+    const detail = detailsById.get(source.id)
+    return detail ? [{ name: source.name, text: detail.text }] : []
+  })
+  if (cleanDetails.length !== state.sources.filter((source) => source.dataUrl || source.text).length) return null
+  return {
+    cleanedData: state.cleanedData,
+    cleanDetails,
+    artifacts: { ...state.artifacts },
+    reportMarkdown: state.reportMarkdown
   }
-  if (/enoent|path not found|找不到.*路径/i.test(raw)) {
-    return '保存位置已不存在。请重新选择桌面或其他文件夹后重试。'
+}
+
+async function storeCompleteReportResult(state: StoreState): Promise<void> {
+  const snapshot = snapshotForReportCache(state)
+  if (!snapshot) return
+  await window.api.storeReportResultCache(
+    reportResultCacheInput(state.sources, state.steering),
+    snapshot
+  )
+}
+
+function optimizationEvent(
+  id: string,
+  reportSessionId: string,
+  type: CostOptimizationEvent['type'],
+  values: Partial<Pick<CostOptimizationEvent, 'localCompletedFiles' | 'sourceCacheHits' | 'skippedModelRequests' | 'reusedReports'>>
+): CostOptimizationEvent {
+  return {
+    schemaVersion: 1,
+    id,
+    reportSessionId,
+    type,
+    createdAt: new Date().toISOString(),
+    localCompletedFiles: values.localCompletedFiles || 0,
+    sourceCacheHits: values.sourceCacheHits || 0,
+    skippedModelRequests: values.skippedModelRequests || 0,
+    reusedReports: values.reusedReports || 0
   }
-  if (/enametoolong|filename.*too long|path.*too long|文件名.*过长|路径.*过长/i.test(raw)) {
-    return '文件名或保存路径太长。请缩短文件名，或直接保存到桌面。'
+}
+
+async function recordOptimizationEvent(event: CostOptimizationEvent): Promise<void> {
+  const api = window.api as typeof window.api & {
+    recordCostOptimization?: typeof window.api.recordCostOptimization
   }
-  if (/timeout|timed out|超时/i.test(raw)) return '请求超时，请检查网络后重试。'
-  if (/401|unauthorized|invalid api key|authentication/i.test(raw)) return '模型授权失败，请检查 API Key。'
-  if (/404|model.*not found|not found.*model/i.test(raw)) return '模型地址或模型名称不正确，请到设置中检查。'
-  if (/429|rate limit|quota|insufficient_quota/i.test(raw)) {
-    const wait = raw.match(/等待\s*(\d+)\s*秒/)
-    return wait
-      ? `模型服务繁忙或额度受限，建议等待 ${wait[1]} 秒后重试。`
-      : '模型服务繁忙或额度受限，请稍后重试。'
-  }
-  if (/fetch failed|econnreset|enotfound|terminated|network/i.test(raw)) {
-    return '网络连接失败，请检查网络和模型地址后重试。'
-  }
-  return raw.slice(0, 280)
+  if (typeof api.recordCostOptimization !== 'function') return
+  await api.recordCostOptimization(event).catch(() => undefined)
+}
+
+export function priorOutputsForStep(
+  stepId: number,
+  artifacts: Record<number, string>
+): PriorOutput[] {
+  const dependencies = STEP_DEPENDENCY_MAP[stepId] || []
+  return dependencies.flatMap((id) => {
+    const output = artifacts[id]
+    const step = SOP_STEPS.find((candidate) => candidate.id === id)
+    return output && step ? [{ id, title: `第${id}步 ${step.title}`, output }] : []
+  })
 }
 
 const isUserStop = (value: unknown): boolean => /已停止|aborted/i.test(String(value || ''))
@@ -97,65 +247,19 @@ function restorePhase(project: SavedProject): Phase {
   return project.phase as Phase
 }
 
-export function buildProjectSnapshot(state: {
-  projectRevision: number
-  sources: Source[]
-  messages: ChatMsg[]
-  cleanedData: string
-  cleanDetails: { id: string; name: string; text: string }[]
-  artifacts: Record<number, string>
-  reportMarkdown: string
-  reportStale: boolean
-  phase: Phase
-  steering: string
-}): SavedProject {
-  return {
-    revision: state.projectRevision,
-    sources: state.sources.map((s) => ({
-      id: s.id,
-      name: s.name,
-      kind: s.kind,
-      text: s.text,
-      dataUrl: s.dataUrl,
-      error: s.error,
-      warning: s.warning,
-      attribution: s.attribution,
-      platform: s.platform,
-      purpose: s.purpose,
-      note: s.note,
-      size: s.size
-    })),
-    messages: state.messages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      text: m.text,
-      kind: m.kind
-    })),
-    cleanedData: state.cleanedData,
-    cleanDetails: state.cleanDetails,
-    artifacts: state.artifacts,
-    reportMarkdown: isRunningPhase(state.phase)
-      ? state.artifacts[REPORT_STEP_ID] || ''
-      : state.reportMarkdown,
-    reportStale: state.reportStale,
-    phase: state.phase as ProjectPhase,
-    steering: state.steering,
-    updatedAt: new Date().toISOString()
-  }
-}
-
 function classify(name: string): Source['kind'] {
   const ext = name.toLowerCase().split('.').pop() || ''
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return 'image'
-  if (['xlsx', 'xls', 'csv'].includes(ext)) return 'table'
-  if (['pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt'].includes(ext)) return 'doc'
+  if (['png', 'jpg', 'jpeg'].includes(ext)) return 'image'
+  if (['xlsx', 'xls', 'xlsm', 'xlsb', 'ods', 'csv', 'tsv'].includes(ext)) return 'table'
+  if (['pdf', 'doc', 'docx', 'pptx', 'webp', 'gif', 'tif', 'tiff', 'avif', 'heic', 'heif', 'md', 'markdown', 'txt', 'log', 'yaml', 'yml', 'rtf', 'json', 'jsonl', 'ndjson', 'html', 'htm', 'xml'].includes(ext)) return 'doc'
   return 'other'
 }
 
 const SUPPORTED_EXTS = new Set([
   'png', 'jpg', 'jpeg', 'webp', 'gif',
-  'xlsx', 'xls', 'csv',
-  'pdf', 'docx', 'doc', 'pptx', 'ppt', 'md', 'markdown', 'txt',
+  'xlsx', 'xls', 'xlsm', 'xlsb', 'ods', 'csv', 'tsv',
+  'pdf', 'doc', 'docx', 'pptx', 'tif', 'tiff', 'avif', 'heic', 'heif', 'md', 'markdown', 'txt', 'log', 'yaml', 'yml', 'rtf',
+  'json', 'jsonl', 'ndjson', 'html', 'htm', 'xml',
   'zip'
 ])
 const extOf = (n: string): string => n.toLowerCase().split('.').pop() || ''
@@ -506,162 +610,15 @@ const downscaleImage = async (file: File, maxDim = 1600, quality = 0.9): Promise
   })
 }
 
-const toSourceLike = (
-  s: Source
-): {
-  name: string
-  kind: string
-  text?: string
-  dataUrl?: string
-  attribution?: string
-  platform?: string
-  purpose?: string
-  note?: string
-} => ({
-  name: s.name,
-  kind: s.kind,
-  text: s.text,
-  dataUrl: s.dataUrl,
-  attribution: s.attribution,
-  platform: s.platform,
-  purpose: s.purpose,
-  note: s.note
-})
-
 function cleanedSummaryOnly(cleanedData: string): string {
   const index = cleanedData.indexOf(CLEAN_DETAIL_MARKER)
   return index >= 0 ? cleanedData.slice(0, index).trim() : cleanedData
 }
 
-function compactForFinalReport(text: string, limit = FINAL_PRIOR_OUTPUT_LIMIT): string {
-  if (text.length <= limit) return text
-  return `${text.slice(0, limit)}\n\n（以上为该步骤关键产出节选；最终成稿只保留经营决策需要的信息，不要复述过程。）`
-}
-
-async function runFinalReportInParts(params: {
-  cleanedData: string
-  priorOutputs: PriorOutput[]
-  feedback: string
-  setAbort: (fn: (() => void) | null) => void
-  onProgress: (text: string) => void
-  onRetry: (partLabel: string, n: number) => void
-}): Promise<{ ok: boolean; text: string; error?: string }> {
-  let full = ''
-  for (const part of FINAL_REPORT_PARTS) {
-    const messages = buildFinalReportPartMessages({
-      part,
-      cleanedData: params.cleanedData,
-      priorOutputs: params.priorOutputs,
-      feedback: params.feedback
-    })
-    let current = ''
-    const res = await runModelRetry(
-      messages,
-      (acc) => {
-        current = acc
-        params.onProgress(`${full}${acc}`)
-      },
-      params.setAbort,
-      (n) => params.onRetry(part.label, n),
-      2
-    )
-    if (!res.ok) return { ok: false, text: full + current, error: res.error }
-    full = `${full}${res.text.trim()}\n\n`
-    params.onProgress(full)
-  }
-  return { ok: true, text: full.trim() }
-}
-
-// 包装流式调用为 Promise，并暴露中止函数
-function runModel(
-  messages: ChatMessage[],
-  onAcc: (acc: string) => void,
-  setAbort: (fn: (() => void) | null) => void
-): Promise<{ ok: boolean; text: string; error?: string }> {
-  return new Promise((resolve) => {
-    let acc = ''
-    let settled = false
-    let publishTimer: number | null = null
-    let lastPublished = ''
-    const publish = (text: string): void => {
-      if (text === lastPublished) return
-      lastPublished = text
-      onAcc(text)
-    }
-    const flush = (text = acc): void => {
-      if (publishTimer !== null) {
-        window.clearTimeout(publishTimer)
-        publishTimer = null
-      }
-      publish(text)
-    }
-    const done = (r: { ok: boolean; text: string; error?: string }): void => {
-      if (settled) return
-      settled = true
-      flush(r.text)
-      setAbort(null)
-      resolve(r)
-    }
-    try {
-      const handle = window.api.sendChat(messages, {
-        onChunk: (d) => {
-          acc += d
-          if (publishTimer === null) {
-            publishTimer = window.setTimeout(() => {
-              publishTimer = null
-              publish(acc)
-            }, 60)
-          }
-        },
-        onDone: (full) => done({ ok: true, text: full || acc }),
-        onError: (msg) => done({ ok: false, text: acc, error: friendlyError(msg) })
-      })
-      setAbort(() => {
-        handle.abort()
-        done({ ok: false, text: acc, error: '已停止' })
-      })
-    } catch (error) {
-      done({ ok: false, text: acc, error: friendlyError(error) })
-    }
-  })
-}
-
-// 带重试的调用：仅在"网络中断且尚无任何输出"时重试，避免重复内容；用户主动停止不重试
-async function runModelRetry(
-  messages: ChatMessage[],
-  onAcc: (acc: string) => void,
-  setAbort: (fn: (() => void) | null) => void,
-  onRetry?: (n: number) => void,
-  retries = 2
-): Promise<{ ok: boolean; text: string; error?: string }> {
-  let res = await runModel(messages, onAcc, setAbort)
-  let n = 0
-  while (
-    !res.ok &&
-    n < retries &&
-    !res.text &&
-    /fetch failed|ECONNRESET|terminated|network|网络连接失败|服务繁忙|额度受限|429/i.test(res.error || '')
-  ) {
-    n++
-    onRetry?.(n)
-    if (/服务繁忙|额度受限|429/i.test(res.error || '')) {
-      const wait = res.error?.match(/等待\s*(\d+)\s*秒/)
-      const delay = wait ? Math.min(60, Number(wait[1])) * 1000 : 1200 * n
-      let stopped = false
-      await new Promise<void>((resolve) => {
-        const timer = window.setTimeout(resolve, delay)
-        setAbort(() => {
-          stopped = true
-          window.clearTimeout(timer)
-          resolve()
-        })
-      })
-      setAbort(null)
-      if (stopped) return { ok: false, text: '', error: '已停止' }
-    }
-    res = await runModel(messages, onAcc, setAbort)
-  }
-  return res
+function compactForFinalReport(text: string): string {
+  // 分析步骤已经通过任务相关的完整证据包控制体积；最终成稿不得再次按字符截断，
+  // 否则步骤中段的来源、数字或限制会在最后一跳静默丢失。
+  return text
 }
 
 function defaultReportName(ext: string): string {
@@ -678,6 +635,7 @@ interface StoreState {
   previousProjectAvailable: boolean
   settings: AppSettings | null
   settingsOpen: boolean
+  reportReuseOffer: ReportResultCacheLookupResult | null
   sopRules: string
   sources: Source[]
   phase: Phase
@@ -685,6 +643,7 @@ interface StoreState {
   cleanedData: string
   cleanDetails: { id: string; name: string; text: string }[]
   artifacts: Record<number, string>
+  taskJournal: Record<string, ProjectTaskSnapshot>
   reportMarkdown: string
   reportStale: boolean
   abortFn: (() => void) | null
@@ -707,6 +666,8 @@ interface StoreState {
   setSourcePurpose: (id: string, purpose: string) => void
   setSourceNote: (id: string, note: string) => void
   startGeneration: () => Promise<void>
+  acceptReportReuse: () => Promise<void>
+  regenerateReport: () => Promise<void>
   confirmCheckpoint: () => Promise<void>
   sendMessage: (text: string) => Promise<boolean>
   abort: () => void
@@ -717,20 +678,23 @@ interface StoreState {
   // 内部
   _post: (role: ChatMsg['role'], text: string, kind?: ChatMsg['kind']) => string
   _update: (id: string, text: string) => void
+  _startPaidGeneration: () => Promise<void>
   _runCleaning: (isRerun: boolean) => Promise<void>
   _runAnalysis: () => Promise<void>
-  _rerunReport: () => Promise<void>
+  _rerunReport: (latestFeedback?: string) => Promise<void>
 }
 
 const invalidatedAnalysis = (): Pick<
   StoreState,
-  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress'
+  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress' | 'reportReuseOffer' | 'taskJournal'
 > => ({
   cleanedData: '',
   phase: 'idle',
   abortFn: null,
   exportStatus: '',
-  cleaningProgress: emptyCleaningProgress()
+  cleaningProgress: emptyCleaningProgress(),
+  reportReuseOffer: null,
+  taskJournal: {}
 })
 
 const preserveCommittedReport = (
@@ -752,6 +716,7 @@ export const useStore = create<StoreState>((set, get) => ({
   previousProjectAvailable: false,
   settings: null,
   settingsOpen: false,
+  reportReuseOffer: null,
   sopRules: '',
   sources: [],
   phase: 'idle',
@@ -759,6 +724,7 @@ export const useStore = create<StoreState>((set, get) => ({
   cleanedData: '',
   cleanDetails: [],
   artifacts: {},
+  taskJournal: {},
   reportMarkdown: '',
   reportStale: false,
   abortFn: null,
@@ -803,15 +769,24 @@ export const useStore = create<StoreState>((set, get) => ({
         text: '上次任务在执行过程中退出了，已恢复保存好的资料和完整结果。请检查后重新开始。'
       })
     }
+    if (lastProject?.missingBlobs?.length) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `恢复项目时发现 ${lastProject.missingBlobs.length} 个资料块丢失。其他内容已正常恢复，请重新上传：${lastProject.missingBlobs.join('、')}`
+      })
+    }
     set({
       initialized: true,
       persistencePaused: false,
       projectRevision: lastProject?.revision || 0,
-      analysisSessionId: crypto.randomUUID(),
+      analysisSessionId: lastProject?.analysisSessionId || crypto.randomUUID(),
       previousProjectAvailable: Boolean(previousProject),
       settings,
       sopRules,
-      settingsOpen: !settings.profiles.length,
+      settingsOpen: settings.managedModel?.enabled ? !settings.managedModel.configured : !settings.profiles.length,
+      reportReuseOffer: null,
       sources: lastProject
         ? lastProject.sources.map((source) => ({
             ...source,
@@ -826,6 +801,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleanedData: lastProject?.cleanedData || '',
       cleanDetails: Array.isArray(lastProject?.cleanDetails) ? lastProject.cleanDetails : [],
       artifacts: restoredArtifacts,
+      taskJournal: lastProject?.taskJournal || {},
       reportMarkdown: restoredReport,
       reportStale: Boolean(lastProject?.reportStale),
       phase: lastProject ? restorePhase(lastProject) : 'idle',
@@ -854,6 +830,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleanedData: current.cleanedData,
       cleanDetails: current.cleanDetails,
       artifacts: current.artifacts,
+      taskJournal: current.taskJournal,
       reportMarkdown: current.reportMarkdown,
       reportStale: current.reportStale,
       phase: current.phase,
@@ -865,6 +842,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleaningProgress: current.cleaningProgress,
       projectRevision: current.projectRevision,
       analysisSessionId: current.analysisSessionId,
+      reportReuseOffer: null,
       previousProjectAvailable: true,
       persistencePaused: false
     }
@@ -875,6 +853,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleanedData: '',
       cleanDetails: [] as { id: string; name: string; text: string }[],
       artifacts: {} as Record<number, string>,
+      taskJournal: {} as Record<string, ProjectTaskSnapshot>,
       reportMarkdown: '',
       reportStale: false,
       phase: 'idle' as Phase,
@@ -886,6 +865,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleaningProgress: emptyCleaningProgress(),
       projectRevision: nextRevision,
       analysisSessionId: crypto.randomUUID(),
+      reportReuseOffer: null,
       previousProjectAvailable: true,
       persistencePaused: true
     }
@@ -951,6 +931,14 @@ export const useStore = create<StoreState>((set, get) => ({
         text: '上一份分析在执行过程中退出了，已恢复已保存的内容。请检查资料后重新开始。'
       })
     }
+    if (previous.missingBlobs?.length) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `上一份项目有 ${previous.missingBlobs.length} 个资料块丢失，其他内容已恢复，请重新上传：${previous.missingBlobs.join('、')}`
+      })
+    }
 
     const restoredState = {
       sources: previous.sources.map((source) => ({
@@ -965,6 +953,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleanedData: previous.cleanedData || '',
       cleanDetails: Array.isArray(previous.cleanDetails) ? previous.cleanDetails : [],
       artifacts: restoredArtifacts,
+      taskJournal: previous.taskJournal || {},
       reportMarkdown: restoredReport,
       reportStale: Boolean(previous.reportStale),
       phase: restorePhase(previous),
@@ -975,7 +964,8 @@ export const useStore = create<StoreState>((set, get) => ({
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
       projectRevision: current.projectRevision + 1,
-      analysisSessionId: crypto.randomUUID(),
+      analysisSessionId: previous.analysisSessionId || crypto.randomUUID(),
+      reportReuseOffer: null,
       previousProjectAvailable: false,
       persistencePaused: true
     }
@@ -1010,20 +1000,16 @@ export const useStore = create<StoreState>((set, get) => ({
     }> = []
     const rejected: Source[] = []
     const incomingFiles = Array.from(files)
-    const availableSlots = Math.max(0, MAX_SOURCE_FILES - get().sources.length)
-    if (incomingFiles.length > availableSlots) {
-      get()._post(
-        'assistant',
-        `一次分析最多保留 ${MAX_SOURCE_FILES} 个文件，本次有 ${incomingFiles.length - availableSlots} 个文件未加入。请先完成这一份，再新建分析处理其余文件。`,
-        'error'
-      )
-    }
+    const availableSlots = Math.max(0, MAX_SOURCE_FILES - topLevelSourceCount(get().sources))
+    let validOverflowCount = 0
     let acceptedBytes = get().sources.reduce(
       (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
       0
     )
 
-    for (const file of incomingFiles.slice(0, availableSlots)) {
+    // 先判断是否可解析，再占用 50 份有效资料名额。这样选择的文件中夹有
+    // 系统文件、超限文件时，不会把后面真正可分析的资料挡在前 50 个之外。
+    for (const file of incomingFiles) {
       const name = displayName(file)
       const e = extOf(file.name)
       if (isJunkName(name)) continue
@@ -1035,13 +1021,15 @@ export const useStore = create<StoreState>((set, get) => ({
         parsing: false,
         attribution: inferAttribution(name),
         platform: inferPlatform(name),
-        purpose: inferPurpose(name)
+        purpose: inferPurpose(name),
+        topLevelId: ''
       }
+      base.topLevelId = base.id
       const reject = (error: string): void => {
         rejected.push({ ...base, error })
       }
       if (!SUPPORTED_EXTS.has(e)) {
-        reject(`已忽略：暂不支持 .${e || '未知'} 文件。支持截图、CSV/XLSX、PDF、Word/PPTX、Markdown/TXT、ZIP。`)
+        reject(`已忽略：暂不支持 .${e || '未知'} 文件。支持常见图片及 TIFF/AVIF/HEIC 自动转换、Excel/ODS/CSV/TSV、PDF、DOC/DOCX、PPTX、Markdown/TXT/RTF、JSON/YAML、HTML/XML 和 ZIP。`)
         continue
       }
       if (file.size > MAX_SINGLE_FILE_BYTES) {
@@ -1054,6 +1042,10 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       if (acceptedBytes + file.size > MAX_TOTAL_UPLOAD_BYTES) {
         reject(`已忽略：本次资料总量会超过 ${formatBytes(MAX_TOTAL_UPLOAD_BYTES)}，请分批分析。`)
+        continue
+      }
+      if (acceptedJobs.length >= availableSlots) {
+        validOverflowCount++
         continue
       }
       acceptedBytes += file.size
@@ -1069,12 +1061,29 @@ export const useStore = create<StoreState>((set, get) => ({
       })
     }
 
+    const retainedRejected = rejected.slice(0, Math.max(0, availableSlots - acceptedJobs.length))
+    const omittedRejectedCount = rejected.length - retainedRejected.length
+    if (validOverflowCount) {
+      get()._post(
+        'assistant',
+        `一次分析最多保留 ${MAX_SOURCE_FILES} 份可分析资料，本次还有 ${validOverflowCount} 份有效文件未加入。请先完成这一份，再新建分析处理其余文件。`,
+        'error'
+      )
+    }
+    if (omittedRejectedCount) {
+      get()._post(
+        'assistant',
+        `另有 ${omittedRejectedCount} 份不支持或超限文件没有占用资料名额；请按上传说明转换格式或拆分后重试。`,
+        'error'
+      )
+    }
+
     const jobs = acceptedJobs
 
-    if (!jobs.length && rejected.length) {
+    if (!jobs.length && retainedRejected.length) {
       set((s) =>
         s.analysisSessionId === sessionId && !isRunningPhase(s.phase)
-          ? { sources: [...s.sources, ...rejected] }
+          ? { sources: [...s.sources, ...retainedRejected] }
           : s
       )
       return
@@ -1089,7 +1098,7 @@ export const useStore = create<StoreState>((set, get) => ({
         ...preserveCommittedReport(s),
         sources: [
           ...s.sources,
-          ...rejected,
+          ...retainedRejected,
           ...jobs.map((job) => ({
             id: job.id,
             name: job.name,
@@ -1098,7 +1107,8 @@ export const useStore = create<StoreState>((set, get) => ({
             parsing: true,
             attribution: job.attribution,
             platform: job.platform,
-            purpose: job.purpose
+            purpose: job.purpose,
+            topLevelId: job.id
           }))
         ]
       }
@@ -1112,12 +1122,13 @@ export const useStore = create<StoreState>((set, get) => ({
           if (job.ext === 'zip') {
             const buf = await job.file.arrayBuffer()
             const archiveItems = await window.api.parseArchive(job.name, buf)
-            const items = [...archiveItems]
+            // 50份上限只计算用户选择的顶层文件；ZIP条目属于父文件的派生证据。
+            const items = [...archiveItems].sort((left, right) => Number(right.ok) - Number(left.ok))
             let imageIndex = 0
             const processArchiveImages = async (): Promise<void> => {
-              while (imageIndex < archiveItems.length) {
+              while (imageIndex < items.length) {
                 const index = imageIndex++
-                const item = archiveItems[index]
+                const item = items[index]
                 if (!item.ok || item.kind !== 'image' || !item.dataUrl) continue
                 try {
                   const blob = await (await fetch(item.dataUrl)).blob()
@@ -1141,11 +1152,8 @@ export const useStore = create<StoreState>((set, get) => ({
                 (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
                 0
               )
-              const availableSlots = Math.max(0, MAX_SOURCE_FILES - retainedSources.length)
-              const overflowCount = Math.max(0, items.length - availableSlots)
-              const itemSlots = overflowCount ? Math.max(0, availableSlots - 1) : availableSlots
-              const retainedItems = items.slice(0, itemSlots)
-              const expandedBytes = retainedItems.reduce((sum, item) => sum + (item.size || 0), 0)
+              const retainedItems = items
+              const expandedBytes = retainedItems.reduce((sum, item) => sum + (item.ok ? item.size || 0 : 0), 0)
               if (retainedBytes + expandedBytes > MAX_TOTAL_UPLOAD_BYTES) {
                 return {
                   sources: [
@@ -1156,10 +1164,11 @@ export const useStore = create<StoreState>((set, get) => ({
                       kind: 'other',
                       size: job.file.size,
                       parsing: false,
-                      error: `已忽略：压缩包解压后的资料会使总量超过 ${formatBytes(MAX_TOTAL_UPLOAD_BYTES)}，请分批分析。`,
+                      error: `压缩包解压后的资料会使总量超过 ${formatBytes(MAX_TOTAL_UPLOAD_BYTES)}。为避免漏资料，本次不能继续生成，请把压缩包拆分后重新上传。`,
                       attribution: job.attribution,
                       platform: job.platform,
-                      purpose: job.purpose
+                      purpose: job.purpose,
+                      topLevelId: job.id
                     }
                   ]
                 }
@@ -1180,19 +1189,10 @@ export const useStore = create<StoreState>((set, get) => ({
                     attribution: inferAttribution(`${job.name}/${it.name}`),
                     platform: inferPlatform(`${job.name}/${it.name}`),
                     purpose: inferPurpose(`${job.name}/${it.name}`),
-                    note: `来自压缩包：${job.name}`
-                  })),
-                  ...(overflowCount && availableSlots
-                    ? [
-                        {
-                          id: crypto.randomUUID(),
-                          name: `${job.name}：数量提示`,
-                          kind: 'other' as const,
-                          parsing: false,
-                          error: `已忽略：压缩包展开后会超过 ${MAX_SOURCE_FILES} 份资料，本包有 ${overflowCount} 个条目未加入。请新建另一份分析处理。`
-                        }
-                      ]
-                    : [])
+                    note: `来自压缩包：${job.name}`,
+                    topLevelId: job.id,
+                    derivedKind: 'archive-entry' as const
+                  }))
                 ]
               }
             })
@@ -1215,23 +1215,60 @@ export const useStore = create<StoreState>((set, get) => ({
 
           const buf = await job.file.arrayBuffer()
           const parsed = await window.api.parseFile(job.file.name, buf)
-          set((s) =>
-            s.analysisSessionId === sessionId
-              ? {
-                  sources: s.sources.map((a) =>
-                    a.id === job.id
-                      ? {
-                          ...a,
-                          parsing: false,
-                          text: parsed.ok ? parsed.text : undefined,
-                          error: parsed.ok ? undefined : parsed.error,
-                          warning: parsed.ok ? parsed.warning : undefined
-                        }
-                      : a
-                  )
+          const attachments = await Promise.all(
+            (parsed.attachments || []).map(async (item) => {
+              if (!item.ok || item.kind !== 'image' || !item.dataUrl) return item
+              try {
+                const blob = await (await fetch(item.dataUrl)).blob()
+                const imageFile = new File([blob], item.name, { type: blob.type })
+                return { ...item, dataUrl: await downscaleImage(imageFile) }
+              } catch (error) {
+                return {
+                  ...item,
+                  ok: false,
+                  dataUrl: undefined,
+                  error: `Office 内嵌图片无法读取：${error instanceof Error ? error.message : String(error)}`
                 }
-              : s
+              }
+            })
           )
+          set((s) => {
+            if (s.analysisSessionId !== sessionId) return s
+            const retainedSources = s.sources.filter((source) => source.id !== job.id)
+            const parentSources: Source[] = parsed.ok && !parsed.text
+              ? []
+              : [{
+                  id: job.id,
+                  name: job.name,
+                  kind: job.kind,
+                  size: job.file.size,
+                  parsing: false,
+                  text: parsed.ok ? parsed.text : undefined,
+                  error: parsed.ok ? undefined : parsed.error,
+                  warning: parsed.ok ? parsed.warning : undefined,
+                  attribution: job.attribution,
+                  platform: job.platform,
+                  purpose: job.purpose,
+                  topLevelId: job.id
+                }]
+            const attachmentSources: Source[] = attachments.map((item, index) => ({
+              id: crypto.randomUUID(),
+              name: item.name,
+              kind: 'image',
+              size: item.size,
+              parsing: false,
+              dataUrl: item.ok ? item.dataUrl : undefined,
+              error: item.ok ? undefined : item.error,
+              warning: index === 0 && !parentSources.length ? parsed.warning : undefined,
+              attribution: job.attribution,
+              platform: job.platform,
+              purpose: job.purpose,
+              note: `从「${job.name}」自动提取，作为独立图片资料读取。`,
+              topLevelId: job.id,
+              derivedKind: /第\s*\d+\s*页/u.test(item.name) ? 'rendered-page' : 'embedded-image'
+            }))
+            return { sources: [...retainedSources, ...parentSources, ...attachmentSources] }
+          })
         } catch (err) {
           set((s) =>
             s.analysisSessionId === sessionId
@@ -1328,26 +1365,21 @@ export const useStore = create<StoreState>((set, get) => ({
     ),
 
   startGeneration: async () => {
-    const { settings, sources, phase } = get()
+    const { sources, phase } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
-    const profile =
-      settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
-    if (!profile || !profile.baseURL.trim() || !profile.model.trim() || !profile.apiKey.trim()) {
-      set({ settingsOpen: true })
-      get()._post(
-        'assistant',
-        '还没有完成模型配置。请打开设置，粘贴 API Key 并完成“测试连通”后保存。',
-        'error'
-      )
-      return
-    }
-    const activeEndpoint = profile.baseURL.trim().replace(/\/+$/, '')
-    if (!settings?.privacyAccepted || settings.privacyEndpoint !== activeEndpoint) {
-      get()._post('assistant', '开始前请先确认资料将发送到当前模型服务。完成隐私确认后再点“开始生成报告”。', 'error')
-      return
-    }
     if (sources.some((s) => s.parsing)) {
       get()._post('assistant', '还有文件正在本地解析，请等解析完成后再开始生成。', 'narration')
+      return
+    }
+    const parseFailures = sources.filter((source) => source.error && !/^已忽略[：:]/u.test(source.error.trim()))
+    if (parseFailures.length) {
+      const names = parseFailures.slice(0, 3).map((source) => `「${source.name}」`).join('、')
+      const more = parseFailures.length > 3 ? `等 ${parseFailures.length} 份` : ''
+      get()._post(
+        'assistant',
+        `${names}${more}尚未成功解析。为避免报告漏掉资料，本次没有开始分析。请按文件下方提示处理后重新上传，或确认不需要该资料后点右上角“×”移除。`,
+        'error'
+      )
       return
     }
     const unconfirmed = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution)
@@ -1359,7 +1391,129 @@ export const useStore = create<StoreState>((set, get) => ({
       get()._post('assistant', '还没有可用的资料。请先上传截图/表格/文档/zip/文件夹，再点「开始生成」。', 'narration')
       return
     }
-    set((state) => preserveCommittedReport(state))
+    try {
+      if (typeof window.api.preflightProjectStorage === 'function') {
+        const current = get()
+        const storage = await window.api.preflightProjectStorage(buildProjectSnapshot(current))
+        if (!storage.ok) {
+          get()._post('assistant', storage.message, 'error')
+          return
+        }
+      }
+    } catch (error) {
+      get()._post(
+        'assistant',
+        `开始前无法确认项目能否安全保存：${String(error instanceof Error ? error.message : error)}。请确认磁盘至少有 1GB 可用空间后重试。`,
+        'error'
+      )
+      return
+    }
+    try {
+      const cached = await window.api.lookupReportResultCache(reportResultCacheInput(sources, get().steering))
+      if (cached.hit && validReportCacheSnapshot(cached.snapshot)) {
+        set({ reportReuseOffer: cached })
+        return
+      }
+    } catch {
+      // 缓存不可读、版本不匹配或已损坏时自动正常生成。
+    }
+    await get()._startPaidGeneration()
+  },
+
+  acceptReportReuse: async () => {
+    const offer = get().reportReuseOffer
+    if (!offer || !validReportCacheSnapshot(offer.snapshot)) {
+      set({ reportReuseOffer: null })
+      get()._post('assistant', '上次报告缓存已失效，将按正常流程重新生成。', 'narration')
+      await get()._startPaidGeneration()
+      return
+    }
+    const usable = get().sources.filter((source) => source.dataUrl || source.text)
+    if (
+      usable.length !== offer.snapshot.cleanDetails.length ||
+      usable.some((source, index) => source.name !== offer.snapshot!.cleanDetails[index]?.name)
+    ) {
+      set({ reportReuseOffer: null })
+      get()._post('assistant', '资料已发生变化，无法复用旧报告，将按正常流程重新生成。', 'narration')
+      await get()._startPaidGeneration()
+      return
+    }
+    const sessionId = get().analysisSessionId
+    set({
+      reportReuseOffer: null,
+      cleanedData: offer.snapshot.cleanedData,
+      cleanDetails: usable.map((source, index) => ({
+        id: source.id,
+        name: source.name,
+        text: offer.snapshot!.cleanDetails[index].text
+      })),
+      artifacts: { ...offer.snapshot.artifacts },
+      reportMarkdown: offer.snapshot.reportMarkdown,
+      reportStale: false,
+      phase: 'checkpoint2',
+      abortFn: null,
+      cleaningProgress: emptyCleaningProgress()
+    })
+    get()._post('assistant', '✅ 已恢复上次的完整报告。请核对后点击「确认定稿」。', 'checkpoint')
+    void recordOptimizationEvent(
+      optimizationEvent(`report-reuse:${sessionId}:${offer.cacheKey}`, sessionId, 'report_cache_reuse', {
+        // 汇总 1 次 + 分析 8 次 + 四段成稿 4 次；文件清洗可能本来也会走本地缓存，因此不计入。
+        skippedModelRequests: 13,
+        reusedReports: 1
+      })
+    )
+  },
+
+  regenerateReport: async () => {
+    set({ reportReuseOffer: null })
+    await get()._startPaidGeneration()
+  },
+
+  _startPaidGeneration: async () => {
+    const { settings, phase } = get()
+    if (phase === 'cleaning' || phase === 'analyzing') return
+    let startingPoints: number | undefined
+    const pointsApi = window.api as typeof window.api & {
+      canStartPointsReport?: typeof window.api.canStartPointsReport
+    }
+    if (typeof pointsApi.canStartPointsReport === 'function') {
+      const access = await pointsApi.canStartPointsReport()
+      if (!access.ok) {
+        get()._post('assistant', access.message, 'error')
+        return
+      }
+      startingPoints = access.wallet.balancePoints
+    }
+    const managed = settings?.managedModel?.enabled ? settings.managedModel : undefined
+    const profile =
+      settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0]
+    const modelConfigured = managed?.configured || Boolean(
+      profile && profile.baseURL.trim() && profile.model.trim() && profile.apiKey.trim()
+    )
+    if (!modelConfigured) {
+      set({ settingsOpen: true })
+      get()._post(
+        'assistant',
+        managed
+          ? managed.error || '内置模型服务暂不可用，请联系软件管理员。'
+          : '还没有完成模型配置。请打开设置，粘贴 API Key 并完成“测试连通”后保存。',
+        'error'
+      )
+      return
+    }
+    const activeEndpoint = managed?.baseURL.trim().replace(/\/+$/, '') || profile?.baseURL.trim().replace(/\/+$/, '') || ''
+    if (!settings?.privacyAccepted || settings.privacyEndpoint !== activeEndpoint) {
+      get()._post('assistant', '开始前请先确认资料将发送到当前模型服务。完成隐私确认后再点“开始生成报告”。', 'error')
+      return
+    }
+    if (startingPoints !== undefined) {
+      get()._post(
+        'assistant',
+        `当前剩余 ${startingPoints.toLocaleString('zh-CN', { maximumFractionDigits: 3 })} 积分，正在准备生成报告。`,
+        'narration'
+      )
+    }
+    set((state) => ({ ...preserveCommittedReport(state), reportReuseOffer: null }))
     try {
       await get()._runCleaning(false)
     } catch (error) {
@@ -1368,12 +1522,14 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
-  // 分批清洗：并发抽取每个文件(最多4个) → 汇总(输入截断+失败重试)，避免大请求被中转掐断
+  // 分批清洗：并发抽取每个文件(最多4个) → 均衡汇总；单个文件失败不阻断其他文件完成。
   _runCleaning: async (isRerun) => {
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'cleaning', cleanedData: '' })
     const usable = get().sources.filter((s) => s.dataUrl || s.text)
+    const sourceCount = usable.length
+    const imageCount = usable.filter((s) => s.kind === 'image').length
     const usableIds = new Set(usable.map((s) => s.id))
     // 丢掉已删除文件的旧明细；只抽取还没处理过的文件（支持中断续跑 / 补传后只洗新文件）
     set((st) => ({ cleanDetails: st.cleanDetails.filter((d) => usableIds.has(d.id)) }))
@@ -1384,12 +1540,14 @@ export const useStore = create<StoreState>((set, get) => ({
         total: todo.length,
         done: 0,
         running: [],
-        failed: 0
+        failed: 0,
+        startedAt: Date.now()
       }
     })
 
     if (todo.length) {
-      const conc = Math.min(MAX_CLEANING_CONCURRENCY, todo.length)
+      const concurrencyPlan = planCleaningConcurrency(todo.length, MAX_CLEANING_CONCURRENCY)
+      const conc = concurrencyPlan.sourceWorkers
       get()._post(
         'assistant',
         `${isRerun ? '补充' : '开始'}清洗 ${todo.length} 份资料（并发 ${conc} 个，更快）……`,
@@ -1398,12 +1556,12 @@ export const useStore = create<StoreState>((set, get) => ({
 
       const aborts = new Set<() => void>()
       let cancelled = false
-      const failedRef: { current: { name: string; error: string } | null } = { current: null }
+      const failures: Array<{ name: string; error: string }> = []
       set({ abortFn: () => { cancelled = true; aborts.forEach((fn) => fn()) } })
 
       let next = 0
       const worker = async (): Promise<void> => {
-        while (!cancelled && !failedRef.current) {
+        while (!cancelled) {
           const i = next++
           if (i >= todo.length) return
           const s = todo[i]
@@ -1414,16 +1572,269 @@ export const useStore = create<StoreState>((set, get) => ({
             }
           }))
           get()._post('assistant', `⏳ 清洗：${s.name}`, 'narration')
-          const res = await runModelRetry(
-            buildExtractMessages(toSourceLike(s)),
-            () => {},
-            (fn) => {
-              if (fn) aborts.add(fn)
+          const cacheInput = toSourceCleanCacheInput(s)
+          try {
+            try {
+              const cached = await window.api.lookupSourceCleanCache(cacheInput)
+              if (!isCurrentSession()) return
+              if (cached.hit && cached.text) {
+                set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cached.text! }] }))
+                set((st) => ({
+                  cleaningProgress: {
+                    ...st.cleaningProgress,
+                    done: st.cleaningProgress.done + 1,
+                    running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                  }
+                }))
+                get()._post('assistant', `♻️ 已复用本机清洗结果：${s.name}`, 'narration')
+                await recordOptimizationEvent(
+                  optimizationEvent(`source-cache:${sessionId}:${s.id}`, sessionId, 'source_cache_hit', {
+                    sourceCacheHits: 1,
+                    skippedModelRequests: 1
+                  })
+                )
+                continue
+              }
+            } catch {
+              // 缓存异常不应影响报告生成，继续走原模型清洗流程。
             }
-          )
-          if (!isCurrentSession()) return
-          if (!res.ok) {
-            if (!failedRef.current) failedRef.current = { name: s.name, error: res.error || '失败' }
+            let modelCleanInput = cacheInput
+            if (s.kind === 'table' && cacheInput.text) {
+              const localResult = preprocessTableForModel(cacheInput.text)
+              if (localResult.applied && localResult.text.trim()) {
+                modelCleanInput = { ...cacheInput, text: localResult.text }
+              }
+              const localDetail = buildLocalTableCleanDetail(cacheInput, localResult)
+              if (localDetail) {
+                set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: localDetail }] }))
+                try {
+                  await window.api.storeSourceCleanCache(cacheInput, localDetail)
+                } catch {
+                  // 本次本地清洗已经完成，缓存写入失败只影响下次复用。
+                }
+                set((st) => ({
+                  cleaningProgress: {
+                    ...st.cleaningProgress,
+                    done: st.cleaningProgress.done + 1,
+                    running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                  }
+                }))
+                get()._post(
+                  'assistant',
+                  `✅ 本机已读取结构化表格：${s.name}（${localResult.retainedRows} 条记录，未调用模型，本文件未扣清洗积分）`,
+                  'narration'
+                )
+                await recordOptimizationEvent(
+                  optimizationEvent(`local-clean:${sessionId}:${s.id}`, sessionId, 'local_source_clean', {
+                    localCompletedFiles: 1,
+                    skippedModelRequests: 1
+                  })
+                )
+                continue
+              }
+            }
+            const batchPlan = buildSourceCleanBatchPlan(modelCleanInput)
+            if (batchPlan.degradedReason) {
+              const reason = batchPlan.degradedReason === 'quotes'
+                ? '引号未闭合'
+                : batchPlan.degradedReason === 'too_wide'
+                  ? '列数超过200'
+                  : '有效行列不足，无法识别为规则表格'
+              const warning = `该表格结构不规则（${reason}），已按整篇文本清洗；逐行核对不可用，请在资料确认页重点检查这份文件。`
+              set((state) => ({
+                sources: state.sources.map((source) => source.id === s.id ? { ...source, warning } : source)
+              }))
+              get()._post('assistant', `⚠️ ${s.name}：${warning}`, 'narration')
+            }
+            const batchOutputs: Array<string | undefined> = new Array(batchPlan.batches.length)
+            const perSourceBatchConcurrency = Math.min(
+              batchPlan.batches.length,
+              concurrencyPlan.batchWorkersPerSource
+            )
+            if (batchPlan.batches.length > 1 && perSourceBatchConcurrency > 1) {
+              get()._post(
+                'assistant',
+                `「${s.name}」共 ${batchPlan.batches.length} 批，将同时处理 ${perSourceBatchConcurrency} 批以缩短等待时间。`,
+                'narration'
+              )
+            }
+            let sourceFailed = false
+            let activeBatchRequests = 0
+            const markSourceFailure = (error: string): void => {
+              if (sourceFailed) return
+              sourceFailed = true
+              failures.push({ name: s.name, error })
+              set((state) => ({
+                cleaningProgress: {
+                  ...state.cleaningProgress,
+                  running: state.cleaningProgress.running.filter((name) => name !== s.name),
+                  failed: state.cleaningProgress.failed + 1
+                }
+              }))
+            }
+            const runWithReservationBackpressure = async (
+              label: string,
+              run: () => ReturnType<typeof runModelRetry>
+            ): Promise<Awaited<ReturnType<typeof runModelRetry>>> => {
+              let reservationRetry = 0
+              while (!cancelled && isCurrentSession()) {
+                activeBatchRequests += 1
+                let result: Awaited<ReturnType<typeof runModelRetry>>
+                try {
+                  result = await run()
+                } finally {
+                  activeBatchRequests = Math.max(0, activeBatchRequests - 1)
+                }
+                if (
+                  result.ok || reservationRetry >= perSourceBatchConcurrency ||
+                  !isTemporaryReservationContention(result.error, activeBatchRequests)
+                ) return result
+                reservationRetry += 1
+                get()._post(
+                  'assistant',
+                  `${label}正在等待其他批次释放预留积分，释放后会自动继续，不会重复扣费。`,
+                  'narration'
+                )
+                let waits = 0
+                while (activeBatchRequests > 0 && !cancelled && isCurrentSession() && waits < 360) {
+                  await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
+                  waits += 1
+                }
+              }
+              return { ok: false, text: '', error: '已停止' }
+            }
+            let nextBatch = 0
+            const batchWorker = async (): Promise<void> => {
+              while (!cancelled && !sourceFailed && isCurrentSession()) {
+                const batchPosition = nextBatch++
+                if (batchPosition >= batchPlan.batches.length) return
+                const batch = batchPlan.batches[batchPosition]
+                if (batchPlan.batches.length > 1) {
+                  get()._post(
+                    'assistant',
+                    `正在清洗「${s.name}」第 ${batch.context.batchIndex}/${batch.context.batchCount} 批……`,
+                    'narration'
+                  )
+                }
+                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v5-local-structured:${batch.context.batchIndex}`
+                const savedBatch = get().taskJournal[batchTaskId]
+                if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
+                  batchOutputs[batchPosition] = savedBatch.output
+                  continue
+                }
+                const res = await runWithReservationBackpressure(
+                  `「${s.name}」第 ${batch.context.batchIndex} 批`,
+                  () => runModelRetry(
+                    buildExtractMessages(batch.source, batch.context),
+                    () => {},
+                    (fn) => {
+                      if (fn) aborts.add(fn)
+                    },
+                    undefined,
+                    1,
+                    {
+                      reportSessionId: sessionId,
+                      taskType: 'source_clean',
+                      taskKey: batchTaskId,
+                      billingRequestId: batchTaskId,
+                      isVision: s.kind === 'image',
+                      sourceCount,
+                      imageCount,
+                      sourceId: s.id,
+                      stepId: `batch-${batch.context.batchIndex}-of-${batch.context.batchCount}`
+                    }
+                  )
+                )
+                if (!isCurrentSession()) return
+                if (!res.ok) {
+                  const suffix = batchPlan.batches.length > 1
+                    ? `（第 ${batch.context.batchIndex}/${batch.context.batchCount} 批）`
+                    : ''
+                  markSourceFailure(`${suffix}${res.error || '失败'}`)
+                  continue
+                }
+                let verifiedText = res.text
+                const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batchPlan.mode)
+                if (missingEvidence.length) {
+                  get()._post(
+                    'assistant',
+                    `「${s.name}」第 ${batch.context.batchIndex} 批漏了 ${missingEvidence.length} 个证据单元，正在只补做这一批……`,
+                    'narration'
+                  )
+                  const repairTaskId = `${batchTaskId}:coverage-repair-v1`
+                  const repair = await runWithReservationBackpressure(
+                    `「${s.name}」第 ${batch.context.batchIndex} 批补做`,
+                    () => runModelRetry(
+                      buildExtractMessages(batch.source, batch.context),
+                      () => {},
+                      (fn) => {
+                        if (fn) aborts.add(fn)
+                      },
+                      undefined,
+                      0,
+                      {
+                        reportSessionId: sessionId,
+                        taskType: 'source_clean',
+                        taskKey: repairTaskId,
+                        billingRequestId: repairTaskId,
+                        isVision: s.kind === 'image',
+                        sourceCount,
+                        imageCount,
+                        sourceId: s.id,
+                        stepId: `batch-${batch.context.batchIndex}-coverage-repair`
+                      }
+                    )
+                  )
+                  if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
+                    markSourceFailure(`第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`)
+                    continue
+                  }
+                  verifiedText = repair.text
+                }
+                batchOutputs[batchPosition] = verifiedText
+                set((state) => ({
+                  taskJournal: {
+                    ...state.taskJournal,
+                    [batchTaskId]: {
+                      kind: 'source_clean',
+                      status: 'complete',
+                      output: verifiedText,
+                      updatedAt: new Date().toISOString()
+                    }
+                  }
+                }))
+                scheduleCleaningCheckpointSave(get)
+              }
+            }
+            await Promise.all(Array.from({ length: perSourceBatchConcurrency }, () => batchWorker()))
+            if (!isCurrentSession()) return
+            if (
+              sourceFailed ||
+              batchOutputs.filter((output) => Boolean(output?.trim())).length !== batchPlan.batches.length
+            ) continue
+            const cleanText = combineSourceCleanBatchOutputs(batchPlan, batchOutputs as string[])
+            set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cleanText }] }))
+            try {
+              await window.api.storeSourceCleanCache(cacheInput, cleanText)
+            } catch {
+              // 写缓存失败只影响下次复用，不影响本次分析结果。
+            }
+            set((st) => ({
+              cleaningProgress: {
+                ...st.cleaningProgress,
+                done: st.cleaningProgress.done + 1,
+                running: st.cleaningProgress.running.filter((name) => name !== s.name)
+              }
+            }))
+            get()._post(
+              'assistant',
+              batchPlan.mode === 'table_rows' && batchPlan.originalRecordCount !== undefined
+                ? `✅ 已清洗：${s.name}（${batchPlan.originalRecordCount} 条记录，${batchPlan.batches.length} 批全部完成）`
+                : `✅ 已清洗：${s.name}（${batchPlan.batches.length} 批全部完成）`,
+              'narration'
+            )
+          } catch (error) {
+            failures.push({ name: s.name, error: friendlyError(error) })
             set((st) => ({
               cleaningProgress: {
                 ...st.cleaningProgress,
@@ -1431,32 +1842,33 @@ export const useStore = create<StoreState>((set, get) => ({
                 failed: st.cleaningProgress.failed + 1
               }
             }))
-            return
           }
-          set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: res.text }] }))
-          set((st) => ({
-            cleaningProgress: {
-              ...st.cleaningProgress,
-              done: st.cleaningProgress.done + 1,
-              running: st.cleaningProgress.running.filter((name) => name !== s.name)
-            }
-          }))
-          get()._post('assistant', `✅ 已清洗：${s.name}`, 'narration')
         }
       }
       await Promise.all(Array.from({ length: conc }, () => worker()))
       if (!isCurrentSession()) return
       set({ abortFn: null })
 
+      // 并发完成顺序不稳定；统一恢复为用户上传顺序，防止汇总、缓存和恢复时错配文件。
+      const completedById = new Map(get().cleanDetails.map((detail) => [detail.id, detail]))
+      set({ cleanDetails: usable.flatMap((source) => {
+        const detail = completedById.get(source.id)
+        return detail ? [detail] : []
+      }) })
+
       if (cancelled) {
         set({ phase: get().cleanedData ? 'checkpoint1' : 'idle' })
         return
       }
-      if (failedRef.current) {
-        const f = failedRef.current
+      if (failures.length) {
+        const preview = failures
+          .slice(0, 3)
+          .map((failure) => `「${failure.name}」：${failure.error}`)
+          .join('\n')
+        const more = failures.length > 3 ? `\n另有 ${failures.length - 3} 份资料未完成。` : ''
         get()._post(
           'assistant',
-          `⚠️ 「${f.name}」清洗失败：${f.error}。已完成的会保留，再点「开始生成」会跳过它们只洗剩下的。`,
+          `⚠️ 有 ${failures.length} 份资料本轮未完成，但其他资料已继续清洗并保留：\n${preview}${more}\n请根据提示处理后再点「开始生成」，软件只会重试未完成的资料。`,
           'error'
         )
         set({ phase: get().cleanedData ? 'checkpoint1' : 'idle' })
@@ -1464,33 +1876,133 @@ export const useStore = create<StoreState>((set, get) => ({
       }
     }
 
-    // 汇总：输入按文件截断（避免请求过大），网络错误自动重试一次
-    get()._post('assistant', '正在汇总「① 资料分类总览」…', 'narration')
+    // 汇总：所有清洗批次先分组参与中间汇总，再统一合并；不再对超大文件只抽首中尾。
     const details = get().cleanDetails.map((d) => ({ name: d.name, text: d.text }))
-    const blockId = get()._post('assistant', '', 'report-block')
-    const res = await runModelRetry(
-      buildSummaryMessages(details, get().steering),
-      (acc) => {
-        if (isCurrentSession()) get()._update(blockId, acc)
-      },
-      (fn) => {
-        if (isCurrentSession()) set({ abortFn: fn })
-      },
-      (n) => {
-        if (isCurrentSession()) get()._post('assistant', `汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
-      }
+    const summaryGroups = planSummaryDetailGroups(details)
+    get()._post(
+      'assistant',
+      summaryGroups.length > 1
+        ? `清洗明细较多，正在分 ${summaryGroups.length} 组完整汇总，确保每个批次都进入分析……`
+        : '正在汇总「① 资料分类总览」…',
+      'narration'
     )
-    if (!isCurrentSession()) return
-    if (!res.ok) {
-      get()._update(blockId, (res.text || '') + `\n\n⚠️ 汇总失败：${res.error}`)
-      set({ phase: get().cleanedData ? 'checkpoint1' : 'idle' })
-      return
+    const blockId = get()._post('assistant', '', 'report-block')
+    const partialSummaries: string[] = []
+    for (let index = 0; index < summaryGroups.length; index++) {
+      const groupNumber = index + 1
+      if (summaryGroups.length > 1) {
+        get()._post('assistant', `正在汇总第 ${groupNumber}/${summaryGroups.length} 组清洗证据……`, 'narration')
+      }
+      const groupTaskId = `${sessionId}:summary:group-v2:${groupNumber}`
+      const savedGroup = get().taskJournal[groupTaskId]
+      if (savedGroup?.status === 'complete' && savedGroup.output?.trim()) {
+        partialSummaries.push(savedGroup.output)
+        if (summaryGroups.length === 1) get()._update(blockId, savedGroup.output)
+        continue
+      }
+      const groupResult = await runModelRetry(
+        buildSummaryGroupMessages(summaryGroups[index], groupNumber, summaryGroups.length, get().steering),
+        (acc) => {
+          if (isCurrentSession() && summaryGroups.length === 1) get()._update(blockId, acc)
+        },
+        (fn) => {
+          if (isCurrentSession()) set({ abortFn: fn })
+        },
+        (n) => {
+          if (isCurrentSession()) get()._post('assistant', `第 ${groupNumber} 组汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
+        },
+        1,
+        {
+          reportSessionId: sessionId,
+          taskType: 'summary',
+          taskKey: groupTaskId,
+          billingRequestId: groupTaskId,
+          isVision: false,
+          sourceCount,
+          imageCount,
+          stepId: `group-${groupNumber}-of-${summaryGroups.length}`
+        }
+      )
+      if (!isCurrentSession()) return
+      if (!groupResult.ok || !groupResult.text.trim()) {
+        get()._update(blockId, `${partialSummaries.join('\n\n')}\n\n⚠️ 第 ${groupNumber} 组汇总失败：${groupResult.error || '模型没有返回内容'}`.trim())
+        set({ phase: get().cleanedData ? 'checkpoint1' : 'idle', abortFn: null })
+        return
+      }
+      partialSummaries.push(groupResult.text)
+      set((state) => ({
+        taskJournal: {
+          ...state.taskJournal,
+          [groupTaskId]: {
+            kind: 'summary',
+            status: 'complete',
+            output: groupResult.text,
+            updatedAt: new Date().toISOString()
+          }
+        }
+      }))
+      await window.api.saveLastProject(buildProjectSnapshot(get()))
     }
+
+    let summaryText = partialSummaries[0] || ''
+    if (partialSummaries.length > 1) {
+      get()._post('assistant', '所有清洗批次均已进入中间汇总，正在合并最终资料总览……', 'narration')
+      const mergeTaskId = `${sessionId}:summary:merge-v2`
+      const savedMerge = get().taskJournal[mergeTaskId]
+      if (savedMerge?.status === 'complete' && savedMerge.output?.trim()) {
+        summaryText = savedMerge.output
+        get()._update(blockId, savedMerge.output)
+      } else {
+      const mergeResult = await runModelRetry(
+        buildSummaryMergeMessages(partialSummaries, get().steering),
+        (acc) => {
+          if (isCurrentSession()) get()._update(blockId, acc)
+        },
+        (fn) => {
+          if (isCurrentSession()) set({ abortFn: fn })
+        },
+        (n) => {
+          if (isCurrentSession()) get()._post('assistant', `最终汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
+        },
+        1,
+        {
+          reportSessionId: sessionId,
+          taskType: 'summary',
+          taskKey: mergeTaskId,
+          billingRequestId: mergeTaskId,
+          isVision: false,
+          sourceCount,
+          imageCount,
+          stepId: 'merge-all-groups'
+        }
+      )
+      if (!isCurrentSession()) return
+      if (!mergeResult.ok || !mergeResult.text.trim()) {
+        get()._update(blockId, `${partialSummaries.join('\n\n')}\n\n⚠️ 最终汇总失败：${mergeResult.error || '模型没有返回内容'}`)
+        set({ phase: get().cleanedData ? 'checkpoint1' : 'idle', abortFn: null })
+        return
+      }
+      summaryText = mergeResult.text
+      set((state) => ({
+        taskJournal: {
+          ...state.taskJournal,
+          [mergeTaskId]: {
+            kind: 'summary',
+            status: 'complete',
+            output: mergeResult.text,
+            updatedAt: new Date().toISOString()
+          }
+        }
+      }))
+      await window.api.saveLastProject(buildProjectSnapshot(get()))
+      }
+    }
+    set({ abortFn: null })
 
     // cleanedData = 汇总(总览+竞品+人群方向) + 各文件完整明细（供后续分析用，不截断）
     const detailFull = get().cleanDetails.map((d) => `### ${d.name}\n${d.text}`).join('\n\n')
     set({
-      cleanedData: `${res.text}\n\n---\n## 各来源清洗明细\n\n${detailFull}`,
+      cleanedData: `${summaryText}\n\n---\n## 各来源清洗明细\n\n${detailFull}`,
       phase: 'checkpoint1'
     })
     get()._post(
@@ -1510,20 +2022,145 @@ export const useStore = create<StoreState>((set, get) => ({
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
     const { sopRules, cleanedData } = get()
+    const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)
+    let analysisInput = cleanedData
+    if (analysisEvidenceGroups.length > 1) {
+      get()._post(
+        'assistant',
+        `资料较多，正在一次性建立 ${analysisEvidenceGroups.length} 组通用证据台账，后续8个分析步骤将直接复用。`,
+        'narration'
+      )
+      const digestOutputs: string[] = []
+      let digestFailure = ''
+      for (let index = 0; index < analysisEvidenceGroups.length; index++) {
+        const taskId = `${sessionId}:evidence_digest:v1:source:${index + 1}`
+        const saved = get().taskJournal[taskId]
+        if (saved?.status === 'complete' && saved.output?.trim()) {
+          digestOutputs.push(saved.output)
+          continue
+        }
+        const digest = await runModelRetry(
+          buildEvidenceDigestMessages({
+            evidenceGroup: analysisEvidenceGroups[index],
+            groupIndex: index + 1,
+            groupCount: analysisEvidenceGroups.length
+          }),
+          () => {},
+          (fn) => set({ abortFn: fn }),
+          (n) => get()._post('assistant', `证据台账第 ${index + 1} 组连接中断，重试第 ${n} 次…`, 'narration'),
+          1,
+          {
+            reportSessionId: sessionId,
+            taskType: 'analysis_step',
+            taskKey: taskId,
+            billingRequestId: taskId,
+            isVision: false,
+            sourceCount: topLevelSourceCount(get().sources),
+            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            stepId: `evidence-digest-${index + 1}`
+          }
+        )
+        if (!digest.ok || !digest.text.trim()) {
+          digestFailure = digest.error || `证据台账第 ${index + 1} 组没有返回内容`
+          break
+        }
+        digestOutputs.push(digest.text)
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [taskId]: {
+              kind: 'analysis_step',
+              status: 'complete',
+              output: digest.text,
+              updatedAt: new Date().toISOString()
+            }
+          }
+        }))
+        await window.api.saveLastProject(buildProjectSnapshot(get()))
+      }
+      let evidenceDigest = digestOutputs.map((output, index) => `### 证据分组 ${index + 1}\n${output}`).join('\n\n')
+      let round = 0
+      while (!digestFailure && planAnalysisEvidenceGroups(evidenceDigest).length > 1 && round < 4) {
+        round += 1
+        const groups = planAnalysisEvidenceGroups(evidenceDigest)
+        const consolidated: string[] = []
+        for (let index = 0; index < groups.length; index++) {
+          const taskId = `${sessionId}:evidence_digest:v1:${round}:${index + 1}`
+          const saved = get().taskJournal[taskId]
+          if (saved?.status === 'complete' && saved.output?.trim()) {
+            consolidated.push(saved.output)
+            continue
+          }
+          const merge = await runModelRetry(
+            buildEvidenceDigestConsolidationMessages({
+              evidenceLedger: groups[index],
+              groupIndex: index + 1,
+              groupCount: groups.length
+            }),
+            () => {},
+            (fn) => set({ abortFn: fn }),
+            undefined,
+            1,
+            {
+              reportSessionId: sessionId,
+              taskType: 'analysis_step',
+              taskKey: taskId,
+              billingRequestId: taskId,
+              isVision: false,
+              sourceCount: topLevelSourceCount(get().sources),
+              imageCount: get().sources.filter((source) => source.kind === 'image').length,
+              stepId: `evidence-digest-merge-${round}-${index + 1}`
+            }
+          )
+          if (!merge.ok || !merge.text.trim()) {
+            digestFailure = merge.error || '通用证据台账合并失败'
+            break
+          }
+          consolidated.push(merge.text)
+          set((state) => ({
+            taskJournal: {
+              ...state.taskJournal,
+              [taskId]: {
+                kind: 'analysis_step',
+                status: 'complete',
+                output: merge.text,
+                updatedAt: new Date().toISOString()
+              }
+            }
+          }))
+          await window.api.saveLastProject(buildProjectSnapshot(get()))
+        }
+        if (!digestFailure) evidenceDigest = consolidated.join('\n\n')
+      }
+      if (digestFailure || planAnalysisEvidenceGroups(evidenceDigest).length > 1) {
+        get()._post('assistant', `⚠️ 通用证据台账生成失败：${digestFailure || '合并后仍超过安全长度'}。请修好后继续分析。`, 'error')
+        set({ phase: 'checkpoint1', abortFn: null })
+        return
+      }
+      analysisInput = evidenceDigest
+    }
     for (const step of SOP_STEPS) {
       if (get().phase !== 'analyzing') return
       const isReportStep = step.id === REPORT_STEP_ID
       // 已完成的非成稿步骤直接跳过（支持中断后续跑）
       if (!isReportStep && get().artifacts[step.id]) continue
 
-      const priorOutputs = SOP_STEPS.filter((s) => s.id < step.id && get().artifacts[s.id]).map((s) => ({
-        id: s.id,
-        title: `第${s.id}步 ${s.title}`,
-        output: isReportStep ? compactForFinalReport(get().artifacts[s.id]) : get().artifacts[s.id]
-      }))
+      const priorOutputs = isReportStep
+        ? SOP_STEPS.filter((s) => s.id < step.id && get().artifacts[s.id]).map((s) => ({
+            id: s.id,
+            title: `第${s.id}步 ${s.title}`,
+            output: compactForFinalReport(get().artifacts[s.id])
+          }))
+        : priorOutputsForStep(step.id, get().artifacts)
       if (isReportStep) {
         const previousReport = get().reportMarkdown
         const reportFeedback = get().steering
+        const finalTaskPrefix = `${sessionId}:final_part`
+        const completedFinalParts = Object.fromEntries(
+          Object.entries(get().taskJournal)
+            .filter(([taskId, task]) => taskId.startsWith(`${finalTaskPrefix}:`) && task.kind === 'final_part' && task.status === 'complete' && task.output)
+            .map(([taskId, task]) => [taskId, task.output || ''])
+        )
         get()._post('assistant', '⏳ 正在整合成稿…', 'narration')
         const res = await runFinalReportInParts({
           cleanedData: cleanedSummaryOnly(cleanedData),
@@ -1537,6 +2174,29 @@ export const useStore = create<StoreState>((set, get) => ({
           },
           onRetry: (partLabel, n) => {
             if (isCurrentSession()) get()._post('assistant', `成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
+          },
+          taskContext: {
+            reportSessionId: sessionId,
+            taskType: 'final_part',
+            taskKeyPrefix: finalTaskPrefix,
+            sourceCount: topLevelSourceCount(get().sources),
+            imageCount: get().sources.filter((source) => source.kind === 'image').length
+          },
+          completedParts: completedFinalParts,
+          onPartComplete: async (taskId, output) => {
+            if (!isCurrentSession()) return
+            set((state) => ({
+              taskJournal: {
+                ...state.taskJournal,
+                [taskId]: {
+                  kind: 'final_part',
+                  status: 'complete',
+                  output,
+                  updatedAt: new Date().toISOString()
+                }
+              }
+            }))
+            await window.api.saveLastProject(buildProjectSnapshot(get()))
           }
         })
         if (!isCurrentSession()) return
@@ -1557,26 +2217,52 @@ export const useStore = create<StoreState>((set, get) => ({
           await get()._rerunReport()
           return
         }
+        const structureErrors = validateReportStructure(res.text)
+        if (structureErrors.length) {
+          set({ phase: 'checkpoint1', reportMarkdown: previousReport, abortFn: null })
+          get()._post(
+            'assistant',
+            `成稿结构检查未通过，软件已保留上一份完整报告并停止定稿：\n${structureErrors.slice(0, 4).map((item) => `- ${item}`).join('\n')}\n请点「确认，继续分析」补做本次成稿。`,
+            'error'
+          )
+          return
+        }
+        const evidenceAudit = validateReportEvidenceLinks(res.text, cleanedData)
+        if (evidenceAudit.errors.length) {
+          set({ phase: 'checkpoint1', reportMarkdown: previousReport, abortFn: null })
+          get()._post('assistant', evidenceAudit.errors.join('\n'), 'error')
+          return
+        }
         set((s) => ({
           artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
           reportMarkdown: res.text,
           reportStale: false
         }))
       } else {
-        const messages = buildStepMessages({
-          stepId: step.id,
-          stepTitle: step.title,
-          sopRules,
-          cleanedData,
-          priorOutputs,
-          feedback: get().steering
-        })
         get()._post('assistant', `⏳ 正在：${step.title}…`, 'narration')
         const res = await runModelRetry(
-          messages,
+          buildStepMessages({
+            stepId: step.id,
+            stepTitle: step.title,
+            sopRules,
+            cleanedData: analysisInput,
+            priorOutputs,
+            feedback: get().steering
+          }),
           () => {},
           (fn) => set({ abortFn: fn }),
-          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration')
+          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
+          1,
+          {
+            reportSessionId: sessionId,
+            taskType: 'analysis_step',
+            taskKey: `${sessionId}:analysis_step:${step.id}`,
+            billingRequestId: `${sessionId}:analysis_step:${step.id}`,
+            isVision: false,
+            sourceCount: topLevelSourceCount(get().sources),
+            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            stepId: String(step.id)
+          }
         )
         if (!isCurrentSession()) return
         if (!res.ok) {
@@ -1591,11 +2277,42 @@ export const useStore = create<StoreState>((set, get) => ({
           return
         }
         set((s) => ({ artifacts: { ...s.artifacts, [step.id]: res.text } }))
+        const analysisTaskId = `${sessionId}:analysis_step:${step.id}`
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [analysisTaskId]: {
+              kind: 'analysis_step',
+              status: 'complete',
+              output: res.text,
+              updatedAt: new Date().toISOString()
+            }
+          }
+        }))
+        await window.api.saveLastProject(buildProjectSnapshot(get()))
         get()._post('assistant', `✅ ${step.title} 完成`, 'narration')
       }
     }
     if (!isCurrentSession()) return
     set({ phase: 'checkpoint2' })
+    try {
+      await storeCompleteReportResult(get())
+    } catch {
+      // 完整报告已生成；缓存失败不能影响本次结果和积分结算。
+    }
+    try {
+      const charge = await window.api.getReportPointsCharge(sessionId)
+      const wallet = await window.api.getPointsWallet()
+      if (!isCurrentSession()) return
+      get()._post(
+        'assistant',
+        `报告已完成，本次消耗 ${formatPointsValue(charge.chargedPoints)} 积分，剩余 ${formatPointsValue(wallet.balancePoints)} 积分。`,
+        'narration'
+      )
+    } catch {
+      if (!isCurrentSession()) return
+      get()._post('assistant', '报告已完成，剩余积分可在页面顶部查看。', 'narration')
+    }
     get()._post(
       'assistant',
       '✅ 报告初稿已生成（右侧）。需要改哪里直接说（如：经营建议再具体、第 9 步选题加几条），或点「确认定稿」。',
@@ -1603,13 +2320,24 @@ export const useStore = create<StoreState>((set, get) => ({
     )
   },
 
-  _rerunReport: async () => {
+  _rerunReport: async (latestFeedback) => {
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
-    const { sopRules, cleanedData, steering, artifacts } = get()
-    const reportFeedback = steering
+    const { cleanedData, steering, artifacts } = get()
+    const steeringAtStart = steering
+    const reportFeedback = latestFeedback?.trim() || steering
     const previousReport = get().reportMarkdown
+    const selectedParts = previousReport.trim() ? selectRevisionParts(reportFeedback) : FINAL_REPORT_PARTS
+    const partialRevision = selectedParts.length < FINAL_REPORT_PARTS.length
+    const revisionRunId = crypto.randomUUID()
     set({ phase: 'analyzing' })
+    if (partialRevision) {
+      get()._post(
+        'assistant',
+        `本次只重写：${selectedParts.map((part) => part.label).join('、')}；其他章节保持不变。`,
+        'narration'
+      )
+    }
     const priorOutputs = SOP_STEPS.filter((s) => s.id < REPORT_STEP_ID && artifacts[s.id]).map((s) => ({
       id: s.id,
       title: `第${s.id}步 ${s.title}`,
@@ -1623,11 +2351,19 @@ export const useStore = create<StoreState>((set, get) => ({
         if (isCurrentSession()) set({ abortFn: fn })
       },
       onProgress: (text) => {
-        if (isCurrentSession()) set({ reportMarkdown: text })
+        if (isCurrentSession() && !partialRevision) set({ reportMarkdown: text })
       },
       onRetry: (partLabel, n) => {
         if (isCurrentSession()) get()._post('assistant', `修订成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
-      }
+      },
+      taskContext: {
+        reportSessionId: sessionId,
+        taskType: 'revision_part',
+        taskKeyPrefix: `${sessionId}:revision:${revisionRunId}`,
+        sourceCount: get().sources.length,
+        imageCount: get().sources.filter((source) => source.kind === 'image').length
+      },
+      parts: selectedParts
     })
     if (!isCurrentSession()) return
     if (!res.ok) {
@@ -1639,19 +2375,60 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
       return
     }
-    if (get().steering !== reportFeedback) {
+    if (get().steering !== steeringAtStart) {
       set({ reportMarkdown: previousReport })
       get()._post('assistant', '检测到修订期间又有新要求，正在继续按最新要求修订。', 'narration')
       await get()._rerunReport()
       return
     }
+    const nextReport = partialRevision
+      ? mergeRevisionParts(previousReport, res.text, selectedParts)
+      : res.text
+    if (!nextReport) {
+      get()._post('assistant', '局部修订返回的章节不完整，已保留上一份完整报告，请重试。', 'error')
+      set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
+      return
+    }
+    const structureErrors = validateReportStructure(nextReport)
+    if (structureErrors.length) {
+      get()._post(
+        'assistant',
+        `修订结果结构不完整，已保留上一份完整报告：\n${structureErrors.slice(0, 4).map((item) => `- ${item}`).join('\n')}`,
+        'error'
+      )
+      set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
+      return
+    }
+    const evidenceAudit = validateReportEvidenceLinks(nextReport, cleanedData)
+    if (evidenceAudit.errors.length) {
+      get()._post('assistant', evidenceAudit.errors.join('\n'), 'error')
+      set({ phase: previousReport ? 'checkpoint2' : 'checkpoint1', reportMarkdown: previousReport })
+      return
+    }
     set((s) => ({
-      artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
-      reportMarkdown: res.text,
+      artifacts: { ...s.artifacts, [REPORT_STEP_ID]: nextReport },
+      reportMarkdown: nextReport,
       reportStale: false,
       phase: 'checkpoint2'
     }))
-    get()._post('assistant', '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。', 'checkpoint')
+    try {
+      await storeCompleteReportResult(get())
+    } catch {
+      // 修订结果已保存到项目；复用缓存失败不影响本次报告。
+    }
+    try {
+      const charge = await window.api.getReportPointsCharge(sessionId)
+      const wallet = await window.api.getPointsWallet()
+      if (!isCurrentSession()) return
+      get()._post(
+        'assistant',
+        `✅ 已完成修订，本次会话累计消耗 ${formatPointsValue(charge.chargedPoints)} 积分，剩余 ${formatPointsValue(wallet.balancePoints)} 积分。还要改可以继续说。`,
+        'checkpoint'
+      )
+    } catch {
+      if (!isCurrentSession()) return
+      get()._post('assistant', '✅ 已按你的要求修订报告。还要改继续说，或点「确认定稿」。剩余积分可在页面顶部查看。', 'checkpoint')
+    }
   },
 
   confirmCheckpoint: async () => {
@@ -1671,6 +2448,15 @@ export const useStore = create<StoreState>((set, get) => ({
       ) {
         set({ phase: 'checkpoint1' })
         get()._post('assistant', '报告内容不完整，请重新继续分析后再定稿。', 'error')
+        return
+      }
+      const structureErrors = validateReportStructure(get().reportMarkdown)
+      if (structureErrors.length) {
+        get()._post(
+          'assistant',
+          `报告仍有结构问题，暂不能定稿：\n${structureErrors.slice(0, 4).map((item) => `- ${item}`).join('\n')}`,
+          'error'
+        )
         return
       }
       set({ phase: 'done' })
@@ -1696,7 +2482,11 @@ export const useStore = create<StoreState>((set, get) => ({
           return {
             steering: (s.steering ? s.steering + '\n' : '') + t,
             artifacts: committedReport ? { [REPORT_STEP_ID]: committedReport } : {},
-            reportStale: Boolean(committedReport)
+            reportStale: Boolean(committedReport),
+            // 用户纠偏会改变汇总及后续推理；只保留逐文件清洗批次，避免复用旧结论。
+            taskJournal: Object.fromEntries(
+              Object.entries(s.taskJournal).filter(([, task]) => task.kind === 'source_clean')
+            )
           }
         })
         get()._post('assistant', '好的，按你的要求重新清洗归一……', 'narration')
@@ -1706,7 +2496,7 @@ export const useStore = create<StoreState>((set, get) => ({
       if (phase === 'checkpoint2' || phase === 'done') {
         set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
         get()._post('assistant', '好的，按你的要求修订报告……', 'narration')
-        await get()._rerunReport()
+        await get()._rerunReport(t)
         return true
       }
       set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
@@ -1750,6 +2540,11 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     if (phase !== 'done' && !reportStale) {
       set({ exportStatus: '这还是待确认的初稿，请先点击“确认定稿”再导出。' })
+      return
+    }
+    const structuralWarnings = validateReportStructure(md)
+    if (structuralWarnings.length > 0) {
+      set({ exportStatus: `成稿检查还有 ${structuralWarnings.length} 项，请先修正后再导出。` })
       return
     }
     set({ exportStatus: '导出中…', lastExportPath: '' })

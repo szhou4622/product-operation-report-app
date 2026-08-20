@@ -1,4 +1,10 @@
-import { FINAL_REPORT_REQUIRED_FOOTER, finalReportRequiredHeadings, PROCESS_TERMS } from './reportTemplate'
+import {
+  FINAL_REPORT_REQUIRED_FOOTER,
+  FINAL_REPORT_SECTIONS,
+  finalReportRequiredHeadings,
+  PROCESS_TERMS,
+  type FinalReportPart
+} from './reportTemplate'
 
 // 成稿前的来源绑定硬规则检查（启发式，非阻断，仅提示）
 export function validateReport(md: string): string[] {
@@ -111,4 +117,66 @@ export function validateReport(md: string): string[] {
   }
 
   return warnings
+}
+
+/** 只返回会导致导出丢章、乱序或缺核心表格的硬错误；证据不足提醒仍允许用户导出。 */
+export function validateReportStructure(md: string): string[] {
+  const hardPrefixes = [
+    '报告标题前出现了多余文本',
+    '报告缺少标准章节',
+    '报告章节顺序疑似不符合标准模板',
+    '报告出现模板外二级章节',
+    '报告缺少「生成日期',
+    '第 9 章缺少',
+    '报告末尾缺少',
+    '报告缺少目标格式要求的表格列'
+  ]
+  return validateReport(md).filter((warning) => hardPrefixes.some((prefix) => warning.startsWith(prefix)))
+}
+
+/** Validate each independently generated part before it is checkpointed or joined. */
+export function validateFinalReportPart(md: string, part: FinalReportPart): string[] {
+  const errors: string[] = []
+  const headings = FINAL_REPORT_SECTIONS.filter((section) => part.sections.includes(section.number))
+    .map((section) => `## ${section.number}. ${section.title}`)
+  const lines = md.replace(/\\\./gu, '.').split(/\r?\n/u).map((line) => line.trim())
+  const foundHeadings = lines.filter((line) => /^##\s+/u.test(line))
+  const extra = foundHeadings.filter((line) => !headings.includes(line))
+  const missing = headings.filter((heading) => !lines.includes(heading))
+  if (missing.length) errors.push(`缺少章节：${missing.join('、')}`)
+  if (extra.length) errors.push(`出现本片段范围外章节：${extra.join('、')}`)
+  let previous = -1
+  for (const heading of headings) {
+    const index = lines.indexOf(heading)
+    if (index >= 0 && index < previous) errors.push('章节顺序不正确。')
+    previous = Math.max(previous, index)
+  }
+  if (part.includeTitle && !lines.find((line) => line.startsWith('# '))) errors.push('缺少报告标题。')
+  if (part.includeDate && !lines.some((line) => /^生成日期：/u.test(line))) errors.push('缺少生成日期。')
+  if (part.includeFooter && !md.includes(FINAL_REPORT_REQUIRED_FOOTER)) errors.push('缺少报告末尾注释。')
+  return [...new Set(errors)]
+}
+
+/** Rejects fabricated evidence identifiers. Missing links remain an audit warning during staged rollout. */
+export function validateReportEvidenceLinks(
+  md: string,
+  cleanedData: string
+): { errors: string[]; linkedIds: number; unlinkedNumericLines: number } {
+  const idPattern = /\bPOR-[RTI]-[A-F0-9]{8}-\d{6}\b/gu
+  const reportIds = [...new Set(md.match(idPattern) || [])]
+  const knownIds = new Set(cleanedData.match(idPattern) || [])
+  const unknown = reportIds.filter((id) => !knownIds.has(id))
+  const unlinkedNumericLines = md.split(/\r?\n/u).filter((line) => {
+    const trimmed = line.trim()
+    if (!trimmed || /^#{1,6}\s|^生成日期|^\|?\s*[-:]+/u.test(trimmed)) return false
+    if (!/\d/u.test(trimmed) || /\bPOR-[RTI]-[A-F0-9]{8}-\d{6}\b/u.test(trimmed)) return false
+    return !/建议|排序|优先级|第\s*\d+|近期|中期|长期|验证项/u.test(trimmed)
+  }).length
+  return {
+    errors: unknown.length
+      ? [`报告引用了清洗账本中不存在的证据ID：${unknown.slice(0, 8).join('、')}${unknown.length > 8 ? '等' : ''}。`]
+      : [],
+    linkedIds: reportIds.length,
+    unlinkedNumericLines
+  }
 }

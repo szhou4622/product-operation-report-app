@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { useStore } from '../store'
+import { derivedSourceCount, evidenceScopeStats, topLevelSourceCount, useStore } from '../store'
 
 export default function ConversationPanel(): JSX.Element {
   const sources = useStore((s) => s.sources)
   const phase = useStore((s) => s.phase)
   const messages = useStore((s) => s.messages)
   const cleaningProgress = useStore((s) => s.cleaningProgress)
+  const cleanDetails = useStore((s) => s.cleanDetails)
   const addSources = useStore((s) => s.addSources)
   const removeSource = useStore((s) => s.removeSource)
   const setSourceAttribution = useStore((s) => s.setSourceAttribution)
@@ -56,6 +57,9 @@ export default function ConversationPanel(): JSX.Element {
     (s) => (s.dataUrl || s.text) && Boolean(s.attribution)
   ).length
   const competitorSources = sources.filter((s) => /竞品|竞对|对标|对手/.test(s.attribution ?? ''))
+  const uploadedFileCount = topLevelSourceCount(sources)
+  const derivedCount = derivedSourceCount(sources)
+  const scopeStats = evidenceScopeStats(sources, cleanDetails)
   const parsePercent = sources.length ? Math.round((processedCount / sources.length) * 100) : 0
   const cleanPercent = cleaningProgress.total
     ? Math.round(((cleaningProgress.done + cleaningProgress.failed) / cleaningProgress.total) * 100)
@@ -176,7 +180,7 @@ export default function ConversationPanel(): JSX.Element {
           multiple
           disabled={importLocked}
           style={{ display: 'none' }}
-          accept=".png,.jpg,.jpeg,.webp,.gif,.xlsx,.xls,.csv,.pdf,.docx,.doc,.pptx,.ppt,.md,.markdown,.txt,.zip"
+          accept=".png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.avif,.heic,.heif,.xlsx,.xls,.xlsm,.xlsb,.ods,.csv,.tsv,.pdf,.doc,.docx,.pptx,.md,.markdown,.txt,.log,.yaml,.yml,.rtf,.json,.jsonl,.ndjson,.html,.htm,.xml,.zip"
           onChange={(e) => {
             if (e.target.files?.length) void addSources(e.target.files)
             e.target.value = ''
@@ -196,35 +200,78 @@ export default function ConversationPanel(): JSX.Element {
         {sources.length === 0 ? (
           <div className="upload-welcome">
             <div className="welcome-kicker">AI 经营研究室</div>
-            <h1>把资料交给系统，生成一份可交付的产品经营报告</h1>
-            <p>
-              上传产品手卡、自有经营数据、用户画像、内容素材和竞品资料。系统会自动整理，只在资料整理后和报告初稿完成后请你确认。
+            <h1>上传资料，系统帮你完成经营分析</h1>
+            <p className="welcome-intro">
+              请尽量上传自营产品和竞品的以下五类资料。不必一次全部备齐，现有资料直接上传即可；资料越完整，分析越准确。
             </p>
             <div className="welcome-actions">
               <button className="btn primary big" disabled={importLocked} onClick={() => fileRef.current?.click()}>
-                上传产品资料
+                上传资料
               </button>
               <button className="btn big" disabled={importLocked} onClick={() => folderRef.current?.click()}>
-                选择资料文件夹
+                上传整个文件夹
               </button>
             </div>
-            <div className="deliverable-outline">
-              <div className="outline-title">最终报告将包含</div>
-              <div className="outline-grid">
-                <span>结论摘要</span>
-                <span>数据来源</span>
-                <span>产品基础信息</span>
-                <span>12维卖点拆解</span>
-                <span>竞品卖点判断</span>
-                <span>人群画像</span>
-                <span>内容主线</span>
-                <span>执行选题表</span>
-              </div>
+            <div className="welcome-file-note">
+              <strong>最多上传 50 份，资料总量不超过 350MB</strong>
+              <span>图片：单张不超过 25MB</span>
+              <span>Excel/ODS/CSV/TSV、PDF、DOC/DOCX、PPTX、Markdown/TXT/RTF、JSON/YAML、HTML/XML、ZIP：单个不超过 40MB</span>
+              <span>TIFF/AVIF/HEIC 会在软件内自动转成图片；扫描 PDF 会自动逐页转图，不用用户手动转换</span>
             </div>
+            <section className="source-guide" aria-labelledby="source-guide-title">
+              <div className="source-guide-heading">
+                <h2 id="source-guide-title">建议上传这五类资料</h2>
+                <span>自营和竞品资料尽可能都上传</span>
+              </div>
+              <div className="source-guide-grid">
+                <article className="source-guide-item">
+                  <span className="source-guide-index" aria-hidden="true">01</span>
+                  <div>
+                    <h3>产品与供给资料</h3>
+                    <p>产品手卡、规格参数、成本、材质、工艺、资质背书，以及可以合法使用的卖点证明。</p>
+                  </div>
+                </article>
+                <article className="source-guide-item">
+                  <span className="source-guide-index" aria-hidden="true">02</span>
+                  <div>
+                    <h3>经营与交易数据</h3>
+                    <p>各平台的销售额、订单量、退款、流量和转化数据，用来判断增长来源与低效环节。</p>
+                  </div>
+                </article>
+                <article className="source-guide-item">
+                  <span className="source-guide-index" aria-hidden="true">03</span>
+                  <div>
+                    <h3>内容素材与表现数据</h3>
+                    <p>自营和竞品的图片、视频、文案及素材数据，包括播放、消耗、成交和转化表现。</p>
+                  </div>
+                </article>
+                <article className="source-guide-item">
+                  <span className="source-guide-index" aria-hidden="true">04</span>
+                  <div>
+                    <h3>人群与行为画像</h3>
+                    <p>各平台的购买人群、成交画像和消费行为，用来分析谁在什么场景下购买，以及为什么购买。</p>
+                  </div>
+                </article>
+                <article className="source-guide-item source-guide-item-wide">
+                  <span className="source-guide-index" aria-hidden="true">05</span>
+                  <div>
+                    <h3>用户声音与反馈</h3>
+                    <p>各平台的商品评价、售后反馈和直播评论，用来提炼核心痛点、购买理由和拒绝购买的原因。</p>
+                  </div>
+                </article>
+              </div>
+            </section>
           </div>
         ) : (
           <div className="src-strip-head">
-            <span>资料源（{sources.length}）</span>
+            <span>
+              资料源（{uploadedFileCount} 个文件
+              {scopeStats.worksheets ? `，${scopeStats.worksheets} 个工作表` : ''}
+              {scopeStats.pages ? `，${scopeStats.pages} 页` : ''}
+              {scopeStats.images ? `，${scopeStats.images} 张图片` : ''}
+              {scopeStats.records ? `，${scopeStats.records} 条记录` : ''}
+              {derivedCount ? `，${derivedCount} 项派生证据` : ''}）
+            </span>
             <button className="btn xs" disabled={importLocked} onClick={() => fileRef.current?.click()}>
               ＋ 文件
             </button>

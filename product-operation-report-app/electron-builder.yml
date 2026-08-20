@@ -1,5 +1,5 @@
 appId: com.example.product-operation-report
-productName: 产品经营报告
+productName: 产品与内容经营报告系统
 directories:
   output: dist
   buildResources: build
@@ -9,10 +9,26 @@ files:
   - package.json
 asarUnpack:
   - assets/**/*
+  - node_modules/@napi-rs/canvas-*/**/*
+  - node_modules/@img/**/*
+  - node_modules/sharp/**/*
+# 正式安装包只连接业务代理；模型供应商密钥绝不进入构建产物。
 afterPack: build/afterPack.cjs
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
 mac:
   icon: build/icon.png
   artifactName: Product-Operation-Report-macOS-${version}-${arch}.${ext}
+  minimumSystemVersion: "12.0"
+  hardenedRuntime: true
+  notarize: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
   target:
     - dmg
   category: public.app-category.productivity
