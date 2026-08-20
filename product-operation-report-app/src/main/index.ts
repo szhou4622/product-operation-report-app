@@ -44,6 +44,7 @@ import {
   getActivationStatus,
   getActivationStatusWithServerCheck,
   revalidateSavedActivationCode,
+  restoreAuthorizationOnStartup,
   revealCurrentActivationCode,
   redeemPointsWithCode
 } from './activation'
@@ -94,7 +95,6 @@ let hardExitTimer: ReturnType<typeof setTimeout> | null = null
 const activationOperationGate = new ExclusiveOperationGate()
 const ACTIVATION_REFRESH_MIN_INTERVAL_MS = 60_000
 let lastActivationRefreshStartedAt = 0
-let automaticSavedCodeRecoveryKey = ''
 const allowedLocalOpenPaths = new Set<string>()
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -405,16 +405,10 @@ async function runActivationOperation(operation: () => Promise<ActivationResult>
     status: getActivationStatus()
   }))
 }
-async function getActivationStatusWithSavedCodeRecovery(): Promise<ActivationStatus> {
-  const status = getActivationStatus()
-  if (status.activated || !status.activationCodeAvailable) return status
-  const recoveryKey = `${status.deviceId}:${status.maskedActivationCode || 'saved'}`
-  if (automaticSavedCodeRecoveryKey === recoveryKey) return status
-  automaticSavedCodeRecoveryKey = recoveryKey
-  const result = await runActivationOperation(() => revalidateSavedActivationCode())
-  return result.status
-}
-ipcMain.handle('activation:status', () => getActivationStatusWithSavedCodeRecovery())
+ipcMain.handle('activation:status', () => activationOperationGate.run(
+  () => restoreAuthorizationOnStartup(),
+  () => getActivationStatus()
+))
 ipcMain.handle('activation:activate', async (_e, code: unknown) => {
   if (typeof code !== 'string' || code.length > 512) {
     return { ok: false, message: '激活码格式不正确。', status: getActivationStatus() }

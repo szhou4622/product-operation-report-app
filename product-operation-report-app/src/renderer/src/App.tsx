@@ -127,10 +127,7 @@ export default function App(): JSX.Element {
   const checkActivation = async (): Promise<void> => {
     setActivationLoadError('')
     try {
-      const local = await window.api.getActivationStatus()
-      const status = local.source === 'server'
-        ? await window.api.refreshActivationStatus()
-        : local
+      const status = await window.api.getActivationStatus()
       setActivationStatus(status)
     } catch (error) {
       setActivationLoadError(friendlyUiError(error, '读取激活状态失败，请重试。'))
@@ -196,16 +193,20 @@ export default function App(): JSX.Element {
       if (!document.hidden) void refreshAuthorization()
     }
     void refreshAuthorization()
+    const retryTimers = activationStatus.authorizationState === 'offline_grace'
+      ? [2_000, 5_000, 15_000].map((delay) => window.setTimeout(() => void refreshAuthorization(), delay))
+      : []
     const timer = window.setInterval(handleFocus, AUTHORIZATION_REFRESH_INTERVAL_MS)
     window.addEventListener('focus', handleFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       disposed = true
+      retryTimers.forEach((handle) => window.clearTimeout(handle))
       window.clearInterval(timer)
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId, activationStatus?.bindingStatus])
+  }, [activationStatus?.activated, activationStatus?.source, activationStatus?.licenseId, activationStatus?.bindingStatus, activationStatus?.authorizationState])
 
   useEffect(() => window.api.onUpdateProgress(setUpdateProgress), [])
 
@@ -403,6 +404,10 @@ export default function App(): JSX.Element {
   const submitActivation = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
     if (activationBusy) return
+    if (activationStatus?.authorizationState === 'vault_unavailable' || activationStatus?.authorizationState === 'vault_corrupt') {
+      setActivationError('系统安全凭据当前不可用，已停止提交，避免覆盖原授权。')
+      return
+    }
     setActivationBusy(true)
     setActivationError('')
     setActivationActionNotice('')
@@ -421,6 +426,14 @@ export default function App(): JSX.Element {
 
   const revalidateSavedActivation = async (): Promise<void> => {
     if (activationBusy) return
+    if (
+      activationStatus?.authorizationState === 'unbound' &&
+      !window.confirm('服务器已经解除这台电脑的绑定。\n\n确认重新绑定到这台电脑吗？这会占用一次换机次数。')
+    ) return
+    if (
+      activationStatus?.authorizationState === 'session_expired' &&
+      !window.confirm('本机设备会话已过期。\n\n确认继续在这台电脑恢复原授权吗？')
+    ) return
     setActivationBusy(true)
     setActivationError('')
     setActivationActionNotice('')
@@ -569,8 +582,8 @@ export default function App(): JSX.Element {
           <div className="activation-logo">
             <ProductLogo />
           </div>
-          <h1>正在检查激活状态</h1>
-          <p>{activationLoadError || '请稍候，正在读取本机授权信息。'}</p>
+          <h1>正在恢复原授权</h1>
+          <p>{activationLoadError || '请稍候，正在读取本机安全凭据并向服务器确认。'}</p>
           {activationLoadError && (
             <button className="btn primary" onClick={() => void checkActivation()}>
               重新检查
@@ -589,20 +602,49 @@ export default function App(): JSX.Element {
             <ProductLogo />
           </div>
           <div className="activation-kicker">产品与内容经营报告系统</div>
-          <h1>{activationStatus.activationCodeAvailable ? '重新验证授权' : '首次使用需要激活'}</h1>
+          <h1>{activationStatus.authorizationState === 'unbound'
+            ? '这台电脑已解除绑定'
+            : activationStatus.authorizationState === 'session_expired'
+              ? '确认恢复本机授权'
+              : activationStatus.authorizationState === 'vault_unavailable'
+                ? '系统凭据暂时不可读取'
+                : activationStatus.authorizationState === 'vault_corrupt'
+                  ? '本机授权文件需要处理'
+                  : activationStatus.activationCodeAvailable
+                    ? '重新验证授权'
+                    : '首次使用需要激活'}</h1>
           <p>
-            {activationStatus.activationCodeAvailable
-              ? '本机已安全保存原激活码，可以直接重新验证；也可以输入管理员新发的主激活码。'
-              : '请输入管理员发放的激活码。首次成功后会绑定当前电脑，同一台电脑可重复使用。'}
+            {activationStatus.authorizationState === 'unbound'
+              ? '服务器已停止这台电脑的原授权。只有你明确确认后，软件才会使用已保存的原激活码重新绑定。'
+              : activationStatus.authorizationState === 'session_expired'
+                ? '原激活码和设备凭证仍安全保存在本机，无需重新输入；确认后即可恢复。'
+                : activationStatus.authorizationState === 'vault_unavailable'
+                  ? '请允许 Windows 凭据或 macOS 钥匙串访问，然后点击重新检测。软件不会覆盖原授权文件。'
+                  : activationStatus.authorizationState === 'vault_corrupt'
+                    ? '软件已保留原加密文件，没有生成新的设备码。请复制诊断信息发给管理员。'
+                    : activationStatus.activationCodeAvailable
+                      ? '本机已安全保存原激活码，可以直接重新验证。积分充值码请在进入软件后使用。'
+                      : '请输入管理员发放的主激活码。首次成功后会绑定当前电脑。'}
           </p>
-          {activationStatus.activationCodeAvailable && (
+          {activationStatus.activationCodeAvailable &&
+            activationStatus.authorizationState !== 'disabled' &&
+            activationStatus.authorizationState !== 'expired' &&
+            activationStatus.authorizationState !== 'machine_mismatch' &&
+            activationStatus.authorizationState !== 'credential_revoked' &&
+            activationStatus.authorizationState !== 'vault_unavailable' &&
+            activationStatus.authorizationState !== 'vault_corrupt' && (
             <button
               type="button"
               className="btn activation-saved-code"
               onClick={() => void revalidateSavedActivation()}
               disabled={activationBusy}
             >
-              使用已保存的原激活码{activationStatus.maskedActivationCode ? `（${activationStatus.maskedActivationCode}）` : ''}
+              {activationStatus.authorizationState === 'unbound'
+                ? '重新绑定这台电脑'
+                : activationStatus.authorizationState === 'session_expired'
+                  ? '一键恢复本机授权'
+                  : '使用已保存的原激活码'}
+              {activationStatus.maskedActivationCode ? `（${activationStatus.maskedActivationCode}）` : ''}
             </button>
           )}
           <label className="activation-field">
@@ -616,7 +658,7 @@ export default function App(): JSX.Element {
               }}
               placeholder="POR-XXXX-XXXX-XXXX-XXXX"
               spellCheck={false}
-              disabled={activationBusy}
+              disabled={activationBusy || activationStatus.authorizationState === 'vault_unavailable' || activationStatus.authorizationState === 'vault_corrupt'}
             />
           </label>
           <div className="activation-device">
@@ -641,7 +683,10 @@ export default function App(): JSX.Element {
             <div className="activation-notice" role="status">{activationActionNotice}</div>
           )}
           {activationError && <div className="activation-error">{activationError}</div>}
-          <button className="btn primary activation-submit" disabled={activationBusy}>
+          <button
+            className="btn primary activation-submit"
+            disabled={activationBusy || activationStatus.authorizationState === 'vault_unavailable' || activationStatus.authorizationState === 'vault_corrupt'}
+          >
             {activationBusy ? '正在激活...' : '激活并进入软件'}
           </button>
           <div className="activation-note">

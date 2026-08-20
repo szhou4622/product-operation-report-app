@@ -5,10 +5,13 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, 
 import { join } from 'path'
 import { arch, hostname, platform, userInfo } from 'os'
 import type {
+  ActivationRecoveryAction,
   ActivationCodeAccessResult,
   ActivationDeactivationResult,
   ActivationResult,
   ActivationStatus,
+  ActivationVaultStatus,
+  AuthorizationState,
   LicenseUsageResult
 } from '../shared/types'
 import {
@@ -22,11 +25,13 @@ import {
 import {
   clearLicenseVault,
   getOrCreateFallbackMachineSeed,
+  inspectDeviceVault,
+  inspectLicenseVault,
   readLicenseVault,
-  readStoredMachineCode,
   writeLicenseVault,
   writeStoredMachineCode,
-  type LicenseVaultContents
+  type LicenseVaultContents,
+  type SecureVaultStatus
 } from './licenseVault'
 
 const LICENSE_PROTOCOL_VERSION = 2
@@ -40,6 +45,7 @@ const DEVICE_NAMESPACE = 'product-operation-report:device:v1:'
 const TRANSITIONAL_DEVICE_NAMESPACE = 'product-operation-report:device:v2:'
 const OLD_DEVICE_NAMESPACE = DEVICE_NAMESPACE
 const OLD_ENCRYPTION_NAMESPACE = 'product-operation-report:server-code:v1:'
+const SESSION_ROTATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 let cachedSystemMachineId: string | undefined
 let cachedLegacyDeviceId = ''
 let cachedTransitionalDeviceId = ''
@@ -98,6 +104,7 @@ interface ServerStoredActivation {
   revokedReason?: string
   serverMessage?: string
   requiresRevalidation?: boolean
+  authorizationState?: AuthorizationState
   // v0.3.5 and earlier only. These fields are migrated into license-vault.bin and removed.
   encryptedCode?: string
   encryptedDeviceCredential?: string
@@ -127,6 +134,8 @@ interface ServerLicense {
   action?: string
   primaryLicenseId?: string
   mergedLicenseId?: string
+  authorizationState?: AuthorizationState
+  recoveryAction?: ActivationRecoveryAction
 }
 
 interface ServerDeviceUnbind {
@@ -143,6 +152,7 @@ interface ActivationRequestOptions {
   confirmMerge?: boolean
   deviceCredential?: string
   deviceSession?: string
+  credentialInBody?: boolean
 }
 
 function sha256(value: string): string {
@@ -221,6 +231,26 @@ function getTransitionalDeviceId(): string {
 
 export function getDeviceId(): string {
   if (cachedDeviceId) return cachedDeviceId
+  const stored = readStoredActivation()
+  if (stored && /^[a-f0-9]{32}$/i.test(stored.deviceId)) {
+    cachedDeviceId = stored.deviceId.toLowerCase()
+    try {
+      writeStoredMachineCode(cachedDeviceId)
+    } catch {
+      // The plaintext summary is sufficient to keep the server-bound machine
+      // identity stable while the OS credential store is temporarily locked.
+    }
+    return cachedDeviceId
+  }
+
+  const deviceVault = inspectDeviceVault()
+  if (deviceVault.value?.machineCode) {
+    cachedDeviceId = deviceVault.value.machineCode
+    return cachedDeviceId
+  }
+  if (deviceVault.status === 'unavailable') throw new Error('设备安全存储暂时不可用，请允许系统凭据访问后重试。')
+  if (deviceVault.status === 'corrupt') throw new Error('设备安全存储损坏，已停止生成新的设备码。')
+
   const systemId = getSystemMachineId()
   const stableSeed = systemId || getOrCreateFallbackMachineSeed()
   const kind = systemId
@@ -230,32 +260,16 @@ export function getDeviceId(): string {
     : 'secure-random-device-seed'
   const canonicalDeviceId = sha256(`${DEVICE_NAMESPACE}${kind}|${stableSeed}`).slice(0, 32)
 
-  // A server-bound record must keep the exact machine code it was activated
-  // with. This preserves both the released v1 id and the short-lived v2
-  // development id without weakening the server's device binding.
-  const stored = readStoredActivation()
-  const compatibleIds = new Set([
-    canonicalDeviceId,
-    getLegacyDeviceId(),
-    getTransitionalDeviceId()
-  ].filter(Boolean))
-  const vaultedDeviceId = readStoredMachineCode()
-  cachedDeviceId = stored && compatibleIds.has(stored.deviceId)
-    ? stored.deviceId
-    : vaultedDeviceId && compatibleIds.has(vaultedDeviceId)
-      ? vaultedDeviceId
-      : canonicalDeviceId
+  cachedDeviceId = canonicalDeviceId
 
   // Keep device identity independent from activation credentials. Unbinding
   // clears license-vault.bin, but deliberately leaves device-vault.bin intact.
-  if (vaultedDeviceId !== cachedDeviceId) {
-    try {
-      writeStoredMachineCode(cachedDeviceId)
-    } catch {
-      // A hardware-derived id remains deterministic even if the operating
-      // system credential store is temporarily unavailable. Credential writes
-      // still fail closed later during activation.
-    }
+  try {
+    writeStoredMachineCode(cachedDeviceId)
+  } catch {
+    // A hardware-derived id remains deterministic even if the operating
+    // system credential store is temporarily unavailable. Credential writes
+    // still fail closed later during activation.
   }
   return cachedDeviceId
 }
@@ -284,6 +298,93 @@ function normalizeBindingStatus(value: unknown): 'active' | 'unbound' | undefine
   if (value === 'active' || value === 'bound') return 'active'
   if (value === 'unbound') return 'unbound'
   return undefined
+}
+
+function activationVaultStatus(): ActivationVaultStatus {
+  const license = inspectLicenseVault().status
+  const device = inspectDeviceVault().status
+  if (license === 'unavailable' || device === 'unavailable') return 'unavailable'
+  if (license === 'corrupt' || device === 'corrupt') return 'corrupt'
+  if (license === 'ready' || device === 'ready') return 'ready'
+  return 'missing'
+}
+
+interface DeviceSessionHint {
+  appName?: string
+  codeId?: string
+  machineCode?: string
+  expiresAt?: number
+}
+
+function decodeDeviceSessionHint(session: string | undefined): DeviceSessionHint {
+  if (!session) return {}
+  const parts = session.split('.')
+  if (parts.length !== 3 || parts[0] !== 'DVS1') return {}
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>
+    return {
+      appName: asString(payload.app_name, 128),
+      codeId: asString(payload.code_id, 256),
+      machineCode: asString(payload.machine_code, 256),
+      expiresAt: typeof payload.exp === 'number' && Number.isSafeInteger(payload.exp)
+        ? payload.exp * 1_000
+        : undefined
+    }
+  } catch {
+    return {}
+  }
+}
+
+function sessionExpiresWithin(session: string | undefined, windowMs = SESSION_ROTATION_WINDOW_MS): boolean {
+  const expiresAt = decodeDeviceSessionHint(session).expiresAt
+  return expiresAt !== undefined && expiresAt > Date.now() && expiresAt - Date.now() <= windowMs
+}
+
+function classifyAuthorizationFailure(
+  httpStatus: number,
+  errorCode: string | undefined,
+  message: string
+): { state: AuthorizationState; action: ActivationRecoveryAction; bindingStatus?: 'unbound' } {
+  const code = (errorCode || '').toLowerCase()
+  if (httpStatus === 404 || httpStatus === 408 || httpStatus === 429 || httpStatus >= 500) {
+    return { state: 'offline_grace', action: 'retry_status' }
+  }
+  if (/授权当前未绑定设备|binding[_ -]?unbound|\bunbound\b/i.test(`${code} ${message}`)) {
+    return { state: 'unbound', action: 'confirm_saved_code', bindingStatus: 'unbound' }
+  }
+  if (/兑换码已被停用|激活码已被停用|disabled/i.test(`${code} ${message}`)) {
+    return { state: 'disabled', action: 'contact_admin' }
+  }
+  if (/授权已过期|激活码已过期|license[_ -]?expired/i.test(`${code} ${message}`)) {
+    return { state: 'expired', action: 'contact_admin' }
+  }
+  if (/设备绑定已变更|机器码不匹配|绑定在其他电脑|machine[_ -]?mismatch/i.test(`${code} ${message}`)) {
+    return { state: 'machine_mismatch', action: 'contact_admin' }
+  }
+  if (/设备凭证已撤销|设备凭证无效|credential[_ -]?(revoked|invalid)/i.test(`${code} ${message}`)) {
+    return { state: 'credential_revoked', action: 'contact_admin' }
+  }
+  if (/设备会话已过期|设备会话无效|设备会话签名无效|设备会话内容无效|session[_ -]?(expired|invalid)/i.test(`${code} ${message}`)) {
+    return { state: 'session_expired', action: 'confirm_saved_code' }
+  }
+  if (/credential_refresh|旧授权首次升级设备凭证/i.test(`${code} ${message}`)) {
+    return { state: 'legacy_upgrade', action: 'upgrade_legacy' }
+  }
+  return { state: 'manual_activation_required', action: 'contact_admin' }
+}
+
+function recoveryForState(state: AuthorizationState): {
+  canAutoRecover: boolean
+  action: ActivationRecoveryAction
+} {
+  if (state === 'offline_grace') return { canAutoRecover: true, action: 'retry_status' }
+  if (state === 'session_expiring') return { canAutoRecover: true, action: 'rotate_session' }
+  if (state === 'legacy_upgrade') return { canAutoRecover: true, action: 'upgrade_legacy' }
+  if (state === 'session_expired' || state === 'unbound') return { canAutoRecover: false, action: 'confirm_saved_code' }
+  if (state === 'vault_unavailable' || state === 'vault_corrupt') return { canAutoRecover: false, action: 'unlock_vault' }
+  if (state === 'active') return { canAutoRecover: false, action: 'none' }
+  if (state === 'manual_activation_required') return { canAutoRecover: false, action: 'enter_code' }
+  return { canAutoRecover: false, action: 'contact_admin' }
 }
 
 const LICENSE_RESPONSE_FIELDS = [
@@ -468,29 +569,51 @@ function sanitizedServerRecord(record: ServerStoredActivation): ServerStoredActi
 }
 
 function migrateEmbeddedSecrets(record: ServerStoredActivation): LicenseVaultContents | null {
-  const existing = readLicenseVault()
+  const inspected = inspectLicenseVault()
+  const existing = inspected.value
   if (existing) {
+    const enriched: LicenseVaultContents = {
+      ...existing,
+      version: 2,
+      appName: LICENSE_APP_NAME,
+      licenseId: record.licenseId,
+      machineCode: record.deviceId
+    }
     if (
       record.version === 2 ||
       record.encryptedCode ||
       record.encryptedDeviceCredential ||
       record.encryptedDeviceSession ||
       record.activationCodeStored !== Boolean(existing.activationCode) ||
-      (!record.maskedActivationCode && existing.activationCode)
+      (!record.maskedActivationCode && existing.activationCode) ||
+      existing.version !== 2 ||
+      existing.appName !== LICENSE_APP_NAME ||
+      existing.licenseId !== record.licenseId ||
+      existing.machineCode !== record.deviceId
     ) {
+      writeLicenseVault(enriched)
       writeStoredActivation({
         ...sanitizedServerRecord(record),
         activationCodeStored: Boolean(existing.activationCode),
         maskedActivationCode: existing.activationCode ? maskActivationCode(existing.activationCode) : undefined
       })
     }
-    return existing
+    return enriched
   }
+  if (inspected.status === 'unavailable' || inspected.status === 'corrupt') return null
   const code = decryptOldSecret(record.encryptedCode, record.deviceId)
   const deviceCredential = decryptOldSecret(record.encryptedDeviceCredential, record.deviceId)
   const deviceSession = decryptOldSecret(record.encryptedDeviceSession, record.deviceId)
   if (!code && !deviceCredential && !deviceSession) return null
-  const migrated = { activationCode: code, deviceCredential, deviceSession }
+  const migrated: LicenseVaultContents = {
+    version: 2,
+    appName: LICENSE_APP_NAME,
+    licenseId: record.licenseId,
+    machineCode: record.deviceId,
+    activationCode: code,
+    deviceCredential,
+    deviceSession
+  }
   writeLicenseVault(migrated)
   writeStoredActivation({
     ...sanitizedServerRecord(record),
@@ -516,7 +639,7 @@ function migrateRecordDevice(record: StoredActivation, deviceId: string): Stored
 function prepareServerRecord(
   stored: ServerStoredActivation,
   deviceId: string
-): { record: ServerStoredActivation; vault: LicenseVaultContents | null } {
+): { record: ServerStoredActivation; vault: LicenseVaultContents | null; vaultStatus: SecureVaultStatus } {
   // Old AES records derive their decryption key from the original device id,
   // so secrets must be migrated before any local device-id normalization.
   const vault = migrateEmbeddedSecrets(stored)
@@ -526,7 +649,8 @@ function prepareServerRecord(
     : stored
   return {
     record: migrateRecordDevice(source, deviceId) as ServerStoredActivation,
-    vault
+    vault,
+    vaultStatus: inspectLicenseVault().status
   }
 }
 
@@ -546,15 +670,38 @@ function maskedStoredActivationCode(record: StoredActivation): string | undefine
   return record.maskedActivationCode
 }
 
-function savedCodeRecoveryStatus(deviceId = getDeviceId(), message?: string): ActivationStatus {
-  const savedCode = readLicenseVault()?.activationCode
+function savedCodeRecoveryStatus(
+  deviceId = getDeviceId(),
+  message?: string,
+  state: AuthorizationState = 'manual_activation_required'
+): ActivationStatus {
+  const inspected = inspectLicenseVault()
+  const savedCode = inspected.value?.activationCode
+  const vaultState: AuthorizationState | undefined = inspected.status === 'unavailable'
+    ? 'vault_unavailable'
+    : inspected.status === 'corrupt'
+      ? 'vault_corrupt'
+      : undefined
+  const effectiveState = vaultState || state
+  const recovery = recoveryForState(effectiveState)
   const base = toStatus(null, deviceId)
-  if (!savedCode) return { ...base, message }
+  if (!savedCode) return {
+    ...base,
+    authorizationState: effectiveState,
+    canAutoRecover: recovery.canAutoRecover,
+    recoveryAction: recovery.action,
+    vaultStatus: inspected.status,
+    message
+  }
   return {
     ...base,
     activationCodeAvailable: true,
     maskedActivationCode: maskActivationCode(savedCode),
     requiresRevalidation: true,
+    authorizationState: effectiveState,
+    canAutoRecover: recovery.canAutoRecover,
+    recoveryAction: recovery.action,
+    vaultStatus: inspected.status,
     message: message || '检测到本机已安全保存的原激活码，可以直接重新验证。'
   }
 }
@@ -577,45 +724,87 @@ function friendlyActivationFailure(message: string): string {
 }
 
 function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): ActivationStatus {
+  const vault = inspectLicenseVault()
+  const vaultStatus = activationVaultStatus()
   const common = {
     deviceId,
     codeCount: 0,
     appName: LICENSE_APP_NAME,
     unlimited: false,
     offline: false,
-    activationCodeAvailable: false,
-    requiresRevalidation: false
+    activationCodeAvailable: Boolean(vault.value?.activationCode),
+    maskedActivationCode: vault.value?.activationCode ? maskActivationCode(vault.value.activationCode) : undefined,
+    requiresRevalidation: false,
+    authorizationState: 'manual_activation_required' as AuthorizationState,
+    canAutoRecover: false,
+    recoveryAction: 'enter_code' as ActivationRecoveryAction,
+    vaultStatus
   }
-  if (!record || !recordMatchesDevice(record, deviceId)) return { ...common, activated: false }
+  if (!record || !recordMatchesDevice(record, deviceId)) {
+    const state: AuthorizationState = vaultStatus === 'unavailable'
+      ? 'vault_unavailable'
+      : vaultStatus === 'corrupt'
+        ? 'vault_corrupt'
+        : 'manual_activation_required'
+    const recovery = recoveryForState(state)
+    return {
+      ...common,
+      activated: false,
+      authorizationState: state,
+      canAutoRecover: recovery.canAutoRecover,
+      recoveryAction: recovery.action
+    }
+  }
   if (record.version === 1) {
+    const recovery = recoveryForState('legacy_upgrade')
     return {
       ...common,
       activated: false,
       source: 'legacy',
       licenseType: 'credits',
       requiresRevalidation: true,
+      authorizationState: 'legacy_upgrade',
+      canAutoRecover: recovery.canAutoRecover && Boolean(vault.value?.activationCode),
+      recoveryAction: vault.value?.activationCode ? recovery.action : 'enter_code',
       message: '旧版授权需要重新输入原激活码，完成服务器凭证升级。'
     }
   }
   const remaining = record.creditsRemaining
-  const revoked = Boolean(record.revokedReason) || record.bindingStatus === 'unbound' || isExpired(record.expiresAt)
   const requiresRevalidation = record.source === 'server'
     ? !hasUsableServerValidation(record) || Boolean(record.requiresRevalidation)
     : true
+  let authorizationState: AuthorizationState = record.authorizationState || 'active'
+  if (record.bindingStatus === 'unbound') authorizationState = 'unbound'
+  else if (isExpired(record.expiresAt)) authorizationState = 'expired'
+  else if (vaultStatus === 'unavailable') authorizationState = 'vault_unavailable'
+  else if (vaultStatus === 'corrupt') authorizationState = 'vault_corrupt'
+  else if (record.offlineSince) authorizationState = requiresRevalidation ? 'manual_activation_required' : 'offline_grace'
+  else if (requiresRevalidation && authorizationState === 'active') authorizationState = 'manual_activation_required'
+  else if (!requiresRevalidation && sessionExpiresWithin(vault.value?.deviceSession)) authorizationState = 'session_expiring'
+  const activated = authorizationState === 'active' || authorizationState === 'session_expiring' || authorizationState === 'offline_grace'
+  const recovery = recoveryForState(authorizationState)
   let message = record.serverMessage
-  if (record.bindingStatus === 'unbound') message = '本机已解除绑定，可在新电脑输入原激活码。'
+  if (authorizationState === 'unbound') message = '服务器已对这台电脑执行解除绑定。需要再次使用时，请明确确认重新绑定。'
+  else if (authorizationState === 'disabled') message = '当前激活码已被管理员停用。'
+  else if (authorizationState === 'machine_mismatch') message = '服务器记录的绑定电脑与本机不一致。'
+  else if (authorizationState === 'credential_revoked') message = '本机设备凭证已被撤销，请联系管理员处理。'
+  else if (authorizationState === 'session_expired') message = '设备会话已过期，请确认后恢复本机授权。'
+  else if (authorizationState === 'vault_unavailable') message = '系统安全凭据暂时不可读取，请允许访问后重试。'
+  else if (authorizationState === 'vault_corrupt') message = '本机加密授权文件无法读取，已保留原文件，请联系管理员。'
   else if (record.revokedReason) message = record.revokedReason
-  else if (isExpired(record.expiresAt)) message = '授权已过期，请联系管理员。'
+  else if (authorizationState === 'expired') message = '授权已过期，请联系管理员。'
   else if (record.unlimited) message = record.serverMessage || '无限授权可用。'
   else if ((remaining ?? 0) <= 0) message = record.serverMessage || '积分不足，请充值后再生成新报告。'
   else if (requiresRevalidation) message = record.serverMessage || '正在验证服务器授权；历史报告仍可查看和导出。'
   return {
     ...common,
-    activated: !revoked,
+    activated,
     activatedAt: record.activatedAt,
     licenseId: record.licenseId,
-    activationCodeAvailable: activationCodeAvailable(record),
-    maskedActivationCode: maskedStoredActivationCode(record),
+    activationCodeAvailable: Boolean(vault.value?.activationCode) || activationCodeAvailable(record),
+    maskedActivationCode: vault.value?.activationCode
+      ? maskActivationCode(vault.value.activationCode)
+      : maskedStoredActivationCode(record),
     source: record.source,
     licenseType: record.licenseType,
     unlimited: record.unlimited,
@@ -626,6 +815,10 @@ function toStatus(record: StoredActivation | null, deviceId = getDeviceId()): Ac
     bindingStatus: record.bindingStatus,
     transferCount: record.transferCount,
     requiresRevalidation,
+    authorizationState,
+    canAutoRecover: recovery.canAutoRecover,
+    recoveryAction: recovery.action,
+    vaultStatus,
     lastServerSyncAt: record.lastValidatedAt,
     message
   }
@@ -648,6 +841,7 @@ function parseServerLicense(
   const message = normalizeMessage(body.message ?? body.error ?? body.detail, fallback)
   if (httpStatus < 200 || httpStatus >= 300 || body.ok !== true) {
     const errorCode = asString(body.error_code ?? body.code, 128)?.toLowerCase()
+    const classified = classifyAuthorizationFailure(httpStatus, errorCode, message)
     const credentialRefreshRequired =
       errorCode === 'credential_refresh_required' ||
       /credential_refresh\s*=\s*true/i.test(message)
@@ -656,6 +850,9 @@ function parseServerLicense(
       unavailable,
       unauthorized,
       credentialRefreshRequired,
+      authorizationState: credentialRefreshRequired ? 'legacy_upgrade' : classified.state,
+      recoveryAction: credentialRefreshRequired ? 'upgrade_legacy' : classified.action,
+      bindingStatus: classified.bindingStatus,
       message,
       licenseType: 'standard',
       unlimited: false
@@ -663,11 +860,11 @@ function parseServerLicense(
   }
   const selected = selectServerLicensePayload(body)
   if (selected.conflict || !selected.payload) {
-    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, message: '服务器授权响应存在冲突，已拒绝更新本地授权。', licenseType: 'standard', unlimited: false }
+    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, authorizationState: 'manual_activation_required', recoveryAction: 'contact_admin', message: '服务器授权响应存在冲突，已拒绝更新本地授权。', licenseType: 'standard', unlimited: false }
   }
   const license = selected.payload
   if (license.app_name !== LICENSE_APP_NAME) {
-    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, message: '服务器返回的软件标识不匹配。', licenseType: 'standard', unlimited: false }
+    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, authorizationState: 'manual_activation_required', recoveryAction: 'contact_admin', message: '服务器返回的软件标识不匹配。', licenseType: 'standard', unlimited: false }
   }
   const licenseId = asString(license.code_id, 256)
   const machineCode = asString(license.machine_code, 256)
@@ -684,13 +881,13 @@ function parseServerLicense(
     transferCount === undefined ||
     (primaryRemaining === undefined && legacyRemaining === undefined)
   ) {
-    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, message: '服务器授权响应缺少必要字段，已拒绝更新本地授权。', licenseType: 'standard', unlimited: false }
+    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, authorizationState: 'manual_activation_required', recoveryAction: 'contact_admin', message: '服务器授权响应缺少必要字段，已拒绝更新本地授权。', licenseType: 'standard', unlimited: false }
   }
   if (primaryRemaining !== undefined && legacyRemaining !== undefined && primaryRemaining !== legacyRemaining) {
-    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, message: '服务器返回了相互冲突的积分余额，已拒绝更新。', licenseType: 'standard', unlimited: false }
+    return { ok: false, unavailable: false, unauthorized: false, contractInvalid: true, authorizationState: 'manual_activation_required', recoveryAction: 'contact_admin', message: '服务器返回了相互冲突的积分余额，已拒绝更新。', licenseType: 'standard', unlimited: false }
   }
   if (bindingStatus !== 'active') {
-    return { ok: false, unavailable: false, unauthorized: false, message, licenseId, licenseType: 'standard', unlimited, creditsRemaining: primaryRemaining ?? legacyRemaining, bindingStatus, transferCount }
+    return { ok: false, unavailable: false, unauthorized: false, authorizationState: 'unbound', recoveryAction: 'confirm_saved_code', message, licenseId, licenseType: 'standard', unlimited, creditsRemaining: primaryRemaining ?? legacyRemaining, bindingStatus, transferCount }
   }
   const licenseTypeText = asString(license.license_type, 64)?.toLowerCase() || ''
   const licenseType: ServerLicense['licenseType'] = unlimited
@@ -722,7 +919,9 @@ function parseServerLicense(
     grantScore,
     action,
     primaryLicenseId,
-    mergedLicenseId
+    mergedLicenseId,
+    authorizationState: 'active',
+    recoveryAction: 'none'
   }
 }
 
@@ -747,7 +946,7 @@ async function requestServerActivation(
   try {
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json' }
     if (options.deviceSession) headers.authorization = `Bearer ${options.deviceSession}`
-    if (options.deviceCredential) headers['x-device-credential'] = options.deviceCredential
+    if (options.deviceCredential && !options.credentialInBody) headers['x-device-credential'] = options.deviceCredential
     const body: Record<string, unknown> = {
       license_protocol_version: LICENSE_PROTOCOL_VERSION,
       app_name: LICENSE_APP_NAME,
@@ -758,6 +957,7 @@ async function requestServerActivation(
     if (options.currentCodeId) body.current_code_id = options.currentCodeId
     if (options.credentialRefresh) body.credential_refresh = true
     if (options.confirmMerge) body.confirm_merge = true
+    if (options.deviceCredential && options.credentialInBody) body.device_credential = options.deviceCredential
     const response = await fetch(LICENSE_ACTIVATE_URL, {
       method: 'POST',
       headers,
@@ -877,7 +1077,11 @@ async function requestServerDeviceUnbind(
   }
 }
 
-function currentServerRecord(): { record: ServerStoredActivation; vault: LicenseVaultContents | null } | null {
+function currentServerRecord(): {
+  record: ServerStoredActivation
+  vault: LicenseVaultContents | null
+  vaultStatus: SecureVaultStatus
+} | null {
   const deviceId = getDeviceId()
   const stored = readStoredActivation()
   if (!stored || stored.version === 1 || !recordMatchesDevice(stored, deviceId)) return null
@@ -910,8 +1114,27 @@ function entitlementRecord(
     activationCodeStored: true,
     maskedActivationCode: maskActivationCode(code),
     serverMessage: result.message,
-    requiresRevalidation: false
+    requiresRevalidation: false,
+    authorizationState: 'active'
   }
+}
+
+function persistLicenseVault(
+  activationCode: string,
+  deviceId: string,
+  licenseId: string | undefined,
+  deviceCredential?: string,
+  deviceSession?: string
+): void {
+  writeLicenseVault({
+    version: 2,
+    appName: LICENSE_APP_NAME,
+    licenseId,
+    machineCode: deviceId,
+    activationCode,
+    deviceCredential,
+    deviceSession
+  })
 }
 
 export function getActivationStatus(): ActivationStatus {
@@ -925,9 +1148,19 @@ export function getActivationStatus(): ActivationStatus {
 /** Revalidate a securely stored primary code without exposing it to the renderer. */
 export async function revalidateSavedActivationCode(): Promise<ActivationResult> {
   const code = readLicenseVault()?.activationCode
+  const status = getActivationStatus()
   if (!code) {
-    const status = getActivationStatus()
     return { ok: false, message: '本机没有已保存的原激活码，请手动输入管理员发放的激活码。', status }
+  }
+  if (
+    status.authorizationState === 'disabled' ||
+    status.authorizationState === 'expired' ||
+    status.authorizationState === 'machine_mismatch' ||
+    status.authorizationState === 'credential_revoked' ||
+    status.authorizationState === 'vault_unavailable' ||
+    status.authorizationState === 'vault_corrupt'
+  ) {
+    return { ok: false, message: status.message || '当前授权不能自动恢复，请联系管理员。', status }
   }
   return activateWithCode(code)
 }
@@ -973,6 +1206,117 @@ export function getLicenseProxyIdentity(): {
   }
 }
 
+function recoveryRecordFromVault(
+  activationCode: string,
+  deviceId: string,
+  licenseId: string,
+  state: AuthorizationState,
+  message: string
+): ServerStoredActivation {
+  return {
+    version: 3,
+    appName: LICENSE_APP_NAME,
+    source: 'server',
+    codeHash: hashActivationCode(activationCode),
+    deviceId,
+    activatedAt: new Date().toISOString(),
+    licenseId,
+    licenseType: 'credits',
+    unlimited: false,
+    bindingStatus: state === 'unbound' ? 'unbound' : 'active',
+    activationCodeStored: true,
+    maskedActivationCode: maskActivationCode(activationCode),
+    requiresRevalidation: true,
+    authorizationState: state,
+    revokedReason: state === 'session_expired' ? undefined : message,
+    serverMessage: message
+  }
+}
+
+/**
+ * Restore a previous installation without treating possession of a saved code
+ * as permission to rebind. Only authenticated device/status and the legacy
+ * no-credential upgrade path run automatically.
+ */
+export async function restoreAuthorizationOnStartup(): Promise<ActivationStatus> {
+  const stored = readStoredActivation()
+  if (stored) {
+    const local = getActivationStatus()
+    if (
+      local.authorizationState === 'unbound' ||
+      local.authorizationState === 'disabled' ||
+      local.authorizationState === 'expired' ||
+      local.authorizationState === 'machine_mismatch' ||
+      local.authorizationState === 'credential_revoked' ||
+      local.authorizationState === 'session_expired'
+    ) return local
+    return getActivationStatusWithServerCheck()
+  }
+
+  const deviceId = getDeviceId()
+  const inspected = inspectLicenseVault()
+  const vault = inspected.value
+  if (inspected.status === 'unavailable') {
+    return savedCodeRecoveryStatus(deviceId, '系统安全凭据暂时不可读取，请允许访问后重试。', 'vault_unavailable')
+  }
+  if (inspected.status === 'corrupt') {
+    return savedCodeRecoveryStatus(deviceId, '本机加密授权文件无法读取，已保留原文件。', 'vault_corrupt')
+  }
+  if (!vault?.activationCode || !vault.deviceCredential || !vault.deviceSession) {
+    return savedCodeRecoveryStatus(deviceId)
+  }
+
+  const hint = decodeDeviceSessionHint(vault.deviceSession)
+  const hintValid = hint.appName === LICENSE_APP_NAME &&
+    Boolean(hint.codeId) &&
+    hint.machineCode?.toLowerCase() === deviceId.toLowerCase()
+  if (!hintValid || !hint.codeId) {
+    return savedCodeRecoveryStatus(deviceId, '本机授权摘要缺失，无法安全确认原授权编号，请联系管理员。')
+  }
+  persistLicenseVault(vault.activationCode, deviceId, hint.codeId, vault.deviceCredential, vault.deviceSession)
+  if (!hint.expiresAt || hint.expiresAt <= Date.now()) {
+    const record = recoveryRecordFromVault(
+      vault.activationCode,
+      deviceId,
+      hint.codeId,
+      'session_expired',
+      '设备会话已过期，请确认后恢复本机授权。'
+    )
+    writeStoredActivation(record)
+    clearRuntimeValidation()
+    return toStatus(record, deviceId)
+  }
+
+  const result = await requestServerDeviceStatus(
+    deviceId,
+    hint.codeId,
+    vault.deviceCredential,
+    vault.deviceSession
+  )
+  if (result.ok) {
+    const record = entitlementRecord(null, vault.activationCode, deviceId, result)
+    persistLicenseVault(vault.activationCode, deviceId, record.licenseId, vault.deviceCredential, vault.deviceSession)
+    writeStoredActivation(record)
+    markValidationSuccess()
+    return toStatus(record, deviceId)
+  }
+  if (result.unavailable) {
+    return savedCodeRecoveryStatus(deviceId, '授权服务器暂时无法连接，请稍后重试。')
+  }
+  const state = result.authorizationState || 'manual_activation_required'
+  const record = recoveryRecordFromVault(vault.activationCode, deviceId, hint.codeId, state, result.message)
+  if (state === 'unbound' || state === 'disabled' || state === 'expired' || state === 'machine_mismatch' || state === 'credential_revoked') {
+    try {
+      persistLicenseVault(vault.activationCode, deviceId, hint.codeId)
+    } catch {
+      // Preserve the original encrypted files when secure storage is unavailable.
+    }
+  }
+  writeStoredActivation(record)
+  clearRuntimeValidation()
+  return toStatus(record, deviceId)
+}
+
 export async function getActivationStatusWithServerCheck(): Promise<ActivationStatus> {
   const deviceId = getDeviceId()
   const stored = readStoredActivation()
@@ -983,13 +1327,40 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
   const prepared = prepareServerRecord(stored, deviceId)
   const current = prepared.record
   const vault = prepared.vault
-  if (!current.licenseId || !vault?.activationCode) {
-    const updated = { ...sanitizedServerRecord(current), requiresRevalidation: true, serverMessage: '本机授权记录不完整，请重新输入原激活码。' }
+  if (prepared.vaultStatus === 'unavailable' || prepared.vaultStatus === 'corrupt') {
+    const state: AuthorizationState = prepared.vaultStatus === 'unavailable' ? 'vault_unavailable' : 'vault_corrupt'
+    const updated: ServerStoredActivation = {
+      ...sanitizedServerRecord(current),
+      requiresRevalidation: true,
+      authorizationState: state,
+      serverMessage: state === 'vault_unavailable'
+        ? '系统安全凭据暂时不可读取，请允许访问后重试。'
+        : '本机加密授权文件无法读取，已保留原文件。'
+    }
     writeStoredActivation(updated)
     clearRuntimeValidation()
     return toStatus(updated, deviceId)
   }
-  if ((!vault.deviceCredential || !vault.deviceSession) && (current.bindingStatus === 'unbound' || current.revokedReason)) {
+  if (!current.licenseId || !vault?.activationCode) {
+    const updated: ServerStoredActivation = {
+      ...sanitizedServerRecord(current),
+      requiresRevalidation: true,
+      authorizationState: 'manual_activation_required',
+      serverMessage: '本机授权记录不完整，请重新输入原激活码。'
+    }
+    writeStoredActivation(updated)
+    clearRuntimeValidation()
+    return toStatus(updated, deviceId)
+  }
+  if (
+    current.bindingStatus === 'unbound' ||
+    current.authorizationState === 'unbound' ||
+    current.authorizationState === 'disabled' ||
+    current.authorizationState === 'expired' ||
+    current.authorizationState === 'machine_mismatch' ||
+    current.authorizationState === 'credential_revoked' ||
+    current.authorizationState === 'session_expired'
+  ) {
     // A background status refresh must never rebind a device. Once credentials
     // are revoked, only the user's explicit saved-code or manual activation
     // action may call /activate again.
@@ -1003,34 +1374,57 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
         credentialRefresh: true
       })
   if (result.ok) {
-    const credential = result.deviceCredential || vault.deviceCredential
-    const session = result.deviceSession || vault.deviceSession
+    let credential = result.deviceCredential || vault.deviceCredential
+    let session = result.deviceSession || vault.deviceSession
     if (!credential || !session) {
-      const updated = { ...sanitizedServerRecord(current), requiresRevalidation: true, serverMessage: '服务器未返回完整设备凭证，请重新验证。' }
+      const updated: ServerStoredActivation = {
+        ...sanitizedServerRecord(current),
+        requiresRevalidation: true,
+        authorizationState: 'manual_activation_required',
+        serverMessage: '服务器未返回完整设备凭证，请重新验证。'
+      }
       writeStoredActivation(updated)
       clearRuntimeValidation()
       return toStatus(updated, deviceId)
     }
-    const updated = entitlementRecord(current, vault.activationCode, deviceId, result)
-    writeLicenseVault({ activationCode: vault.activationCode, deviceCredential: credential, deviceSession: session })
+    let effectiveResult = result
+    if (sessionExpiresWithin(session)) {
+      const rotated = await requestServerActivation(vault.activationCode, deviceId, {
+        currentCodeId: current.licenseId,
+        credentialRefresh: true,
+        deviceCredential: credential,
+        deviceSession: session
+      })
+      const safeRotation = rotated.ok &&
+        rotated.licenseId === current.licenseId &&
+        rotated.bindingStatus === 'active' &&
+        rotated.action !== 'rebound' &&
+        rotated.action !== 'balance_merged' &&
+        (rotated.transferCount === undefined || rotated.transferCount === result.transferCount)
+      if (safeRotation && rotated.deviceCredential && rotated.deviceSession) {
+        effectiveResult = rotated
+        credential = rotated.deviceCredential
+        session = rotated.deviceSession
+      }
+    }
+    const updated = entitlementRecord(current, vault.activationCode, deviceId, effectiveResult)
+    persistLicenseVault(vault.activationCode, deviceId, updated.licenseId, credential, session)
     writeStoredActivation(updated)
     markValidationSuccess()
     return toStatus(updated, deviceId)
   }
-  if (result.bindingStatus === 'unbound') {
+  if (result.authorizationState === 'unbound' || result.bindingStatus === 'unbound') {
     clearRuntimeValidation()
     let activationCodeStored = false
     try {
       if (vault.activationCode) {
         // Keep only the original code so the user can explicitly reactivate it.
         // Revoked device credentials must not survive an administrator unbind.
-        writeLicenseVault({ activationCode: vault.activationCode })
+        persistLicenseVault(vault.activationCode, deviceId, current.licenseId)
         activationCodeStored = true
-      } else {
-        clearLicenseVault()
       }
     } catch {
-      clearLicenseVault()
+      activationCodeStored = Boolean(vault.activationCode)
     }
     const message = result.message || '当前设备已在服务器解除绑定，请重新输入激活码。'
     const updated: ServerStoredActivation = {
@@ -1041,6 +1435,7 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
       lastValidatedAt: new Date().toISOString(),
       offlineSince: undefined,
       requiresRevalidation: true,
+      authorizationState: 'unbound',
       revokedReason: message,
       serverMessage: message,
       activationCodeStored,
@@ -1058,6 +1453,7 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
       ...sanitizedServerRecord(current),
       offlineSince: new Date().toISOString(),
       requiresRevalidation: !withinGrace,
+      authorizationState: withinGrace ? 'offline_grace' : 'manual_activation_required',
       serverMessage: withinGrace
         ? '当前处于离线授权宽限期，软件会稍后自动重连；可继续生成和导出报告。'
         : '授权服务器暂时无法连接，且离线宽限期已结束；历史报告仍可查看和导出。'
@@ -1065,31 +1461,17 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     writeStoredActivation(updated)
     return toStatus(updated, deviceId)
   }
-  if (result.unauthorized) {
+  if (result.authorizationState === 'session_expired') {
     clearRuntimeValidation()
-    let activationCodeStored = false
-    try {
-      if (vault.activationCode) {
-        // A revoked device token returns to activation, while the original code
-        // remains protected by DPAPI/Keychain for an explicit reactivation.
-        writeLicenseVault({ activationCode: vault.activationCode })
-        activationCodeStored = true
-      } else {
-        clearLicenseVault()
-      }
-    } catch {
-      clearLicenseVault()
-    }
-    const message = '设备凭证已失效，请重新输入原激活码验证。'
+    const message = '设备会话已过期，请确认后恢复本机授权。'
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
       requiresRevalidation: true,
-      revokedReason: message,
+      authorizationState: 'session_expired',
+      revokedReason: undefined,
       serverMessage: message,
-      activationCodeStored,
-      maskedActivationCode: activationCodeStored && vault.activationCode
-        ? maskActivationCode(vault.activationCode)
-        : undefined
+      activationCodeStored: true,
+      maskedActivationCode: maskActivationCode(vault.activationCode)
     }
     writeStoredActivation(updated)
     return toStatus(updated, deviceId)
@@ -1099,16 +1481,35 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     const updated: ServerStoredActivation = {
       ...sanitizedServerRecord(current),
       requiresRevalidation: true,
+      authorizationState: 'manual_activation_required',
+      revokedReason: undefined,
       serverMessage: result.message
     }
     writeStoredActivation(updated)
     return toStatus(updated, deviceId)
   }
+  const hardState = result.authorizationState || 'manual_activation_required'
+  let activationCodeStored = Boolean(vault.activationCode)
+  if (
+    hardState === 'disabled' ||
+    hardState === 'expired' ||
+    hardState === 'machine_mismatch' ||
+    hardState === 'credential_revoked'
+  ) {
+    try {
+      persistLicenseVault(vault.activationCode, deviceId, current.licenseId)
+    } catch {
+      activationCodeStored = Boolean(vault.activationCode)
+    }
+  }
   const revoked: ServerStoredActivation = {
     ...sanitizedServerRecord(current),
     requiresRevalidation: true,
+    authorizationState: hardState,
     revokedReason: result.message,
-    serverMessage: result.message
+    serverMessage: result.message,
+    activationCodeStored,
+    maskedActivationCode: activationCodeStored ? maskActivationCode(vault.activationCode) : undefined
   }
   clearRuntimeValidation()
   writeStoredActivation(revoked)
@@ -1121,32 +1522,95 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   const currentStatus = getActivationStatus()
   if (!normalized) return { ok: false, message: '请输入激活码。', status: currentStatus }
   if (enteredCode.length > 512) return { ok: false, message: '激活码格式不正确。', status: currentStatus }
+  const vaultInspection = inspectLicenseVault()
+  if (!safeStorage.isEncryptionAvailable() || vaultInspection.status === 'unavailable') {
+    const message = '系统安全凭据暂时不可用，本次没有提交激活，避免服务器已绑定但本机无法保存。'
+    return {
+      ok: false,
+      message,
+      status: {
+        ...currentStatus,
+        activated: false,
+        authorizationState: 'vault_unavailable',
+        canAutoRecover: false,
+        recoveryAction: 'unlock_vault',
+        vaultStatus: 'unavailable',
+        requiresRevalidation: true,
+        message
+      }
+    }
+  }
+  if (vaultInspection.status === 'corrupt') {
+    const message = '本机加密授权文件损坏，已停止提交激活并保留原文件。'
+    return {
+      ok: false,
+      message,
+      status: {
+        ...currentStatus,
+        activated: false,
+        authorizationState: 'vault_corrupt',
+        canAutoRecover: false,
+        recoveryAction: 'unlock_vault',
+        vaultStatus: 'corrupt',
+        requiresRevalidation: true,
+        message
+      }
+    }
+  }
   const deviceId = currentStatus.deviceId
   const existing = currentServerRecord()
   const savedVault = readLicenseVault()
   const samePrimary = existing?.record.codeHash === hashActivationCode(enteredCode)
-  const savedCodeRecovery = Boolean(
+  const savedCodeMatches = Boolean(
     savedVault?.activationCode &&
-    savedVault.deviceCredential &&
-    savedVault.deviceSession &&
     hashActivationCode(savedVault.activationCode) === hashActivationCode(enteredCode)
   )
+  const savedCodeRecovery = Boolean(savedCodeMatches && savedVault?.deviceCredential)
   if (currentStatus.activated && existing && !samePrimary) {
     return { ok: false, message: '当前电脑已有主激活码；新增积分请使用“充值积分”。', status: currentStatus }
   }
+  if (
+    samePrimary &&
+    (
+      currentStatus.authorizationState === 'disabled' ||
+      currentStatus.authorizationState === 'expired' ||
+      currentStatus.authorizationState === 'machine_mismatch' ||
+      currentStatus.authorizationState === 'credential_revoked' ||
+      currentStatus.authorizationState === 'manual_activation_required'
+    )
+  ) {
+    return { ok: false, message: currentStatus.message || '当前授权不能自动恢复，请联系管理员。', status: currentStatus }
+  }
+  const explicitRecovery = currentStatus.authorizationState === 'session_expired' ||
+    currentStatus.authorizationState === 'unbound'
   const refreshOptions: ActivationRequestOptions = samePrimary
-    ? {
+    ? currentStatus.authorizationState === 'session_expired' && existing?.vault?.deviceCredential
+      ? {
+          currentCodeId: existing.record.licenseId,
+          deviceCredential: existing.vault.deviceCredential,
+          credentialInBody: true
+        }
+      : currentStatus.authorizationState === 'unbound'
+        ? {}
+        : {
         currentCodeId: existing?.record.licenseId,
         credentialRefresh: true,
         deviceCredential: existing?.vault?.deviceCredential,
         deviceSession: existing?.vault?.deviceSession
       }
     : savedCodeRecovery
-      ? {
-          credentialRefresh: true,
-          deviceCredential: savedVault?.deviceCredential,
-          deviceSession: savedVault?.deviceSession
-        }
+      ? savedVault?.deviceSession && !explicitRecovery
+        ? {
+            currentCodeId: savedVault.licenseId,
+            credentialRefresh: true,
+            deviceCredential: savedVault.deviceCredential,
+            deviceSession: savedVault.deviceSession
+          }
+        : {
+            currentCodeId: savedVault?.licenseId,
+            deviceCredential: savedVault?.deviceCredential,
+            credentialInBody: true
+          }
       : {}
   let result = await requestServerActivation(enteredCode, deviceId, refreshOptions)
   if (!result.ok && result.credentialRefreshRequired && !samePrimary) {
@@ -1155,7 +1619,10 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
     // the v2 credential-upgrade flag; never opt into balance merging here.
     result = await requestServerActivation(enteredCode, deviceId, savedCodeRecovery
       ? refreshOptions
-      : { credentialRefresh: true })
+      : {
+          currentCodeId: samePrimary ? existing?.record.licenseId : savedCodeMatches ? savedVault?.licenseId : undefined,
+          credentialRefresh: true
+        })
   }
   if (!result.ok) return { ok: false, message: friendlyActivationFailure(result.message), status: currentStatus }
   if (result.action === 'balance_merged') {
@@ -1175,7 +1642,7 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   }
   let credentialsSaved = false
   try {
-    writeLicenseVault({ activationCode: enteredCode, deviceCredential: credential, deviceSession: session })
+    persistLicenseVault(enteredCode, deviceId, result.licenseId, credential, session)
     credentialsSaved = true
     const record = entitlementRecord(samePrimary ? existing?.record || null : null, enteredCode, deviceId, result)
     writeStoredActivation(record)
@@ -1288,11 +1755,13 @@ export async function deactivateCurrentDevice(): Promise<ActivationDeactivationR
       return { ok: false, message: refreshed.message, status: before }
     }
     const updated = entitlementRecord(current.record, current.vault.activationCode, before.deviceId, refreshed)
-    writeLicenseVault({
-      activationCode: current.vault.activationCode,
-      deviceCredential: refreshed.deviceCredential,
-      deviceSession: refreshed.deviceSession
-    })
+    persistLicenseVault(
+      current.vault.activationCode,
+      before.deviceId,
+      updated.licenseId,
+      refreshed.deviceCredential,
+      refreshed.deviceSession
+    )
     writeStoredActivation(updated)
     markValidationSuccess()
     current = currentServerRecord()
@@ -1336,6 +1805,9 @@ export function getActivationFilePath(): string {
 
 export const activationInternals = {
   parseServerLicense,
+  classifyAuthorizationFailure,
+  decodeDeviceSessionHint,
+  sessionExpiresWithin,
   compatibleDeviceIdsForTests(): string[] {
     const systemId = getSystemMachineId()
     const stableSeed = systemId || getOrCreateFallbackMachineSeed()
@@ -1354,6 +1826,10 @@ export const activationInternals = {
     cachedSystemMachineId = undefined
     cachedLegacyDeviceId = ''
     cachedTransitionalDeviceId = ''
+    cachedDeviceId = ''
+  },
+  setSystemMachineIdForTests(value: string | undefined): void {
+    cachedSystemMachineId = value
     cachedDeviceId = ''
   },
   resetRuntimeValidationForTests(): void {

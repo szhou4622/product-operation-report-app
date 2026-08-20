@@ -1,6 +1,6 @@
 {
   "name": "product-operation-report-app",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "产品与内容经营报告系统 — 专业的产品经营与内容分析报告系统",
   "main": "./out/main/index.js",
   "author": "",

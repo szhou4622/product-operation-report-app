@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmS
 import { createCipheriv, createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, safeStorage } from 'electron'
 import JSZip from 'jszip'
 import Papa from 'papaparse'
 import iconv from 'iconv-lite'
@@ -21,10 +21,11 @@ import {
   getActivationStatusWithServerCheck,
   getDeviceId,
   revalidateSavedActivationCode,
+  restoreAuthorizationOnStartup,
   revealCurrentActivationCode,
   redeemPointsWithCode
 } from '../src/main/activation'
-import { writeLicenseVault } from '../src/main/licenseVault'
+import { inspectLicenseVault, writeLicenseVault } from '../src/main/licenseVault'
 import { buildActivationDiagnostic } from '../src/main/activationDiagnostics'
 import { clearAiProxySession, clearProxyWalletSnapshot, fetchProxyWallet } from '../src/main/aiProxy'
 import { ExclusiveOperationGate } from '../src/main/exclusiveOperationGate'
@@ -128,6 +129,16 @@ function encryptV032StoredCode(code: string, deviceId: string): string {
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   const encrypted = Buffer.concat([cipher.update(code, 'utf8'), cipher.final()])
   return `v1:${iv.toString('base64url')}:${cipher.getAuthTag().toString('base64url')}:${encrypted.toString('base64url')}`
+}
+
+function deviceSessionForTest(codeId: string, machineCode: string, expiresAtSeconds: number): string {
+  const payload = Buffer.from(JSON.stringify({
+    app_name: 'ProductOperationReport',
+    code_id: codeId,
+    machine_code: machineCode,
+    exp: expiresAtSeconds
+  }), 'utf8').toString('base64url')
+  return `DVS1.${payload}.test-signature`
 }
 
 const tempUserData = mkdtempSync(join(tmpdir(), 'por-regression-'))
@@ -272,6 +283,12 @@ async function testDeviceIdentityPersistsAcrossAuthorizationReset(): Promise<voi
       historical,
       'clearing or unbinding authorization must not change the physical device identity'
     )
+    activationInternals.setSystemMachineIdForTests('temporarily-different-system-id')
+    assert.equal(
+      getDeviceId(),
+      historical,
+      'the encrypted device vault wins over a transiently different hardware query'
+    )
     activationInternals.resetDeviceIdentityForTests()
     assert.equal(getDeviceId(), historical, 'a simulated application restart keeps the same machine code')
   } finally {
@@ -383,6 +400,68 @@ async function testHistoricalCredentialRefreshRetry(): Promise<void> {
   }
 }
 
+async function testLegacyUpgradeRestoresOnStartup(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const code = 'V026-UPGRADE-PRIMARY-CODE'
+  let requestBody: Record<string, unknown> = {}
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const deviceId = getDeviceId()
+    const oldRecord = {
+      version: 2,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256')
+        .update(`product-operation-report:activation:v1:${code.replace(/[^A-Z0-9]/g, '')}`, 'utf8')
+        .digest('hex'),
+      encryptedCode: encryptV032StoredCode(code, deviceId),
+      deviceId,
+      activatedAt: new Date().toISOString(),
+      licenseId: 'v026-upgrade-primary',
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 100,
+      bindingStatus: 'active'
+    }
+    writeFileSync(activationFile, JSON.stringify(oldRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(oldRecord), 'utf8')
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'v026-upgrade-primary',
+        license_type: 'credits',
+        remaining_credits: 100,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: deviceId,
+        device_credential: 'v026-upgrade-credential',
+        device_session: deviceSessionForTest('v026-upgrade-primary', deviceId, Math.floor(Date.now() / 1_000) + 30 * 86400),
+        action: 'already_bound',
+        grant_score: 0
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const restored = await restoreAuthorizationOnStartup()
+    assert.equal(restored.activated, true, 'a v0.2.6-style encrypted record upgrades without retyping its code')
+    assert.equal(requestBody.credential_refresh, true)
+    assert.equal(requestBody.current_code_id, 'v026-upgrade-primary')
+    assert.equal(requestBody.confirm_merge, undefined)
+    assert.equal(restored.authorizationState, 'active')
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
 async function testSavedActivationRecovery(): Promise<void> {
   const originalFetch = globalThis.fetch
   const activationFile = join(tempUserData, 'activation.json')
@@ -464,6 +543,212 @@ async function testSavedActivationRecovery(): Promise<void> {
   }
 }
 
+function testSecureVaultBackupAndCorruptionGuard(): void {
+  const vaultFile = join(tempUserData, 'license-vault.bin')
+  const vaultBackup = `${vaultFile}.bak`
+  try {
+    for (const file of [vaultFile, vaultBackup]) rmSync(file, { force: true })
+    writeLicenseVault({
+      version: 2,
+      appName: 'ProductOperationReport',
+      licenseId: 'vault-backup-primary',
+      machineCode: getDeviceId(),
+      activationCode: 'VAULT-BACKUP-CODE',
+      deviceCredential: 'vault-backup-credential',
+      deviceSession: 'vault-backup-session'
+    })
+    const backupBytes = readFileSync(vaultBackup)
+    writeFileSync(vaultFile, 'broken-primary-vault', 'utf8')
+    const recovered = inspectLicenseVault()
+    assert.equal(recovered.status, 'ready')
+    assert.equal(recovered.source, 'backup')
+    assert.equal(recovered.value?.activationCode, 'VAULT-BACKUP-CODE')
+    assert.deepEqual(readFileSync(vaultFile), backupBytes, 'a readable backup self-heals the primary vault')
+
+    const corruptPrimary = safeStorage.encryptString('broken-primary-vault')
+    const corruptBackup = safeStorage.encryptString('broken-backup-vault')
+    writeFileSync(vaultFile, corruptPrimary)
+    writeFileSync(vaultBackup, corruptBackup)
+    const corrupt = inspectLicenseVault()
+    assert.equal(corrupt.status, 'corrupt')
+    assert.throws(
+      () => writeLicenseVault({ activationCode: 'MUST-NOT-OVERWRITE' }),
+      /corrupt/i,
+      'a corrupt encrypted vault is preserved instead of overwritten'
+    )
+    assert.deepEqual(readFileSync(vaultFile), corruptPrimary)
+    assert.deepEqual(readFileSync(vaultBackup), corruptBackup)
+  } finally {
+    for (const file of [vaultFile, vaultBackup]) rmSync(file, { force: true })
+  }
+}
+
+async function testSessionRotationAndExpiredRecovery(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const code = 'SESSION-LIFECYCLE-PRIMARY-CODE'
+  const codeId = 'session-lifecycle-primary'
+  let mode: 'initial' | 'rotate' | 'expired' | 'recover' = 'initial'
+  let lastActivationBody: Record<string, unknown> = {}
+  let lastActivationHeaders = new Headers()
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const machineCode = getDeviceId()
+    const expiringSession = deviceSessionForTest(codeId, machineCode, Math.floor(Date.now() / 1_000) + 3 * 86400)
+    const renewedSession = deviceSessionForTest(codeId, machineCode, Math.floor(Date.now() / 1_000) + 30 * 86400)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/device/status')) {
+        if (mode === 'expired') {
+          return new Response(JSON.stringify({ ok: false, error: '设备会话已过期。' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: codeId,
+          license_type: 'credits',
+          remaining_credits: 88,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: machineCode,
+          message: 'status active'
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      lastActivationBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>
+      lastActivationHeaders = new Headers(init?.headers)
+      const session = mode === 'initial' ? expiringSession : renewedSession
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: codeId,
+        license_type: 'credits',
+        remaining_credits: 88,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: machineCode,
+        device_credential: 'session-lifecycle-credential',
+        device_session: session,
+        action: 'already_bound',
+        grant_score: 0,
+        message: 'session ready'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const activated = await activateWithCode(code)
+    assert.equal(activated.ok, true)
+    assert.equal(activated.status.authorizationState, 'session_expiring')
+
+    mode = 'rotate'
+    const rotated = await getActivationStatusWithServerCheck()
+    assert.equal(rotated.activated, true)
+    assert.equal(rotated.authorizationState, 'active')
+    assert.equal(lastActivationBody.credential_refresh, true)
+    assert.equal(lastActivationBody.confirm_merge, undefined)
+    assert.equal(lastActivationBody.current_code_id, codeId)
+    assert.equal(lastActivationHeaders.get('authorization'), `Bearer ${expiringSession}`)
+
+    mode = 'expired'
+    const expired = await getActivationStatusWithServerCheck()
+    assert.equal(expired.activated, false)
+    assert.equal(expired.authorizationState, 'session_expired')
+    assert.equal(expired.recoveryAction, 'confirm_saved_code')
+
+    mode = 'recover'
+    const recovered = await revalidateSavedActivationCode()
+    assert.equal(recovered.ok, true)
+    assert.equal(lastActivationBody.device_credential, 'session-lifecycle-credential')
+    assert.equal(lastActivationBody.credential_refresh, undefined)
+    assert.equal(lastActivationBody.confirm_merge, undefined)
+    assert.equal(lastActivationHeaders.get('authorization'), null, 'expired sessions are never reused')
+    assert.equal(recovered.status.creditsRemaining, 88)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
+async function testUnboundNeverAutoRebinds(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const licenseVault = join(tempUserData, 'license-vault.bin')
+  const licenseVaultBackup = `${licenseVault}.bak`
+  const code = 'NO-AUTO-REBIND-PRIMARY-CODE'
+  let activationCalls = 0
+  let unbound = false
+  try {
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const machineCode = getDeviceId()
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/device/status')) {
+        if (unbound) {
+          return new Response(JSON.stringify({ ok: false, error: '授权当前未绑定设备。' }), {
+            status: 401,
+            headers: { 'content-type': 'application/json' }
+          })
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          app_name: 'ProductOperationReport',
+          code_id: 'no-auto-rebind-primary',
+          license_type: 'credits',
+          remaining_credits: 66,
+          unlimited: false,
+          binding_status: 'active',
+          transfer_count: 0,
+          machine_code: machineCode
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      activationCalls += 1
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: 'no-auto-rebind-primary',
+        license_type: 'credits',
+        remaining_credits: 66,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: unbound ? 1 : 0,
+        machine_code: machineCode,
+        device_credential: 'no-auto-rebind-credential',
+        device_session: deviceSessionForTest('no-auto-rebind-primary', machineCode, Math.floor(Date.now() / 1_000) + 30 * 86400),
+        action: unbound ? 'rebound' : 'activated',
+        grant_score: 0
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    assert.equal((await activateWithCode(code)).ok, true)
+    unbound = true
+    const detected = await getActivationStatusWithServerCheck()
+    assert.equal(detected.authorizationState, 'unbound')
+    assert.equal(detected.activated, false)
+    const beforeStartup = activationCalls
+    const afterRestart = await restoreAuthorizationOnStartup()
+    assert.equal(afterRestart.authorizationState, 'unbound')
+    assert.equal(activationCalls, beforeStartup, 'startup must not call /activate after an administrator unbind')
+
+    const explicit = await revalidateSavedActivationCode()
+    assert.equal(explicit.ok, true, 'an explicit user action may rebind the saved primary code')
+    assert.equal(activationCalls, beforeStartup + 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+  }
+}
+
 async function testActivationAdmissionAndSafeDiagnostics(): Promise<void> {
   const gate = new ExclusiveOperationGate()
   let releaseFirst: (() => void) | undefined
@@ -482,6 +767,10 @@ async function testActivationAdmissionAndSafeDiagnostics(): Promise<void> {
     deviceId: 'b38301cafa771234567890abcdef1234',
     activationCodeAvailable: true,
     maskedActivationCode: 'PRO-••••-SECRET',
+    authorizationState: 'manual_activation_required',
+    canAutoRecover: false,
+    recoveryAction: 'contact_admin',
+    vaultStatus: 'ready',
     codeCount: 1,
     appName: 'ProductOperationReport',
     unlimited: false,
@@ -565,7 +854,8 @@ async function testActivationAndSettingsBackup(): Promise<void> {
   writeFileSync(join(tempUserData, 'activation.json'), malformedText, 'utf8')
   writeFileSync(join(tempUserData, 'activation.json.bak'), malformedText, 'utf8')
   const recoveredMalformedRecord = getActivationStatus()
-  assert.equal(recoveredMalformedRecord.activated, true, 'a v2 record with only a corrupt trailing serverMessage is recovered')
+  assert.equal(recoveredMalformedRecord.activated, false, 'a recovered v2 summary waits for server confirmation')
+  assert.equal(recoveredMalformedRecord.activationCodeAvailable, true, 'the migrated original code remains recoverable')
   assert.equal(recoveredMalformedRecord.licenseId, 'malformed-v2-recovery-id')
   assert.equal(revealCurrentActivationCode().activationCode, recoveryCode)
   const recoveredJson = JSON.parse(readFileSync(join(tempUserData, 'activation.json'), 'utf8')) as Record<string, unknown>
@@ -1196,12 +1486,13 @@ async function testRemoteAdminUnbindReturnsToActivation(): Promise<void> {
     assert.equal(revokedCredential.activated, false, 'a revoked device credential must return to activation')
     assert.equal(revokedCredential.requiresRevalidation, true)
     assert.equal(revokedCredential.activationCodeAvailable, true)
-    assert.match(revokedCredential.message || '', /重新输入原激活码/)
+    assert.equal(revokedCredential.authorizationState, 'credential_revoked')
+    assert.match(revokedCredential.message || '', /撤销|管理员/)
 
     statusMode = 'active'
     const revalidated = await activateWithCode(code)
-    assert.equal(revalidated.ok, true)
-    assert.equal(revalidated.status.activated, true)
+    assert.equal(revalidated.ok, false, 'revoked credentials require administrator handling')
+    assert.equal(revalidated.status.activated, false)
   } finally {
     globalThis.fetch = originalFetch
     for (const file of [activationFile, activationBackup, licenseVault, licenseVaultBackup]) {
@@ -1405,15 +1696,13 @@ async function testLicenseProtocolV2StrictContract(): Promise<void> {
 
     mode = 'active'
     const refreshed = await activateWithCode(code)
-    assert.equal(refreshed.ok, true)
-    assert.equal(activationBody.credential_refresh, true)
-    assert.equal(activationBody.current_code_id, 'strict-v2-primary')
+    assert.equal(refreshed.ok, false, 'an unknown 401 must fail closed instead of guessing a recovery path')
     assert.equal(activationHeaders.get('authorization'), null, 'a revoked device session must not be reused during revalidation')
-    assert.equal(refreshed.status.creditsRemaining, 42, 'credential rotation must not add credits')
+    assert.equal(refreshed.status.creditsRemaining, 42, 'a rejected recovery must not alter credits')
 
     mode = 'conflict'
     const conflicted = await getActivationStatusWithServerCheck()
-    assert.equal(conflicted.activated, true)
+    assert.equal(conflicted.activated, false, 'a conflicting server contract fails closed')
     assert.equal(conflicted.creditsRemaining, 42, 'conflicting aliases must not overwrite the last trusted balance')
     assert.equal(conflicted.requiresRevalidation, true)
     assert.match(conflicted.message || '', /冲突/)
@@ -1736,10 +2025,9 @@ function testRepairPlanStaticContracts(): void {
   assert.doesNotMatch(main, /function authorizationWallet/u)
   assert.match(main, /fetchProxyWallet/u)
   assert.equal((main.match(/getActivationStatusWithServerCheck\(/gu) || []).length, 1, 'only throttled refresh calls device status')
-  assert.match(main, /async function getActivationStatusWithSavedCodeRecovery\(\)/u)
-  assert.match(main, /status\.activated \|\| !status\.activationCodeAvailable/u)
-  assert.match(main, /automaticSavedCodeRecoveryKey === recoveryKey/u)
-  assert.match(main, /ipcMain\.handle\('activation:status', \(\) => getActivationStatusWithSavedCodeRecovery\(\)\)/u)
+  assert.match(main, /restoreAuthorizationOnStartup/u)
+  assert.doesNotMatch(main, /automaticSavedCodeRecoveryKey|getActivationStatusWithSavedCodeRecovery/u)
+  assert.match(main, /ipcMain\.handle\('activation:status', \(\) => activationOperationGate\.run/u)
   assert.doesNotMatch(preload, /license:canStartAnalysis|license:consumeAnalysisCredit/u)
   assert.equal(existsSync(join(process.cwd(), 'src', 'main', 'pointsWallet.ts')), false)
   assert.doesNotMatch(table, /sourceForModel/u)
@@ -3960,7 +4248,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   )
   assert.match(
     appComponent,
-    /placeholder="POR-XXXX-XXXX-XXXX-XXXX"[\s\S]{0,120}disabled=\{activationBusy\}/u,
+    /placeholder="POR-XXXX-XXXX-XXXX-XXXX"[\s\S]{0,300}disabled=\{activationBusy \|\|/u,
     'the activation code cannot change while its request is in flight'
   )
   const settingsComponent = readFileSync(
@@ -4771,8 +5059,16 @@ async function run(): Promise<void> {
   await testDeviceIdentityPersistsAcrossAuthorizationReset()
   console.log('Regression: historical authorization credential-upgrade retry')
   await testHistoricalCredentialRefreshRetry()
+  console.log('Regression: v0.2.6-style authorization restores automatically on startup')
+  await testLegacyUpgradeRestoresOnStartup()
   console.log('Regression: securely saved activation recovery')
   await testSavedActivationRecovery()
+  console.log('Regression: secure vault backup recovery and corruption guard')
+  testSecureVaultBackupAndCorruptionGuard()
+  console.log('Regression: proactive session rotation and explicit expired-session recovery')
+  await testSessionRotationAndExpiredRecovery()
+  console.log('Regression: administrator unbind never auto-rebinds on restart')
+  await testUnboundNeverAutoRebinds()
   console.log('Regression: activation single-flight and safe diagnostics')
   await testActivationAdmissionAndSafeDiagnostics()
   console.log('Regression: activation and settings backup')

@@ -33,9 +33,41 @@ export interface AppSettings {
 }
 
 /** 聊天消息内容块 */
+export type AuthorizationState =
+  | 'checking'
+  | 'active'
+  | 'offline_grace'
+  | 'session_expiring'
+  | 'session_expired'
+  | 'legacy_upgrade'
+  | 'unbound'
+  | 'disabled'
+  | 'expired'
+  | 'machine_mismatch'
+  | 'credential_revoked'
+  | 'vault_unavailable'
+  | 'vault_corrupt'
+  | 'manual_activation_required'
+
+export type ActivationRecoveryAction =
+  | 'none'
+  | 'retry_status'
+  | 'rotate_session'
+  | 'upgrade_legacy'
+  | 'confirm_saved_code'
+  | 'enter_code'
+  | 'contact_admin'
+  | 'unlock_vault'
+
+export type ActivationVaultStatus = 'ready' | 'missing' | 'unavailable' | 'corrupt'
+
 export interface ActivationStatus {
   activated: boolean
   deviceId: string
+  authorizationState: AuthorizationState
+  canAutoRecover: boolean
+  recoveryAction: ActivationRecoveryAction
+  vaultStatus: ActivationVaultStatus
   activatedAt?: string
   licenseId?: string
   /** 当前用于软件授权和设备绑定的主激活码；不包含后来输入的积分充值码。 */

@@ -22,6 +22,8 @@ export function buildActivationDiagnostic(
     `运行平台：${platformLabel}`,
     `设备码：${status.deviceId.slice(0, 12).toUpperCase()}`,
     `授权状态：${diagnosticState(status)}`,
+    `授权状态码：${status.authorizationState}`,
+    `安全存储：${status.vaultStatus}`,
     `采集时间：${capturedAt}`
   ].join('\n')
 }
