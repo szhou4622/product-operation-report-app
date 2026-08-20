@@ -13,7 +13,7 @@ jobs:
   package:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: product-operation-report-app
@@ -39,9 +39,6 @@ jobs:
             arch: x64
             artifact: product-operation-report-macos-x64
             path: product-operation-report-app/dist/*.dmg
-
-    env:
-      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
     steps:
       - name: Check out source
@@ -80,8 +77,30 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: npm run test:html-visual
 
-      - name: Build installer
+      - name: Build Windows installer
+        if: matrix.os == 'windows-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run ${{ matrix.script }} -- --${{ matrix.arch }}
+
+      - name: Build, sign, and notarize macOS installer
+        if: startsWith(matrix.os, 'macos-')
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+        run: |
+          set -euo pipefail
+          : "${CSC_LINK:?Missing MAC_CSC_LINK secret}"
+          : "${CSC_KEY_PASSWORD:?Missing MAC_CSC_KEY_PASSWORD secret}"
+          : "${APPLE_ID:?Missing APPLE_ID secret}"
+          : "${APPLE_APP_SPECIFIC_PASSWORD:?Missing APPLE_APP_SPECIFIC_PASSWORD secret}"
+          : "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID secret}"
+          npm run "${{ matrix.script }}" -- --${{ matrix.arch }}
 
       - name: Verify installer contains no model provider secret
         shell: bash
@@ -114,7 +133,14 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${app_path}"
           signature_details="$(codesign -dvvv "${app_path}" 2>&1)"
           printf '%s\n' "${signature_details}"
-          grep -q 'Signature=adhoc' <<<"${signature_details}"
+          grep -q 'Authority=Developer ID Application' <<<"${signature_details}"
+          grep -q 'TeamIdentifier=SC3VT47K6J' <<<"${signature_details}"
+          if grep -q 'Signature=adhoc' <<<"${signature_details}"; then
+            echo 'macOS app is still ad-hoc signed' >&2
+            exit 1
+          fi
+          xcrun stapler validate "${app_path}"
+          spctl --assess --type execute --verbose=4 "${app_path}"
           binary_details="$(file "${executable_path}")"
           printf '%s\n' "${binary_details}"
           if [[ "${{ matrix.arch }}" == "x64" ]]; then
