@@ -44,11 +44,11 @@
 .contact-qr-popover {
   position: absolute;
   top: calc(100% + 10px);
-  left: 50%;
+  left: 0;
   z-index: 300;
   display: grid;
-  width: 232px;
-  padding: 12px;
+  width: min(520px, calc(100vw - 24px));
+  padding: 14px;
   border: 1px solid rgba(148, 163, 184, 0.28);
   border-radius: 12px;
   background: #ffffff;
@@ -58,14 +58,14 @@
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transform: translate(-50%, -4px);
+  transform: translate(0, -4px);
   transition: opacity 150ms ease, transform 150ms ease, visibility 150ms ease;
 }
 
 .contact-qr-popover::before {
   position: absolute;
   top: -8px;
-  left: calc(50% - 8px);
+  left: 44px;
   width: 16px;
   height: 16px;
   border-top: 1px solid rgba(148, 163, 184, 0.28);
@@ -89,8 +89,9 @@
   position: relative;
   z-index: 1;
   display: block;
-  width: 206px;
-  height: 190px;
+  width: 100%;
+  height: auto;
+  max-height: min(520px, calc(100vh - 150px));
   border-radius: 8px;
   object-fit: contain;
   background: #ffffff;
@@ -102,7 +103,7 @@
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transform: translate(-50%, 0);
+  transform: translate(0, 0);
 }
 
 .contact-unavailable {
@@ -162,10 +163,6 @@
 
 @media (max-width: 70rem) {
   .contact-trigger { padding-inline: 10px; }
-  .contact-qr-popover { left: 0; transform: translate(0, -4px); }
-  .contact-entry:hover .contact-qr-popover,
-  .contact-entry:focus-within .contact-qr-popover,
-  .contact-entry.pinned .contact-qr-popover { transform: translate(0, 0); }
 }
 
 @media (max-width: 46rem) {

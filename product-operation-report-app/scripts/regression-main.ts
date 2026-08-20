@@ -4026,6 +4026,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
             tutorial: rect('.tutorial-link'),
             actions: rect('.topbar .right'),
             contactDisplay: getComputedStyle(document.querySelector('.contact-entry')).display,
+            topbarZIndex: getComputedStyle(document.querySelector('.topbar')).zIndex,
             modelDisplay: model instanceof HTMLElement ? getComputedStyle(model).display : ''
           }
         })()`
@@ -4038,6 +4039,7 @@ async function testWorkbenchTopbarContract(): Promise<void> {
       tutorial: { left: number; right: number; width: number } | null
       actions: { left: number; right: number; width: number } | null
       contactDisplay: string
+      topbarZIndex: string
       modelDisplay: string
     }
     assert.equal(layout.innerWidth, width)
@@ -4047,6 +4049,8 @@ async function testWorkbenchTopbarContract(): Promise<void> {
     assert.ok(layout.contact!.right + 8 <= layout.tutorial!.left, `${width}px 联系方式与教程入口重叠`)
     assert.ok(layout.contactPopover && layout.contactPopover.left >= 0, `${width}px 二维码浮层超出左侧窗口`)
     assert.ok(layout.contactPopover!.right <= layout.innerWidth, `${width}px 二维码浮层超出右侧窗口`)
+    assert.ok(layout.contactPopover!.width >= 400, '二维码浮层宽度不足，扫码区域会过小')
+    assert.equal(layout.topbarZIndex, '500', '顶栏层级必须高于内容区')
     assert.ok(layout.tutorial!.right + 8 <= layout.actions!.left, `${width}px 教程入口与操作区重叠`)
     assert.equal(layout.modelDisplay, 'none')
   } finally {

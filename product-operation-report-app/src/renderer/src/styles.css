@@ -4643,6 +4643,9 @@ body.resizing .pane-resizer {
 .topbar {
   display: flex;
   gap: 16px;
+  position: relative;
+  z-index: 500;
+  overflow: visible;
 }
 
 .topbar .brand {
