@@ -47,6 +47,7 @@ export type AuthorizationState =
   | 'credential_revoked'
   | 'vault_unavailable'
   | 'vault_corrupt'
+  | 'merged_main_conflict'
   | 'manual_activation_required'
 
 export type ActivationRecoveryAction =

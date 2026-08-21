@@ -408,6 +408,10 @@ export default function App(): JSX.Element {
       setActivationError('系统安全凭据当前不可用，已停止提交，避免覆盖原授权。')
       return
     }
+    if (
+      activationStatus?.authorizationState === 'merged_main_conflict' &&
+      !window.confirm('本机保存的码已经作为积分码合并，不能再次作为主授权。\n\n只有管理员明确补发的新主码才应在这里继续激活。确认这是管理员补发的主码吗？')
+    ) return
     setActivationBusy(true)
     setActivationError('')
     setActivationActionNotice('')
@@ -604,6 +608,8 @@ export default function App(): JSX.Element {
           <div className="activation-kicker">产品与内容经营报告系统</div>
           <h1>{activationStatus.authorizationState === 'unbound'
             ? '这台电脑已解除绑定'
+            : activationStatus.authorizationState === 'merged_main_conflict'
+              ? '未找到可用的原主授权'
             : activationStatus.authorizationState === 'session_expired'
               ? '确认恢复本机授权'
               : activationStatus.authorizationState === 'vault_unavailable'
@@ -616,6 +622,8 @@ export default function App(): JSX.Element {
           <p>
             {activationStatus.authorizationState === 'unbound'
               ? '服务器已停止这台电脑的原授权。只有你明确确认后，软件才会使用已保存的原激活码重新绑定。'
+              : activationStatus.authorizationState === 'merged_main_conflict'
+                ? '软件已经检查本机保存的历史授权，但服务器没有认可其中任何一张为当前主码。请只输入管理员补发的主激活码；积分充值码需要进入软件后使用。'
               : activationStatus.authorizationState === 'session_expired'
                 ? '原激活码和设备凭证仍安全保存在本机，无需重新输入；确认后即可恢复。'
                 : activationStatus.authorizationState === 'vault_unavailable'
@@ -631,6 +639,7 @@ export default function App(): JSX.Element {
             activationStatus.authorizationState !== 'expired' &&
             activationStatus.authorizationState !== 'machine_mismatch' &&
             activationStatus.authorizationState !== 'credential_revoked' &&
+            activationStatus.authorizationState !== 'merged_main_conflict' &&
             activationStatus.authorizationState !== 'vault_unavailable' &&
             activationStatus.authorizationState !== 'vault_corrupt' && (
             <button

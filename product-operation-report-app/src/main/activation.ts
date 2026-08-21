@@ -27,9 +27,13 @@ import {
   getOrCreateFallbackMachineSeed,
   inspectDeviceVault,
   inspectLicenseVault,
+  licenseVaultRecoveryEntries,
+  markLicenseVaultEntry,
   readLicenseVault,
+  upsertLicenseVaultEntry,
   writeLicenseVault,
   writeStoredMachineCode,
+  type LicenseVaultEntryState,
   type LicenseVaultContents,
   type SecureVaultStatus
 } from './licenseVault'
@@ -367,6 +371,9 @@ function classifyAuthorizationFailure(
   if (/设备会话已过期|设备会话无效|设备会话签名无效|设备会话内容无效|session[_ -]?(expired|invalid)/i.test(`${code} ${message}`)) {
     return { state: 'session_expired', action: 'confirm_saved_code' }
   }
+  if (/合并码不能作为设备主授权|merged[_ -]?(main|primary)/i.test(`${code} ${message}`)) {
+    return { state: 'merged_main_conflict', action: 'contact_admin' }
+  }
   if (/credential_refresh|旧授权首次升级设备凭证/i.test(`${code} ${message}`)) {
     return { state: 'legacy_upgrade', action: 'upgrade_legacy' }
   }
@@ -572,12 +579,17 @@ function migrateEmbeddedSecrets(record: ServerStoredActivation): LicenseVaultCon
   const inspected = inspectLicenseVault()
   const existing = inspected.value
   if (existing) {
-    const enriched: LicenseVaultContents = {
-      ...existing,
-      version: 2,
-      appName: LICENSE_APP_NAME,
+    const enriched = {
+      ...upsertLicenseVaultEntry(existing, {
       licenseId: record.licenseId,
-      machineCode: record.deviceId
+      machineCode: record.deviceId,
+      activationCode: existing.activationCode,
+      deviceCredential: existing.deviceCredential,
+      deviceSession: existing.deviceSession,
+      state: record.bindingStatus === 'unbound' ? 'unbound' : 'active',
+      lastValidatedAt: record.lastValidatedAt
+      }, true),
+      appName: LICENSE_APP_NAME
     }
     if (
       record.version === 2 ||
@@ -586,7 +598,7 @@ function migrateEmbeddedSecrets(record: ServerStoredActivation): LicenseVaultCon
       record.encryptedDeviceSession ||
       record.activationCodeStored !== Boolean(existing.activationCode) ||
       (!record.maskedActivationCode && existing.activationCode) ||
-      existing.version !== 2 ||
+      existing.version !== 3 ||
       existing.appName !== LICENSE_APP_NAME ||
       existing.licenseId !== record.licenseId ||
       existing.machineCode !== record.deviceId
@@ -606,13 +618,19 @@ function migrateEmbeddedSecrets(record: ServerStoredActivation): LicenseVaultCon
   const deviceSession = decryptOldSecret(record.encryptedDeviceSession, record.deviceId)
   if (!code && !deviceCredential && !deviceSession) return null
   const migrated: LicenseVaultContents = {
-    version: 2,
+    version: 3,
     appName: LICENSE_APP_NAME,
-    licenseId: record.licenseId,
-    machineCode: record.deviceId,
-    activationCode: code,
-    deviceCredential,
-    deviceSession
+    activeLicenseId: record.licenseId,
+    entries: [{
+      licenseId: record.licenseId,
+      machineCode: record.deviceId,
+      activationCode: code,
+      deviceCredential,
+      deviceSession,
+      state: record.bindingStatus === 'unbound' ? 'unbound' : 'active',
+      lastValidatedAt: record.lastValidatedAt,
+      updatedAt: new Date().toISOString()
+    }]
   }
   writeLicenseVault(migrated)
   writeStoredActivation({
@@ -620,7 +638,7 @@ function migrateEmbeddedSecrets(record: ServerStoredActivation): LicenseVaultCon
     activationCodeStored: Boolean(code),
     maskedActivationCode: code ? maskActivationCode(code) : undefined
   })
-  return migrated
+  return readLicenseVault() || migrated
 }
 
 function recordMatchesDevice(record: StoredActivation, deviceId: string): boolean {
@@ -1124,17 +1142,46 @@ function persistLicenseVault(
   deviceId: string,
   licenseId: string | undefined,
   deviceCredential?: string,
-  deviceSession?: string
+  deviceSession?: string,
+  options: {
+    state?: LicenseVaultEntryState
+    mergedIntoLicenseId?: string
+    makeActive?: boolean
+    lastValidatedAt?: string
+    clearCredentials?: boolean
+  } = {}
 ): void {
-  writeLicenseVault({
-    version: 2,
-    appName: LICENSE_APP_NAME,
+  const current = readLicenseVault()
+  const next = upsertLicenseVaultEntry(current, {
     licenseId,
     machineCode: deviceId,
     activationCode,
     deviceCredential,
-    deviceSession
-  })
+    deviceSession,
+    state: options.state || 'active',
+    mergedIntoLicenseId: options.mergedIntoLicenseId,
+    lastValidatedAt: options.lastValidatedAt
+  }, options.makeActive !== false, !options.clearCredentials)
+  writeLicenseVault({ ...next, appName: LICENSE_APP_NAME })
+}
+
+function recordMergedLicenseCode(
+  activationCode: string,
+  deviceId: string,
+  mergedLicenseId: string | undefined,
+  primaryLicenseId: string | undefined
+): void {
+  if (!mergedLicenseId) return
+  const current = readLicenseVault()
+  const next = upsertLicenseVaultEntry(current, {
+    licenseId: mergedLicenseId,
+    machineCode: deviceId,
+    activationCode,
+    state: 'merged',
+    mergedIntoLicenseId: primaryLicenseId,
+    lastValidatedAt: new Date().toISOString()
+  }, false)
+  writeLicenseVault({ ...next, appName: LICENSE_APP_NAME })
 }
 
 export function getActivationStatus(): ActivationStatus {
@@ -1413,6 +1460,60 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     markValidationSuccess()
     return toStatus(updated, deviceId)
   }
+  if (result.authorizationState === 'merged_main_conflict') {
+    let history = markLicenseVaultEntry(vault, current.licenseId, 'merged')
+    const candidates = licenseVaultRecoveryEntries(history, deviceId, current.licenseId)
+    for (const candidate of candidates) {
+      const candidateResult = await requestServerDeviceStatus(
+        deviceId,
+        candidate.licenseId!,
+        candidate.deviceCredential!,
+        candidate.deviceSession!
+      )
+      if (candidateResult.ok && candidateResult.licenseId === candidate.licenseId && candidate.activationCode) {
+        const restoredAt = new Date().toISOString()
+        history = upsertLicenseVaultEntry(history, {
+          ...candidate,
+          state: 'active',
+          lastValidatedAt: restoredAt
+        }, true)
+        writeLicenseVault({ ...history, appName: LICENSE_APP_NAME })
+        const restored = entitlementRecord(null, candidate.activationCode, deviceId, candidateResult)
+        writeStoredActivation(restored)
+        markValidationSuccess()
+        return toStatus(restored, deviceId)
+      }
+      if (candidateResult.authorizationState === 'merged_main_conflict') {
+        history = markLicenseVaultEntry(history, candidate.licenseId!, 'merged')
+      } else if (candidateResult.authorizationState === 'unbound') {
+        history = markLicenseVaultEntry(history, candidate.licenseId!, 'unbound')
+      } else if (
+        candidateResult.authorizationState === 'disabled' ||
+        candidateResult.authorizationState === 'expired' ||
+        candidateResult.authorizationState === 'machine_mismatch' ||
+        candidateResult.authorizationState === 'credential_revoked'
+      ) {
+        history = markLicenseVaultEntry(history, candidate.licenseId!, 'revoked')
+      }
+      if (candidateResult.unavailable) break
+    }
+    writeLicenseVault({ ...history, appName: LICENSE_APP_NAME })
+    clearRuntimeValidation()
+    const message = candidates.length
+      ? '本机保存的主码已被服务器标记为积分合并码，历史授权中没有仍可使用的主码；请使用管理员补发的主码。'
+      : '本机保存的主码已被服务器标记为积分合并码，且没有可验证的历史主授权；请使用管理员补发的主码。'
+    const conflicted: ServerStoredActivation = {
+      ...sanitizedServerRecord(current),
+      requiresRevalidation: true,
+      authorizationState: 'merged_main_conflict',
+      revokedReason: message,
+      serverMessage: message,
+      activationCodeStored: Boolean(vault.activationCode),
+      maskedActivationCode: vault.activationCode ? maskActivationCode(vault.activationCode) : undefined
+    }
+    writeStoredActivation(conflicted)
+    return toStatus(conflicted, deviceId)
+  }
   if (result.authorizationState === 'unbound' || result.bindingStatus === 'unbound') {
     clearRuntimeValidation()
     let activationCodeStored = false
@@ -1420,7 +1521,12 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
       if (vault.activationCode) {
         // Keep only the original code so the user can explicitly reactivate it.
         // Revoked device credentials must not survive an administrator unbind.
-        persistLicenseVault(vault.activationCode, deviceId, current.licenseId)
+        persistLicenseVault(vault.activationCode, deviceId, current.licenseId, undefined, undefined, {
+          state: 'unbound',
+          makeActive: true,
+          lastValidatedAt: new Date().toISOString(),
+          clearCredentials: true
+        })
         activationCodeStored = true
       }
     } catch {
@@ -1497,7 +1603,12 @@ export async function getActivationStatusWithServerCheck(): Promise<ActivationSt
     hardState === 'credential_revoked'
   ) {
     try {
-      persistLicenseVault(vault.activationCode, deviceId, current.licenseId)
+      persistLicenseVault(vault.activationCode, deviceId, current.licenseId, undefined, undefined, {
+        state: 'revoked',
+        makeActive: true,
+        lastValidatedAt: new Date().toISOString(),
+        clearCredentials: true
+      })
     } catch {
       activationCodeStored = Boolean(vault.activationCode)
     }
@@ -1626,6 +1737,17 @@ export async function activateWithCode(input: string): Promise<ActivationResult>
   }
   if (!result.ok) return { ok: false, message: friendlyActivationFailure(result.message), status: currentStatus }
   if (result.action === 'balance_merged') {
+    try {
+      recordMergedLicenseCode(
+        enteredCode,
+        deviceId,
+        result.mergedLicenseId || result.licenseId,
+        result.primaryLicenseId
+      )
+    } catch {
+      // The server result remains authoritative; never replace the active local
+      // primary merely because recording consumed-code history failed.
+    }
     return {
       ok: false,
       message: '这台电脑在服务器上已有主激活码，本次积分码已充值到原主授权。请重新输入原主激活码恢复本机授权；如果原码已丢失，请联系管理员处理。',
@@ -1707,6 +1829,11 @@ export async function redeemPointsWithCode(input: string): Promise<{
     return { ok: false, message: '服务器返回的主授权编号不一致，本次未更新余额。', status: before, addedPoints: 0 }
   }
   const previousBalance = before.creditsRemaining || 0
+  try {
+    recordMergedLicenseCode(code, before.deviceId, result.mergedLicenseId || result.licenseId, returnedPrimaryId)
+  } catch {
+    // A consumed recharge code must never replace or invalidate the main code.
+  }
   const updated = entitlementRecord(current.record, vault.activationCode, before.deviceId, {
     ...result,
     licenseId: returnedPrimaryId

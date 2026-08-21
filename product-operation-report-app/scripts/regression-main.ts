@@ -1475,6 +1475,9 @@ async function testRemoteAdminUnbindReturnsToActivation(): Promise<void> {
     assert.equal(unbound.activationCodeAvailable, true, 'the original code remains recoverable from secure storage')
     assert.match(unbound.message || '', /解除绑定/)
     assert.equal(revealCurrentActivationCode().activationCode, code)
+    const unboundVault = inspectLicenseVault().value
+    assert.equal(unboundVault?.deviceCredential, undefined, 'administrator unbind revokes the cached device credential')
+    assert.equal(unboundVault?.deviceSession, undefined, 'administrator unbind revokes the cached device session')
 
     statusMode = 'active'
     const rebound = await activateWithCode(code)
@@ -1488,6 +1491,9 @@ async function testRemoteAdminUnbindReturnsToActivation(): Promise<void> {
     assert.equal(revokedCredential.activationCodeAvailable, true)
     assert.equal(revokedCredential.authorizationState, 'credential_revoked')
     assert.match(revokedCredential.message || '', /撤销|管理员/)
+    const revokedVault = inspectLicenseVault().value
+    assert.equal(revokedVault?.deviceCredential, undefined, 'credential revocation clears the cached credential')
+    assert.equal(revokedVault?.deviceSession, undefined, 'credential revocation clears the cached session')
 
     statusMode = 'active'
     const revalidated = await activateWithCode(code)
@@ -1599,6 +1605,147 @@ async function testPrimaryActivationAndRechargeCodeSeparation(): Promise<void> {
     rmSync(activationBackup, { force: true })
     rmSync(join(tempUserData, 'license-vault.bin'), { force: true })
     rmSync(join(tempUserData, 'license-vault.bin.bak'), { force: true })
+  }
+}
+
+async function testEncryptedMultiLicenseHistoryRecovery(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const activationFile = join(tempUserData, 'activation.json')
+  const activationBackup = `${activationFile}.bak`
+  const vaultFile = join(tempUserData, 'license-vault.bin')
+  const vaultBackup = `${vaultFile}.bak`
+  const currentCode = 'CURRENT-MERGED-MAIN-CODE'
+  const historicalCode = 'HISTORICAL-VALID-PRIMARY-CODE'
+  const currentLicenseId = 'current-merged-license'
+  const historicalLicenseId = 'historical-valid-license'
+  let activationCalls = 0
+  try {
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
+    const deviceId = getActivationStatus().deviceId
+    const now = new Date().toISOString()
+    writeLicenseVault({
+      version: 3,
+      appName: 'ProductOperationReport',
+      activeLicenseId: currentLicenseId,
+      entries: [
+        {
+          licenseId: currentLicenseId,
+          machineCode: deviceId,
+          activationCode: currentCode,
+          deviceCredential: 'current-merged-credential',
+          deviceSession: 'current-merged-session',
+          state: 'active',
+          lastValidatedAt: now,
+          updatedAt: now
+        },
+        {
+          licenseId: historicalLicenseId,
+          machineCode: deviceId,
+          activationCode: historicalCode,
+          deviceCredential: 'historical-valid-credential',
+          deviceSession: 'historical-valid-session',
+          state: 'unknown',
+          lastValidatedAt: new Date(Date.now() - 60_000).toISOString(),
+          updatedAt: new Date(Date.now() - 60_000).toISOString()
+        }
+      ]
+    })
+    const currentRecord = {
+      version: 3,
+      appName: 'ProductOperationReport',
+      source: 'server',
+      codeHash: createHash('sha256')
+        .update(`product-operation-report:activation:v1:${currentCode.replace(/[^A-Z0-9]/g, '')}`, 'utf8')
+        .digest('hex'),
+      deviceId,
+      activatedAt: now,
+      licenseId: currentLicenseId,
+      licenseType: 'credits',
+      unlimited: false,
+      creditsRemaining: 1_000,
+      lastValidatedAt: now,
+      offlineUntil: new Date(Date.now() + 60_000).toISOString(),
+      bindingStatus: 'active',
+      transferCount: 0,
+      activationCodeStored: true,
+      maskedActivationCode: 'CURR••••CODE',
+      requiresRevalidation: false,
+      authorizationState: 'active'
+    }
+    writeFileSync(activationFile, JSON.stringify(currentRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(currentRecord), 'utf8')
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      if (!url.pathname.includes('/device/status')) {
+        activationCalls += 1
+        throw new Error('historical recovery must never call /activate')
+      }
+      const codeId = url.searchParams.get('code_id')
+      if (codeId === currentLicenseId) {
+        return new Response(JSON.stringify({ ok: false, error: '合并码不能作为设备主授权。' }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      assert.equal(codeId, historicalLicenseId)
+      return new Response(JSON.stringify({
+        ok: true,
+        app_name: 'ProductOperationReport',
+        code_id: historicalLicenseId,
+        license_type: 'credits',
+        remaining_credits: 88,
+        unlimited: false,
+        binding_status: 'active',
+        transfer_count: 0,
+        machine_code: deviceId,
+        message: '历史主授权仍然有效'
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    const recovered = await getActivationStatusWithServerCheck()
+    assert.equal(recovered.activated, true)
+    assert.equal(recovered.licenseId, historicalLicenseId)
+    assert.equal(recovered.creditsRemaining, 88)
+    assert.equal(revealCurrentActivationCode().activationCode, historicalCode)
+    assert.equal(activationCalls, 0, 'history recovery uses status checks only')
+    const recoveredVault = inspectLicenseVault().value
+    assert.equal(recoveredVault?.version, 3)
+    assert.equal(recoveredVault?.activeLicenseId, historicalLicenseId)
+    assert.equal(recoveredVault?.entries?.find((entry) => entry.licenseId === currentLicenseId)?.state, 'merged')
+    assert.equal(recoveredVault?.entries?.find((entry) => entry.licenseId === historicalLicenseId)?.state, 'active')
+    const publicSummary = readFileSync(activationFile, 'utf8')
+    for (const secret of [currentCode, historicalCode, 'current-merged-credential', 'historical-valid-credential']) {
+      assert.equal(publicSummary.includes(secret), false, 'multi-license secrets stay out of activation.json')
+    }
+
+    writeLicenseVault({
+      version: 3,
+      appName: 'ProductOperationReport',
+      activeLicenseId: currentLicenseId,
+      entries: [{
+        licenseId: currentLicenseId,
+        machineCode: deviceId,
+        activationCode: currentCode,
+        deviceCredential: 'current-merged-credential',
+        deviceSession: 'current-merged-session',
+        state: 'active',
+        lastValidatedAt: now,
+        updatedAt: now
+      }]
+    })
+    writeFileSync(activationFile, JSON.stringify(currentRecord), 'utf8')
+    writeFileSync(activationBackup, JSON.stringify(currentRecord), 'utf8')
+    const blocked = await getActivationStatusWithServerCheck()
+    assert.equal(blocked.activated, false)
+    assert.equal(blocked.authorizationState, 'merged_main_conflict')
+    assert.match(blocked.message || '', /管理员补发的主码/)
+    assert.equal(activationCalls, 0, 'a missing historical primary must fail closed without activation')
+  } finally {
+    globalThis.fetch = originalFetch
+    for (const file of [activationFile, activationBackup, vaultFile, vaultBackup]) rmSync(file, { force: true })
+    activationInternals.resetRuntimeValidationForTests()
   }
 }
 
@@ -5092,6 +5239,8 @@ async function run(): Promise<void> {
   await testRemoteAdminUnbindReturnsToActivation()
   console.log('Regression: primary activation code remains unchanged after points recharge')
   await testPrimaryActivationAndRechargeCodeSeparation()
+  console.log('Regression: encrypted multi-license history recovers only a server-valid primary')
+  await testEncryptedMultiLicenseHistoryRecovery()
   console.log('Regression: strict License Protocol v2 contract and secure credential vault')
   await testLicenseProtocolV2StrictContract()
   console.log('Regression: update version comparison')

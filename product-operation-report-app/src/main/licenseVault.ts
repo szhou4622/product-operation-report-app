@@ -3,9 +3,26 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { randomBytes } from 'crypto'
 import { join } from 'path'
 
+export type LicenseVaultEntryState = 'active' | 'merged' | 'unbound' | 'revoked' | 'unknown'
+
+export interface LicenseVaultEntry {
+  licenseId?: string
+  machineCode?: string
+  activationCode?: string
+  deviceCredential?: string
+  deviceSession?: string
+  state?: LicenseVaultEntryState
+  mergedIntoLicenseId?: string
+  lastValidatedAt?: string
+  updatedAt?: string
+}
+
 export interface LicenseVaultContents {
-  version?: 2
+  version?: 2 | 3
   appName?: string
+  activeLicenseId?: string
+  entries?: LicenseVaultEntry[]
+  /** Compatibility view of the active v3 entry for existing callers. */
   licenseId?: string
   machineCode?: string
   activationCode?: string
@@ -28,7 +45,8 @@ export interface SecureVaultReadResult<T> {
 
 const LICENSE_VAULT_FILE = 'license-vault.bin'
 const DEVICE_VAULT_FILE = 'device-vault.bin'
-const MAX_VAULT_BYTES = 128 * 1024
+const MAX_VAULT_BYTES = 512 * 1024
+const MAX_LICENSE_ENTRIES = 20
 
 function vaultPath(name: string): string {
   return join(app.getPath('userData'), name)
@@ -158,6 +176,83 @@ function cleanSecret(value: unknown, maxLength: number): string | undefined {
   return trimmed && trimmed.length <= maxLength ? trimmed : undefined
 }
 
+function cleanEntryState(value: unknown): LicenseVaultEntryState {
+  return value === 'active' || value === 'merged' || value === 'unbound' || value === 'revoked'
+    ? value
+    : 'unknown'
+}
+
+function cleanTimestamp(value: unknown): string | undefined {
+  const cleaned = cleanSecret(value, 128)
+  if (!cleaned) return undefined
+  return Number.isFinite(Date.parse(cleaned)) ? cleaned : undefined
+}
+
+function cleanLicenseEntry(value: unknown): LicenseVaultEntry | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  const entry: LicenseVaultEntry = {
+    licenseId: cleanSecret(raw.licenseId, 256),
+    machineCode: cleanMachineCode(raw.machineCode),
+    activationCode: cleanSecret(raw.activationCode, 512),
+    deviceCredential: cleanSecret(raw.deviceCredential, 8192),
+    deviceSession: cleanSecret(raw.deviceSession, 8192),
+    state: cleanEntryState(raw.state),
+    mergedIntoLicenseId: cleanSecret(raw.mergedIntoLicenseId, 256),
+    lastValidatedAt: cleanTimestamp(raw.lastValidatedAt),
+    updatedAt: cleanTimestamp(raw.updatedAt)
+  }
+  return entry.licenseId || entry.activationCode || entry.deviceCredential || entry.deviceSession
+    ? entry
+    : null
+}
+
+function entryKey(entry: LicenseVaultEntry): string {
+  if (entry.licenseId) return `license:${entry.licenseId.toUpperCase()}`
+  if (entry.activationCode) return `code:${entry.activationCode.toUpperCase().replace(/[^A-Z0-9]/g, '')}`
+  return `session:${entry.deviceSession || entry.deviceCredential || ''}`
+}
+
+function uniqueEntries(entries: LicenseVaultEntry[]): LicenseVaultEntry[] {
+  const seen = new Set<string>()
+  const result: LicenseVaultEntry[] = []
+  for (const raw of entries) {
+    const entry = cleanLicenseEntry(raw)
+    if (!entry) continue
+    const key = entryKey(entry)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    result.push(entry)
+    if (result.length >= MAX_LICENSE_ENTRIES) break
+  }
+  return result
+}
+
+function compatibilityEntry(contents: LicenseVaultContents): LicenseVaultEntry | null {
+  const entries = uniqueEntries(contents.entries || [])
+  const activeLicenseId = cleanSecret(contents.activeLicenseId, 256)
+  if (activeLicenseId) {
+    const active = entries.find((entry) => entry.licenseId === activeLicenseId)
+    if (active) return active
+  }
+  const active = entries.find((entry) => entry.state === 'active')
+  if (active) return active
+  if (contents.version !== 3) return entries[0] || null
+  return null
+}
+
+function withCompatibilityFields(contents: LicenseVaultContents): LicenseVaultContents {
+  const active = compatibilityEntry(contents)
+  return {
+    ...contents,
+    licenseId: active?.licenseId,
+    machineCode: active?.machineCode,
+    activationCode: active?.activationCode,
+    deviceCredential: active?.deviceCredential,
+    deviceSession: active?.deviceSession
+  }
+}
+
 export function readLicenseVault(): LicenseVaultContents | null {
   return inspectLicenseVault().value
 }
@@ -166,33 +261,138 @@ export function inspectLicenseVault(): SecureVaultReadResult<LicenseVaultContent
   const inspected = inspectEncryptedJson<Record<string, unknown>>(LICENSE_VAULT_FILE)
   const value = inspected.value
   if (!value) return { ...inspected, value: null }
-  const contents: LicenseVaultContents = {
-    version: value.version === 2 ? 2 : undefined,
+  const legacyEntry = cleanLicenseEntry({
+    licenseId: value.licenseId,
+    machineCode: value.machineCode,
+    activationCode: value.activationCode,
+    deviceCredential: value.deviceCredential,
+    deviceSession: value.deviceSession,
+    state: 'active'
+  })
+  const entries = value.version === 3
+    ? uniqueEntries(Array.isArray(value.entries) ? value.entries as LicenseVaultEntry[] : [])
+    : uniqueEntries(legacyEntry ? [legacyEntry] : [])
+  if (!entries.length) return { ...inspected, status: 'corrupt', value: null }
+  const requestedActiveId = cleanSecret(value.activeLicenseId, 256)
+  const activeLicenseId = requestedActiveId && entries.some((entry) => entry.licenseId === requestedActiveId)
+    ? requestedActiveId
+    : value.version === 3
+      ? entries.find((entry) => entry.state === 'active')?.licenseId
+      : entries[0]?.licenseId
+  const contents = withCompatibilityFields({
+    version: value.version === 3 ? 3 : 2,
     appName: cleanSecret(value.appName, 128),
-    licenseId: cleanSecret(value.licenseId, 256),
-    machineCode: cleanMachineCode(value.machineCode),
-    activationCode: cleanSecret(value.activationCode, 512),
-    deviceCredential: cleanSecret(value.deviceCredential, 8192),
-    deviceSession: cleanSecret(value.deviceSession, 8192)
-  }
-  const hasValue = contents.activationCode || contents.deviceCredential || contents.deviceSession || contents.licenseId
-  return { ...inspected, value: hasValue ? contents : null }
+    activeLicenseId,
+    entries
+  })
+  return { ...inspected, value: contents }
 }
 
 export function writeLicenseVault(contents: LicenseVaultContents): void {
-  const cleaned: LicenseVaultContents = {
-    version: 2,
-    appName: cleanSecret(contents.appName, 128),
-    licenseId: cleanSecret(contents.licenseId, 256),
-    machineCode: cleanMachineCode(contents.machineCode),
-    activationCode: cleanSecret(contents.activationCode, 512),
-    deviceCredential: cleanSecret(contents.deviceCredential, 8192),
-    deviceSession: cleanSecret(contents.deviceSession, 8192)
-  }
-  if (!cleaned.activationCode && !cleaned.deviceCredential && !cleaned.deviceSession) {
+  const explicitEntries = uniqueEntries(contents.entries || [])
+  const legacyEntry = cleanLicenseEntry({
+    licenseId: contents.licenseId,
+    machineCode: contents.machineCode,
+    activationCode: contents.activationCode,
+    deviceCredential: contents.deviceCredential,
+    deviceSession: contents.deviceSession,
+    state: 'active',
+    updatedAt: new Date().toISOString()
+  })
+  const entries = explicitEntries.length ? explicitEntries : uniqueEntries(legacyEntry ? [legacyEntry] : [])
+  if (!entries.some((entry) => entry.activationCode || entry.deviceCredential || entry.deviceSession)) {
     throw new Error('No credentials are available for secure storage.')
   }
-  writeEncryptedJson(LICENSE_VAULT_FILE, cleaned)
+  const requestedActiveId = cleanSecret(contents.activeLicenseId || contents.licenseId, 256)
+  const activeLicenseId = requestedActiveId && entries.some((entry) => entry.licenseId === requestedActiveId)
+    ? requestedActiveId
+    : entries.find((entry) => entry.state === 'active')?.licenseId
+  writeEncryptedJson(LICENSE_VAULT_FILE, {
+    version: 3,
+    appName: cleanSecret(contents.appName, 128),
+    activeLicenseId,
+    entries
+  })
+}
+
+export function upsertLicenseVaultEntry(
+  current: LicenseVaultContents | null,
+  input: LicenseVaultEntry,
+  makeActive: boolean,
+  preserveExistingCredentials = true
+): LicenseVaultContents {
+  const now = new Date().toISOString()
+  const incoming = cleanLicenseEntry({ ...input, updatedAt: input.updatedAt || now })
+  if (!incoming) throw new Error('License vault entry is invalid.')
+  const priorEntries = uniqueEntries(current?.entries || [])
+  const key = entryKey(incoming)
+  const previous = priorEntries.find((entry) => entryKey(entry) === key)
+  const merged = cleanLicenseEntry({
+    ...previous,
+    ...incoming,
+    activationCode: incoming.activationCode || previous?.activationCode,
+    deviceCredential: preserveExistingCredentials
+      ? incoming.deviceCredential || previous?.deviceCredential
+      : incoming.deviceCredential,
+    deviceSession: preserveExistingCredentials
+      ? incoming.deviceSession || previous?.deviceSession
+      : incoming.deviceSession,
+    state: makeActive ? 'active' : incoming.state,
+    updatedAt: now
+  })
+  if (!merged) throw new Error('License vault entry is invalid.')
+  const entries = uniqueEntries([
+    merged,
+    ...priorEntries
+      .filter((entry) => entryKey(entry) !== key)
+      .map((entry) => makeActive && entry.state === 'active' ? { ...entry, state: 'unknown' as const } : entry)
+  ])
+  return withCompatibilityFields({
+    version: 3,
+    appName: current?.appName,
+    activeLicenseId: makeActive ? merged.licenseId : current?.activeLicenseId,
+    entries
+  })
+}
+
+export function markLicenseVaultEntry(
+  current: LicenseVaultContents,
+  licenseId: string,
+  state: LicenseVaultEntryState,
+  mergedIntoLicenseId?: string
+): LicenseVaultContents {
+  const cleanId = cleanSecret(licenseId, 256)
+  if (!cleanId) return current
+  const entries = uniqueEntries((current.entries || []).map((entry) => entry.licenseId === cleanId
+    ? {
+        ...entry,
+        state,
+        mergedIntoLicenseId: state === 'merged' ? cleanSecret(mergedIntoLicenseId, 256) : undefined,
+        updatedAt: new Date().toISOString()
+      }
+    : entry))
+  return withCompatibilityFields({ ...current, version: 3, entries })
+}
+
+export function licenseVaultRecoveryEntries(
+  current: LicenseVaultContents,
+  machineCode: string,
+  excludedLicenseId?: string
+): LicenseVaultEntry[] {
+  const machine = cleanMachineCode(machineCode)
+  if (!machine) return []
+  return uniqueEntries(current.entries || [])
+    .filter((entry) =>
+      entry.licenseId &&
+      entry.licenseId !== excludedLicenseId &&
+      entry.machineCode === machine &&
+      Boolean(entry.activationCode) &&
+      Boolean(entry.deviceCredential && entry.deviceSession) &&
+      entry.state !== 'merged' &&
+      entry.state !== 'unbound' &&
+      entry.state !== 'revoked'
+    )
+    .sort((left, right) => Date.parse(right.lastValidatedAt || right.updatedAt || '') - Date.parse(left.lastValidatedAt || left.updatedAt || ''))
 }
 
 export function clearLicenseVault(): void {
