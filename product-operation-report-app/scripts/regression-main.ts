@@ -4088,6 +4088,48 @@ async function testSourceCleaningFailureIsolation(): Promise<void> {
   assert.match(useStore.getState().messages.at(-1)?.text || '', /没有再启动新的资料/u)
 }
 
+async function testCleaningCheckpointPrecedesSummary(): Promise<void> {
+  let modelCalls = 0
+  ;(globalThis as typeof globalThis & { window: unknown }).window = {
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    api: {
+      lookupSourceCleanCache: async () => ({ hit: false }),
+      storeSourceCleanCache: async () => ({ stored: true }),
+      saveLastProject: async (project: SavedProject) => project,
+      recordCostOptimization: async () => true,
+      sendChat: () => {
+        modelCalls += 1
+        return { abort: () => undefined }
+      }
+    }
+  }
+  useStore.setState({
+    phase: 'idle',
+    sources: [{
+      id: 'local-profile',
+      name: '画像.csv',
+      kind: 'table',
+      text: '标签类型,标签,占比\n年龄,31-40,60%\n地区,广东,40%',
+      attribution: '自有数据'
+    }],
+    messages: [],
+    cleanedData: '',
+    cleanDetails: [],
+    artifacts: {},
+    reportMarkdown: '',
+    reportStale: false,
+    abortFn: null,
+    analysisSessionId: crypto.randomUUID()
+  })
+  await useStore.getState()._runCleaning(false)
+  assert.equal(modelCalls, 0, 'local structured cleaning reaches confirmation without a summary model call')
+  assert.equal(useStore.getState().phase, 'checkpoint1')
+  assert.match(useStore.getState().cleanedData, /^## 各来源清洗明细/mu)
+  assert.doesNotMatch(useStore.getState().cleanedData, /① 资料分类总览/u)
+  assert.equal(useStore.getState().cleanDetails[0]?.coverage?.mode, 'local_exact')
+}
+
 async function testParseFailureBlocksGeneration(): Promise<void> {
   let chatCalls = 0
   ;(globalThis as typeof globalThis & { window: unknown }).window = {
@@ -4507,7 +4549,10 @@ async function testWorkbenchTopbarContract(): Promise<void> {
   })
   topbarAuditWindow = window
   try {
-    await window.loadFile(htmlPath)
+    await Promise.race([
+      window.loadFile(htmlPath),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('topbar audit window load timed out')), 10_000))
+    ])
     await new Promise((resolveWait) => setTimeout(resolveWait, 60))
     const layout = (await window.webContents.executeJavaScript(
         `(() => {
@@ -5311,6 +5356,8 @@ async function run(): Promise<void> {
   await testZipExpansionGlobalCountGuard()
   console.log('Regression: one source failure preserves in-flight work and pauses new files')
   await testSourceCleaningFailureIsolation()
+  console.log('Regression: source cleaning reaches confirmation before paid summary work')
+  await testCleaningCheckpointPrecedesSummary()
   console.log('Regression: parse failures cannot be silently omitted from a report')
   await testParseFailureBlocksGeneration()
   console.log('Regression: privacy endpoint guard')

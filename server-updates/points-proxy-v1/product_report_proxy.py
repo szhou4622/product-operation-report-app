@@ -14,6 +14,7 @@ import hmac
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import sqlite3
@@ -72,6 +73,7 @@ TASK_OUTPUT_RESERVES = {
     "final_part": MAX_OUTPUT_TOKENS,
     "revision_part": MAX_OUTPUT_TOKENS,
 }
+STREAM_HEARTBEAT_SECONDS = 20.0
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?::fallback:[1-3])?$", re.I)
 SAFE_TEXT_RE = re.compile(r"^[\w.:-]{1,200}$", re.UNICODE)
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1130,6 +1132,42 @@ def merge_provider_usage(previous: dict[str, Any] | None, current: dict[str, Any
     }
 
 
+def provider_stream_items(upstream: Any, heartbeat_seconds: float = STREAM_HEARTBEAT_SECONDS):
+    """Read a blocking provider stream on a worker and emit privacy-safe heartbeats.
+
+    Only raw bytes and transient exceptions pass through this in-memory queue;
+    no prompt or model output is persisted by the proxy.
+    """
+    events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
+
+    def read_upstream() -> None:
+        try:
+            for raw_line in upstream:
+                events.put(("line", raw_line))
+        except BaseException as error:  # transferred back to the request thread
+            events.put(("error", error))
+        finally:
+            events.put(("done", None))
+
+    threading.Thread(target=read_upstream, name="por-provider-stream", daemon=True).start()
+    while True:
+        try:
+            kind, value = events.get(timeout=max(0.01, heartbeat_seconds))
+        except queue.Empty:
+            yield "heartbeat", b": heartbeat\n\n"
+            continue
+        if kind == "done":
+            return
+        if kind == "error":
+            raise value
+        yield kind, value
+
+
+def provider_stream_completed(saw_done: bool, finish_reason: str, usage: dict[str, Any] | None,
+                              sent_content: bool) -> bool:
+    return bool(sent_content and (saw_done or finish_reason == "stop" or usage))
+
+
 def mark_upstream_submitted(request_id: str) -> None:
     with database() as db:
         ensure_schema(db)
@@ -1322,6 +1360,8 @@ class Handler(BaseHTTPRequestHandler):
         sent_content = False
         client_open = True
         final_status = "failed"
+        saw_done = False
+        finish_reason = ""
         try:
             try:
                 upstream = open_provider_stream(provider_candidates, upstream_data, request_id)
@@ -1340,18 +1380,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache, no-store")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                for raw_line in upstream:
+                for item_type, raw_line in provider_stream_items(upstream):
+                    if item_type == "heartbeat":
+                        if client_open:
+                            try:
+                                self.wfile.write(raw_line)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                client_open = False
+                        continue
                     if len(raw_line) > 4 * 1024 * 1024:
                         raise ApiError(502, "模型服务返回单行内容过大。")
                     if raw_line.startswith(b"data:"):
                         data = raw_line[5:].strip()
-                        if data and data != b"[DONE]":
+                        if data == b"[DONE]":
+                            saw_done = True
+                        elif data:
                             try:
                                 event = as_object(json.loads(data.decode("utf-8", "replace")))
                                 usage = merge_provider_usage(usage, provider_usage(event))
                                 choices = event.get("choices")
                                 if isinstance(choices, list):
                                     for choice in choices:
+                                        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+                                            finish_reason = text(choice.get("finish_reason"), 80)
                                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                                         content = delta.get("content") if isinstance(delta, dict) else None
                                         if isinstance(content, str) and content:
@@ -1365,7 +1417,15 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             client_open = False
-                final_status = "success" if usage or sent_content else "failed"
+                completed = provider_stream_completed(saw_done, finish_reason, usage, sent_content)
+                if completed and not saw_done and client_open:
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        saw_done = True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        client_open = False
+                final_status = "success" if completed else "partial" if sent_content else "failed"
         except ApiError:
             if final_status == "failed" and (usage or sent_content):
                 final_status = "partial"

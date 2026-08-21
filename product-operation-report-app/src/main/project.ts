@@ -14,6 +14,7 @@ import {
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import type {
+  CleaningCoverage,
   ProjectCleanDetailSnapshot,
   ProjectMessageSnapshot,
   ProjectPhase,
@@ -356,12 +357,29 @@ function sanitizeMessage(value: unknown): ProjectMessageSnapshot | null {
   return message
 }
 
+function sanitizeCleaningCoverage(value: unknown): CleaningCoverage | undefined {
+  if (!isPlainObject(value) || (value.mode !== 'local_exact' && value.mode !== 'model_batches')) return undefined
+  const nonnegative = (input: unknown): number | undefined =>
+    typeof input === 'number' && Number.isSafeInteger(input) && input >= 0 ? input : undefined
+  const batchCount = nonnegative(value.batchCount)
+  if (batchCount === undefined) return undefined
+  return {
+    mode: value.mode,
+    recordCount: nonnegative(value.recordCount),
+    pageCount: nonnegative(value.pageCount),
+    imageCount: nonnegative(value.imageCount),
+    batchCount,
+    verifiedAt: optionalString(value.verifiedAt) || new Date().toISOString()
+  }
+}
+
 function sanitizeCleanDetail(value: unknown): ProjectCleanDetailSnapshot | null {
   if (!isPlainObject(value)) return null
   return {
     id: asString(value.id),
     name: asString(value.name),
-    text: asString(value.text)
+    text: asString(value.text),
+    coverage: sanitizeCleaningCoverage(value.coverage)
   }
 }
 
@@ -390,6 +408,7 @@ function sanitizeTaskJournal(value: unknown): Record<string, ProjectTaskSnapshot
       kind: raw.kind as ProjectTaskSnapshot['kind'],
       status: raw.status as ProjectTaskSnapshot['status'],
       output: optionalString(raw.output),
+      coverage: sanitizeCleaningCoverage(raw.coverage),
       updatedAt: optionalString(raw.updatedAt) || new Date().toISOString()
     }
   }

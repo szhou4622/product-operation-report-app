@@ -268,13 +268,21 @@ export function buildExtractMessages(
           ? `原文件有效记录 ${batch.originalRecordCount} 条，系统已安排清洗 ${batch.scheduledRecordCount ?? batch.originalRecordCount} 条。`
           : `原始抽取文本 ${batch.originalTextChars.toLocaleString('zh-CN')} 字符。`,
         batch.recordStart !== undefined && batch.recordEnd !== undefined
-          ? `本批覆盖原文件第 ${batch.recordStart}—${batch.recordEnd} 条记录，必须逐条输出，不得只做抽样或合并为产品种类。`
+          ? batch.mode === 'semantic_rows'
+            ? `本批覆盖原文件第 ${batch.recordStart}—${batch.recordEnd} 条记录；每一条都必须阅读，但不要逐行复写。请归纳全部不同主题、共性、差异、长尾异常和可执行信息。`
+            : `本批覆盖原文件第 ${batch.recordStart}—${batch.recordEnd} 条记录，必须逐条输出，不得只做抽样或合并为产品种类。`
           : '本批全部文本都必须进入清洗结果。',
         batch.isMaterialTable
           ? '素材数量必须按“原视频/有效数据行”统计，不能按 SKU、产品种类或人群数量统计。原视频文件名和3秒开头原文必须保留。'
           : '',
         batch.mode === 'table_rows'
           ? '【完整性规则】清洗后内容必须输出为 CSV 表格，第一列固定为 __证据ID；逐行原样回填输入首列中的证据ID，不得改写、合并、集中抄写或跳行。每个ID只能对应一条有实际内容的数据行。'
+          : batch.mode === 'semantic_rows'
+            ? [
+                '【语义表输出】输出简洁Markdown，不要复写整张表。覆盖本批全部记录，列出主题、购买理由、反对理由、异常/少数意见、素材结构或其他与文件字段对应的结论。',
+                '每条结论引用1—5个输入中真实存在的POR-R证据ID；不得编造ID。',
+                `最后单独一行原样输出：COVERAGE:${batch.coverageReceipt}`
+              ].join('\n')
           : `【完整性回执】本批必须在对应内容段落中原样保留证据ID：${batch.evidenceIds.join('、')}。缺少时软件会只重试本批，不能标记为完成。`
       ].filter(Boolean).join('\n')
     : ''

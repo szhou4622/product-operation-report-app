@@ -20,6 +20,8 @@ export interface SourceCleanBatchContext {
   originalTextChars: number
   /** Deterministic IDs that must be echoed by the cleaning result. */
   evidenceIds: string[]
+  /** Compact receipt used when every row is sent but the model must not copy every row back. */
+  coverageReceipt?: string
   mode: SourceCleanBatchPlan['mode']
 }
 
@@ -29,7 +31,7 @@ export interface SourceCleanBatch {
 }
 
 export interface SourceCleanBatchPlan {
-  mode: 'single' | 'table_rows' | 'text_chunks' | 'mixed_evidence'
+  mode: 'single' | 'table_rows' | 'semantic_rows' | 'text_chunks' | 'mixed_evidence'
   batches: SourceCleanBatch[]
   originalRecordCount?: number
   scheduledRecordCount?: number
@@ -215,7 +217,8 @@ function tablePieces(
 
 function tableBatchPlan(
   source: SourceCleanCacheInput,
-  text: string
+  text: string,
+  semanticSummary = false
 ): { plan: SourceCleanBatchPlan | null; degradedReason?: TableDegradedReason } {
   const blocks = workbookBlocks(text)
   const pieces: TablePiece[] = []
@@ -245,11 +248,14 @@ function tableBatchPlan(
       isMaterialTable: material,
       originalTextChars: text.length,
       evidenceIds: piece.evidenceIds,
-      mode: 'table_rows' as const
+      coverageReceipt: semanticSummary
+        ? `POR-B-${sourceEvidenceScope(source)}-${String(index + 1).padStart(4, '0')}|ROWS:${piece.recordStart}-${piece.recordEnd}|COUNT:${piece.evidenceIds.length}`
+        : undefined,
+      mode: semanticSummary ? 'semantic_rows' as const : 'table_rows' as const
     }
   }))
   return { plan: {
-    mode: 'table_rows',
+    mode: semanticSummary ? 'semantic_rows' : 'table_rows',
     batches,
     originalRecordCount: recordOffset,
     scheduledRecordCount: recordOffset,
@@ -258,7 +264,10 @@ function tableBatchPlan(
   } }
 }
 
-function buildTextSourceCleanBatchPlan(input: SourceCleanCacheInput): SourceCleanBatchPlan {
+function buildTextSourceCleanBatchPlan(
+  input: SourceCleanCacheInput,
+  options: { semanticSummary?: boolean } = {}
+): SourceCleanBatchPlan {
   const source: SourceCleanCacheInput = { ...input, attachments: undefined }
   const text = source.text || ''
   const scope = sourceEvidenceScope(source)
@@ -281,7 +290,7 @@ function buildTextSourceCleanBatchPlan(input: SourceCleanCacheInput): SourceClea
     }
   }
   if (source.kind === 'table') {
-    const table = tableBatchPlan(source, text)
+    const table = tableBatchPlan(source, text, Boolean(options.semanticSummary))
     if (table.plan) return table.plan
     const parts = splitCompleteText(text)
     const mode = parts.length > 1 ? 'text_chunks' : 'single'
@@ -323,8 +332,11 @@ function buildTextSourceCleanBatchPlan(input: SourceCleanCacheInput): SourceClea
   }
 }
 
-export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): SourceCleanBatchPlan {
-  const base = buildTextSourceCleanBatchPlan(source)
+export function buildSourceCleanBatchPlan(
+  source: SourceCleanCacheInput,
+  options: { semanticSummary?: boolean } = {}
+): SourceCleanBatchPlan {
+  const base = buildTextSourceCleanBatchPlan(source, options)
   const attachments = (source.attachments || []).filter(
     (item): item is typeof item & { dataUrl: string } => Boolean(item.dataUrl)
   )
@@ -381,7 +393,7 @@ export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outpu
       `\u6e05\u6d17\u7ed3\u679c\u672a\u8986\u76d6 ${missing.length} \u4e2a\u8bc1\u636e\u5355\u5143\uff08${preview}${missing.length > 8 ? '\u7b49' : ''}\uff09\uff0c\u672c\u6587\u4ef6\u4e0d\u80fd\u6807\u8bb0\u4e3a\u5df2\u5b8c\u6210\u3002`
     )
   }
-  const coverage = plan.mode === 'table_rows'
+  const coverage = plan.mode === 'table_rows' || plan.mode === 'semantic_rows'
     ? [
         '## \u7cfb\u7edf\u5b8c\u6574\u6027\u6838\u5bf9',
         `- \u539f\u59cb\u6709\u6548\u8bb0\u5f55\uff1a${plan.originalRecordCount || 0} \u6761`,
@@ -389,8 +401,12 @@ export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outpu
         `- \u52a8\u6001\u6e05\u6d17\u6279\u6b21\uff1a${plan.batches.length} \u6279`,
         ...(plan.isMaterialTable
           ? [`- \u5df2\u8986\u76d6\u7d20\u6750\u6570\u91cf\uff1a${plan.scheduledRecordCount || 0} \u6761\uff08\u6309\u539f\u89c6\u9891/\u6709\u6548\u6570\u636e\u884c\u8ba1\u6570\uff0c\u4e0d\u6309\u4ea7\u54c1\u79cd\u7c7b\u8ba1\u6570\uff09`] : []),
-        `- \u6a21\u578b\u8fd4\u56de\u8986\u76d6\uff1a${plan.batches.flatMap((batch) => batch.context.evidenceIds).length} \u4e2a\u8bc1\u636eID\u5747\u5df2\u901a\u8fc7\u7a0b\u5e8f\u6838\u5bf9\u3002`,
-        '- \u5b8c\u6574\u6027\u7ed3\u8bba\uff1a\u5168\u90e8\u6709\u6548\u8bb0\u5f55\u5747\u5df2\u9001\u5165\u6e05\u6d17\u4e14\u8fd4\u56de\u8986\u76d6\u8bc1\u636eID\uff0c\u672a\u505a\u62bd\u6837\u6216\u56fa\u5b9a\u6761\u6570\u622a\u65ad\u3002'
+        plan.mode === 'semantic_rows'
+          ? `- 模型输入覆盖：${plan.scheduledRecordCount || 0} 条记录全部进入语义批次；${plan.batches.length} 个批次回执均已核对。`
+          : `- \u6a21\u578b\u8fd4\u56de\u8986\u76d6\uff1a${plan.batches.flatMap((batch) => batch.context.evidenceIds).length} \u4e2a\u8bc1\u636eID\u5747\u5df2\u901a\u8fc7\u7a0b\u5e8f\u6838\u5bf9\u3002`,
+        plan.mode === 'semantic_rows'
+          ? '- 完整性结论：全部有效记录均已送入模型读取；输出只保留批次结论和有效来源锚点，不逐行复写原表。'
+          : '- \u5b8c\u6574\u6027\u7ed3\u8bba\uff1a\u5168\u90e8\u6709\u6548\u8bb0\u5f55\u5747\u5df2\u9001\u5165\u6e05\u6d17\u4e14\u8fd4\u56de\u8986\u76d6\u8bc1\u636eID\uff0c\u672a\u505a\u62bd\u6837\u6216\u56fa\u5b9a\u6761\u6570\u622a\u65ad\u3002'
       ].join('\n')
     : [
         '## \u7cfb\u7edf\u5b8c\u6574\u6027\u6838\u5bf9',
@@ -413,6 +429,13 @@ export function missingSourceCleanEvidenceIds(
   output: string,
   mode: SourceCleanBatchPlan['mode']
 ): string[] {
+  if (mode === 'semantic_rows') {
+    const receipt = context.coverageReceipt
+    if (!receipt || !output.includes(`COVERAGE:${receipt}`)) return receipt ? [receipt] : [...context.evidenceIds]
+    const cited = [...output.matchAll(/POR-R-[A-F0-9]{8}-\d{6}/gu)].map((match) => match[0])
+    const allowed = new Set(context.evidenceIds)
+    return cited.some((id) => !allowed.has(id)) ? [receipt] : []
+  }
   if (mode !== 'table_rows') return context.evidenceIds.filter((id) => !output.includes(id))
   if (output.length > 2_048) {
     const offsets = context.evidenceIds.map((id) => output.indexOf(id)).filter((offset) => offset >= 0)

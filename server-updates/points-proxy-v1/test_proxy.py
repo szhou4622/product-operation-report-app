@@ -6,6 +6,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -71,6 +72,19 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(row["c"], 1)
         self.assertEqual(row["description"], "资料汇总")
         self.assertEqual(wallet["locked_milli"], 0)
+
+    def test_stream_heartbeat_and_safe_completion_without_provider_done(self) -> None:
+        class SlowStream:
+            def __iter__(self):
+                time.sleep(0.03)
+                yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+
+        items = list(proxy.provider_stream_items(SlowStream(), heartbeat_seconds=0.005))
+        self.assertTrue(any(kind == "heartbeat" for kind, _value in items))
+        self.assertTrue(any(kind == "line" for kind, _value in items))
+        self.assertTrue(proxy.provider_stream_completed(False, "stop", None, True))
+        self.assertTrue(proxy.provider_stream_completed(False, "", {"input_tokens": 1}, True))
+        self.assertFalse(proxy.provider_stream_completed(False, "", None, True))
 
     def test_session_refresh_replaces_stale_proxy_balance_with_license_balance(self) -> None:
         payload = {

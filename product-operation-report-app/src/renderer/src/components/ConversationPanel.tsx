@@ -440,6 +440,34 @@ export default function ConversationPanel(): JSX.Element {
                     : `正在清洗：${cleaningProgress.running.join('、')}`}
                 </div>
               )}
+              {cleaningProgress.plan && (
+                <details className="cleaning-plan-summary">
+                  <summary>
+                    本机处理 {cleaningProgress.plan.localFileCount} 份 · AI理解 {cleaningProgress.plan.modelFileCount} 份 · 预计 {cleaningProgress.plan.expectedModelJobs} 个AI任务
+                  </summary>
+                  <div className="cleaning-plan-files">
+                    {Object.entries(cleaningProgress.files).map(([id, file]) => {
+                      const method = file.method === 'local_exact'
+                        ? '本机'
+                        : file.method === 'model_vision'
+                          ? '图片识别'
+                          : file.method === 'model_semantic'
+                            ? 'AI理解'
+                            : '不可用'
+                      const status = file.status === 'complete'
+                        ? '已完成'
+                        : file.status === 'failed'
+                          ? '待重试'
+                          : file.status === 'running'
+                            ? `处理中 ${file.doneJobs}/${file.totalJobs}`
+                            : file.status === 'not_started'
+                              ? '尚未启动'
+                              : '等待中'
+                      return <div key={id}><span>{file.name}</span><em>{method} · {status}</em></div>
+                    })}
+                  </div>
+                </details>
+              )}
             </div>
           )}
         </div>

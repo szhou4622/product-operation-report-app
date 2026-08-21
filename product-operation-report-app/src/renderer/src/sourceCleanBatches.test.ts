@@ -37,6 +37,22 @@ describe('row-anchored source cleaning coverage', () => {
     expect(() => combineSourceCleanBatchOutputs(plan, outputs)).toThrow(/未覆盖/u)
   })
 
+  it('accepts compact semantic coverage receipts without requiring the model to copy every row', () => {
+    const text = [
+      '评价内容,评分',
+      ...Array.from({ length: 400 }, (_, index) => [`第${index + 1}条-${'使用体验'.repeat(16)}`, String(index % 5 + 1)])
+    ].map((row) => Array.isArray(row) ? row.join(',') : row).join('\n')
+    const plan = buildSourceCleanBatchPlan({ name: '评价.csv', kind: 'table', text }, { semanticSummary: true })
+    const outputs = plan.batches.map((batch) => [
+      '分类：自有数据 | 平台 | 用户评价 | 时间待补充 | 表格 | 评价主题',
+      `- 本批主要反馈见 ${batch.context.evidenceIds[0]}`,
+      `COVERAGE:${batch.context.coverageReceipt}`
+    ].join('\n'))
+    const combined = combineSourceCleanBatchOutputs(plan, outputs)
+    expect(combined).toContain('全部有效记录均已送入模型读取')
+    expect(combined).not.toContain(plan.batches[0].context.evidenceIds[1])
+  })
+
   it('reports why an ultra-wide table cannot use row verification', () => {
     const text = Papa.unparse([
       Array.from({ length: 201 }, (_, index) => `列${index}`),

@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type {
   AppSettings,
   CostOptimizationEvent,
+  CleaningCoverage,
   ProjectCleanDetailSnapshot,
   ReportResultCacheInput,
   ReportResultCacheLookupResult,
@@ -36,6 +37,11 @@ import { friendlyError } from './store/errors'
 import { buildProjectSnapshot } from './store/persistence'
 import { mergeRevisionParts, runFinalReportInParts, runModelRetry, selectRevisionParts } from './store/analysis'
 import { isTemporaryReservationContention, planCleaningConcurrency } from './store/cleaning'
+import {
+  buildCleaningPlan,
+  type CleaningMethod,
+  type CleaningPlan
+} from './cleaningPlan'
 
 export { friendlyError } from './store/errors'
 export { buildProjectSnapshot } from './store/persistence'
@@ -160,7 +166,7 @@ export function evidenceScopeStats(
   )
   const records = cleanDetails.reduce((sum, detail) => {
     const match = detail.text.match(/原始有效记录[：:]\s*(\d+)\s*条/u) ||
-      detail.text.match(/逐行生成并核对\s*(\d+)\s*个/u)
+      detail.text.match(/逐行生成(?:并核对)?\s*(\d+)\s*个/u)
     return sum + (match ? Number(match[1]) : 0)
   }, 0)
   return { worksheets, pages, images, records }
@@ -198,9 +204,17 @@ export interface CleaningProgress {
   running: string[]
   failed: number
   startedAt?: number
+  plan?: CleaningPlan
+  files: Record<string, {
+    name: string
+    method: CleaningMethod
+    status: 'waiting' | 'running' | 'complete' | 'failed' | 'not_started'
+    doneJobs: number
+    totalJobs: number
+  }>
 }
 
-const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0 })
+const emptyCleaningProgress = (): CleaningProgress => ({ total: 0, done: 0, running: [], failed: 0, files: {} })
 const isRunningPhase = (phase: Phase): boolean => phase === 'cleaning' || phase === 'analyzing'
 
 function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
@@ -712,7 +726,7 @@ interface StoreState {
   phase: Phase
   messages: ChatMsg[]
   cleanedData: string
-  cleanDetails: { id: string; name: string; text: string }[]
+  cleanDetails: ProjectCleanDetailSnapshot[]
   artifacts: Record<number, string>
   taskJournal: Record<string, ProjectTaskSnapshot>
   reportMarkdown: string
@@ -1608,14 +1622,38 @@ export const useStore = create<StoreState>((set, get) => ({
     // 丢掉已删除文件的旧明细；只抽取还没处理过的文件（支持中断续跑 / 补传后只洗新文件）
     set((st) => ({ cleanDetails: st.cleanDetails.filter((d) => usableIds.has(d.id)) }))
     const doneIds = new Set(get().cleanDetails.map((d) => d.id))
-    const todo = usable.filter((s) => !doneIds.has(s.id))
+    const initialTodo = usable.filter((s) => !doneIds.has(s.id))
+    const cleaningPlan = buildCleaningPlan(initialTodo.map((source) => ({
+      ...toSourceCleanCacheInput(source),
+      id: source.id,
+      error: source.error
+    })))
+    const planBySource = new Map(cleaningPlan.entries.map((entry) => [entry.sourceId, entry]))
+    const methodRank: Record<CleaningMethod, number> = {
+      local_exact: 0,
+      model_semantic: 1,
+      model_vision: 2,
+      unsupported: 3
+    }
+    const todo = [...initialTodo].sort((left, right) =>
+      methodRank[planBySource.get(left.id)?.method || 'unsupported'] -
+      methodRank[planBySource.get(right.id)?.method || 'unsupported']
+    )
     set({
       cleaningProgress: {
         total: todo.length,
         done: 0,
         running: [],
         failed: 0,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        plan: cleaningPlan,
+        files: Object.fromEntries(cleaningPlan.entries.map((entry) => [entry.sourceId, {
+          name: entry.sourceName,
+          method: entry.method,
+          status: 'waiting' as const,
+          doneJobs: 0,
+          totalJobs: Math.max(1, entry.jobs.length)
+        }]))
       }
     })
 
@@ -1624,13 +1662,21 @@ export const useStore = create<StoreState>((set, get) => ({
       const conc = concurrencyPlan.sourceWorkers
       get()._post(
         'assistant',
-        `${isRerun ? '补充' : '开始'}清洗 ${todo.length} 份资料（并发 ${conc} 个，更快）……`,
+        `${isRerun ? '补充' : '开始'}处理 ${todo.length} 份资料：本机 ${cleaningPlan.localFileCount} 份，AI理解 ${cleaningPlan.modelFileCount} 份，预计 ${cleaningPlan.expectedModelJobs} 个AI任务（并发不超过 ${MAX_CLEANING_CONCURRENCY} 个）。`,
         'narration'
       )
+      if (cleaningPlan.oversizedFiles.length) {
+        get()._post(
+          'assistant',
+          `⚠️ 以下文件内容很多，预计超过20个语义批次，将按断点任务逐批处理：${cleaningPlan.oversizedFiles.slice(0, 3).join('、')}`,
+          'narration'
+        )
+      }
 
       const aborts = new Set<() => void>()
       let cancelled = false
       let pauseAfterFailure = false
+      let activeVisionSources = 0
       const failures: Array<{ name: string; error: string }> = []
       set({ abortFn: () => { cancelled = true; aborts.forEach((fn) => fn()) } })
 
@@ -1640,10 +1686,24 @@ export const useStore = create<StoreState>((set, get) => ({
           const i = next++
           if (i >= todo.length) return
           const s = todo[i]
+          const planned = planBySource.get(s.id)
+          let visionSlot = false
+          if (planned?.method === 'model_vision') {
+            while (!cancelled && !pauseAfterFailure && activeVisionSources >= 2) {
+              await new Promise<void>((resolve) => window.setTimeout(resolve, 100))
+            }
+            if (cancelled || pauseAfterFailure) return
+            activeVisionSources += 1
+            visionSlot = true
+          }
           set((st) => ({
             cleaningProgress: {
               ...st.cleaningProgress,
-              running: [...st.cleaningProgress.running, s.name].slice(0, 4)
+              running: [...st.cleaningProgress.running, s.name].slice(0, 4),
+              files: {
+                ...st.cleaningProgress.files,
+                [s.id]: { ...st.cleaningProgress.files[s.id], status: 'running' }
+              }
             }
           }))
           get()._post('assistant', `⏳ 清洗：${s.name}`, 'narration')
@@ -1658,7 +1718,11 @@ export const useStore = create<StoreState>((set, get) => ({
                   cleaningProgress: {
                     ...st.cleaningProgress,
                     done: st.cleaningProgress.done + 1,
-                    running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                    running: st.cleaningProgress.running.filter((name) => name !== s.name),
+                    files: {
+                      ...st.cleaningProgress.files,
+                      [s.id]: { ...st.cleaningProgress.files[s.id], status: 'complete', doneJobs: st.cleaningProgress.files[s.id]?.totalJobs || 1 }
+                    }
                   }
                 }))
                 get()._post('assistant', `♻️ 已复用本机清洗结果：${s.name}`, 'narration')
@@ -1679,9 +1743,17 @@ export const useStore = create<StoreState>((set, get) => ({
               if (localResult.applied && localResult.text.trim()) {
                 modelCleanInput = { ...cacheInput, text: localResult.text }
               }
-              const localDetail = buildLocalTableCleanDetail(cacheInput, localResult)
+              const localDetail = planned?.method === 'local_exact'
+                ? buildLocalTableCleanDetail(cacheInput, localResult)
+                : null
               if (localDetail) {
-                set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: localDetail }] }))
+                const coverage: CleaningCoverage = {
+                  mode: 'local_exact',
+                  recordCount: localResult.retainedRows,
+                  batchCount: 0,
+                  verifiedAt: new Date().toISOString()
+                }
+                set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: localDetail, coverage }] }))
                 try {
                   await window.api.storeSourceCleanCache(cacheInput, localDetail)
                 } catch {
@@ -1691,7 +1763,11 @@ export const useStore = create<StoreState>((set, get) => ({
                   cleaningProgress: {
                     ...st.cleaningProgress,
                     done: st.cleaningProgress.done + 1,
-                    running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                    running: st.cleaningProgress.running.filter((name) => name !== s.name),
+                    files: {
+                      ...st.cleaningProgress.files,
+                      [s.id]: { ...st.cleaningProgress.files[s.id], status: 'complete', doneJobs: st.cleaningProgress.files[s.id]?.totalJobs || 1 }
+                    }
                   }
                 }))
                 get()._post(
@@ -1708,7 +1784,9 @@ export const useStore = create<StoreState>((set, get) => ({
                 continue
               }
             }
-            const batchPlan = buildSourceCleanBatchPlan(modelCleanInput)
+            const batchPlan = buildSourceCleanBatchPlan(modelCleanInput, {
+              semanticSummary: planned?.method === 'model_semantic' && s.kind === 'table'
+            })
             if (batchPlan.degradedReason) {
               const reason = batchPlan.degradedReason === 'quotes'
                 ? '引号未闭合'
@@ -1722,10 +1800,9 @@ export const useStore = create<StoreState>((set, get) => ({
               get()._post('assistant', `⚠️ ${s.name}：${warning}`, 'narration')
             }
             const batchOutputs: Array<string | undefined> = new Array(batchPlan.batches.length)
-            const perSourceBatchConcurrency = Math.min(
-              batchPlan.batches.length,
-              concurrencyPlan.batchWorkersPerSource
-            )
+            const perSourceBatchConcurrency = planned?.method === 'model_vision'
+              ? 1
+              : Math.min(batchPlan.batches.length, concurrencyPlan.batchWorkersPerSource)
             if (batchPlan.batches.length > 1 && perSourceBatchConcurrency > 1) {
               get()._post(
                 'assistant',
@@ -1744,7 +1821,11 @@ export const useStore = create<StoreState>((set, get) => ({
                 cleaningProgress: {
                   ...state.cleaningProgress,
                   running: state.cleaningProgress.running.filter((name) => name !== s.name),
-                  failed: state.cleaningProgress.failed + 1
+                  failed: state.cleaningProgress.failed + 1,
+                  files: {
+                    ...state.cleaningProgress.files,
+                    [s.id]: { ...state.cleaningProgress.files[s.id], status: 'failed' }
+                  }
                 }
               }))
             }
@@ -1785,17 +1866,35 @@ export const useStore = create<StoreState>((set, get) => ({
                 const batchPosition = nextBatch++
                 if (batchPosition >= batchPlan.batches.length) return
                 const batch = batchPlan.batches[batchPosition]
-                if (batchPlan.batches.length > 1) {
+                if (
+                  batchPlan.batches.length > 1 &&
+                  (batch.context.batchIndex === 1 || batch.context.batchIndex === batch.context.batchCount || batch.context.batchIndex % 5 === 0)
+                ) {
                   get()._post(
                     'assistant',
                     `正在清洗「${s.name}」第 ${batch.context.batchIndex}/${batch.context.batchCount} 批……`,
                     'narration'
                   )
                 }
-                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v6-record-capped:${batch.context.batchIndex}`
+                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v7-planned:${batch.context.batchIndex}`
                 const savedBatch = get().taskJournal[batchTaskId]
                 if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
                   batchOutputs[batchPosition] = savedBatch.output
+                  set((state) => ({
+                    cleaningProgress: {
+                      ...state.cleaningProgress,
+                      files: {
+                        ...state.cleaningProgress.files,
+                        [s.id]: {
+                          ...state.cleaningProgress.files[s.id],
+                          doneJobs: Math.min(
+                            state.cleaningProgress.files[s.id]?.totalJobs || batchPlan.batches.length,
+                            (state.cleaningProgress.files[s.id]?.doneJobs || 0) + 1
+                          )
+                        }
+                      }
+                    }
+                  }))
                   continue
                 }
                 const res = await runWithReservationBackpressure(
@@ -1813,7 +1912,7 @@ export const useStore = create<StoreState>((set, get) => ({
                       taskType: 'source_clean',
                       taskKey: batchTaskId,
                       billingRequestId: batchTaskId,
-                      isVision: s.kind === 'image' || Boolean(batch.source.attachments?.length),
+                      isVision: planned?.method === 'model_vision',
                       sourceCount,
                       imageCount,
                       sourceId: s.id,
@@ -1853,7 +1952,7 @@ export const useStore = create<StoreState>((set, get) => ({
                         taskType: 'source_clean',
                         taskKey: repairTaskId,
                         billingRequestId: repairTaskId,
-                        isVision: s.kind === 'image' || Boolean(batch.source.attachments?.length),
+                        isVision: planned?.method === 'model_vision',
                         sourceCount,
                         imageCount,
                         sourceId: s.id,
@@ -1877,6 +1976,19 @@ export const useStore = create<StoreState>((set, get) => ({
                       output: verifiedText,
                       updatedAt: new Date().toISOString()
                     }
+                  },
+                  cleaningProgress: {
+                    ...state.cleaningProgress,
+                    files: {
+                      ...state.cleaningProgress.files,
+                      [s.id]: {
+                        ...state.cleaningProgress.files[s.id],
+                        doneJobs: Math.min(
+                          state.cleaningProgress.files[s.id]?.totalJobs || batchPlan.batches.length,
+                          (state.cleaningProgress.files[s.id]?.doneJobs || 0) + 1
+                        )
+                      }
+                    }
                   }
                 }))
                 scheduleCleaningCheckpointSave(get)
@@ -1889,7 +2001,16 @@ export const useStore = create<StoreState>((set, get) => ({
               batchOutputs.filter((output) => Boolean(output?.trim())).length !== batchPlan.batches.length
             ) continue
             const cleanText = combineSourceCleanBatchOutputs(batchPlan, batchOutputs as string[])
-            set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cleanText }] }))
+            const coverage: CleaningCoverage = {
+              mode: 'model_batches',
+              recordCount: batchPlan.scheduledRecordCount,
+              imageCount: planned?.method === 'model_vision'
+                ? batchPlan.batches.reduce((sum, batch) => sum + (batch.source.dataUrl ? 1 : 0) + (batch.source.attachments?.length || 0), 0)
+                : undefined,
+              batchCount: batchPlan.batches.length,
+              verifiedAt: new Date().toISOString()
+            }
+            set((st) => ({ cleanDetails: [...st.cleanDetails, { id: s.id, name: s.name, text: cleanText, coverage }] }))
             try {
               await window.api.storeSourceCleanCache(cacheInput, cleanText)
             } catch {
@@ -1899,12 +2020,16 @@ export const useStore = create<StoreState>((set, get) => ({
               cleaningProgress: {
                 ...st.cleaningProgress,
                 done: st.cleaningProgress.done + 1,
-                running: st.cleaningProgress.running.filter((name) => name !== s.name)
+                running: st.cleaningProgress.running.filter((name) => name !== s.name),
+                files: {
+                  ...st.cleaningProgress.files,
+                  [s.id]: { ...st.cleaningProgress.files[s.id], status: 'complete', doneJobs: st.cleaningProgress.files[s.id]?.totalJobs || batchPlan.batches.length }
+                }
               }
             }))
             get()._post(
               'assistant',
-              batchPlan.mode === 'table_rows' && batchPlan.originalRecordCount !== undefined
+              (batchPlan.mode === 'table_rows' || batchPlan.mode === 'semantic_rows') && batchPlan.originalRecordCount !== undefined
                 ? `✅ 已清洗：${s.name}（${batchPlan.originalRecordCount} 条记录，${batchPlan.batches.length} 批全部完成）`
                 : `✅ 已清洗：${s.name}（${batchPlan.batches.length} 批全部完成）`,
               'narration'
@@ -1916,9 +2041,15 @@ export const useStore = create<StoreState>((set, get) => ({
               cleaningProgress: {
                 ...st.cleaningProgress,
                 running: st.cleaningProgress.running.filter((name) => name !== s.name),
-                failed: st.cleaningProgress.failed + 1
+                failed: st.cleaningProgress.failed + 1,
+                files: {
+                  ...st.cleaningProgress.files,
+                  [s.id]: { ...st.cleaningProgress.files[s.id], status: 'failed' }
+                }
               }
             }))
+          } finally {
+            if (visionSlot) activeVisionSources = Math.max(0, activeVisionSources - 1)
           }
         }
       }
@@ -1938,6 +2069,15 @@ export const useStore = create<StoreState>((set, get) => ({
         return
       }
       if (failures.length) {
+        set((state) => ({
+          cleaningProgress: {
+            ...state.cleaningProgress,
+            files: Object.fromEntries(Object.entries(state.cleaningProgress.files).map(([id, file]) => [
+              id,
+              file.status === 'waiting' ? { ...file, status: 'not_started' as const } : file
+            ]))
+          }
+        }))
         const preview = failures
           .slice(0, 3)
           .map((failure) => `「${failure.name}」：${failure.error}`)
@@ -1953,143 +2093,16 @@ export const useStore = create<StoreState>((set, get) => ({
       }
     }
 
-    // 汇总：所有清洗批次先分组参与中间汇总，再统一合并；不再对超大文件只抽首中尾。
-    const details = get().cleanDetails.map((d) => ({ name: d.name, text: d.text }))
-    const summaryGroups = planSummaryDetailGroups(details)
-    get()._post(
-      'assistant',
-      summaryGroups.length > 1
-        ? `清洗明细较多，正在分 ${summaryGroups.length} 组完整汇总，确保每个批次都进入分析……`
-        : '正在汇总「① 资料分类总览」…',
-      'narration'
-    )
-    const blockId = get()._post('assistant', '', 'report-block')
-    const partialSummaries: string[] = []
-    for (let index = 0; index < summaryGroups.length; index++) {
-      const groupNumber = index + 1
-      if (summaryGroups.length > 1) {
-        get()._post('assistant', `正在汇总第 ${groupNumber}/${summaryGroups.length} 组清洗证据……`, 'narration')
-      }
-      const groupTaskId = `${sessionId}:summary:group-v2:${groupNumber}`
-      const savedGroup = get().taskJournal[groupTaskId]
-      if (savedGroup?.status === 'complete' && savedGroup.output?.trim()) {
-        partialSummaries.push(savedGroup.output)
-        if (summaryGroups.length === 1) get()._update(blockId, savedGroup.output)
-        continue
-      }
-      const groupResult = await runModelRetry(
-        buildSummaryGroupMessages(summaryGroups[index], groupNumber, summaryGroups.length, get().steering),
-        (acc) => {
-          if (isCurrentSession() && summaryGroups.length === 1) get()._update(blockId, acc)
-        },
-        (fn) => {
-          if (isCurrentSession()) set({ abortFn: fn })
-        },
-        (n) => {
-          if (isCurrentSession()) get()._post('assistant', `第 ${groupNumber} 组汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
-        },
-        1,
-        {
-          reportSessionId: sessionId,
-          taskType: 'summary',
-          taskKey: groupTaskId,
-          billingRequestId: groupTaskId,
-          isVision: false,
-          sourceCount,
-          imageCount,
-          stepId: `group-${groupNumber}-of-${summaryGroups.length}`
-        }
-      )
-      if (!isCurrentSession()) return
-      if (!groupResult.ok || !groupResult.text.trim()) {
-        get()._update(blockId, `${partialSummaries.join('\n\n')}\n\n⚠️ 第 ${groupNumber} 组汇总失败：${groupResult.error || '模型没有返回内容'}`.trim())
-        set({ phase: get().cleanedData ? 'checkpoint1' : 'idle', abortFn: null })
-        return
-      }
-      partialSummaries.push(groupResult.text)
-      set((state) => ({
-        taskJournal: {
-          ...state.taskJournal,
-          [groupTaskId]: {
-            kind: 'summary',
-            status: 'complete',
-            output: groupResult.text,
-            updatedAt: new Date().toISOString()
-          }
-        }
-      }))
-      await window.api.saveLastProject(buildProjectSnapshot(get()))
-    }
-
-    let summaryText = partialSummaries[0] || ''
-    if (partialSummaries.length > 1) {
-      get()._post('assistant', '所有清洗批次均已进入中间汇总，正在合并最终资料总览……', 'narration')
-      const mergeTaskId = `${sessionId}:summary:merge-v2`
-      const savedMerge = get().taskJournal[mergeTaskId]
-      if (savedMerge?.status === 'complete' && savedMerge.output?.trim()) {
-        summaryText = savedMerge.output
-        get()._update(blockId, savedMerge.output)
-      } else {
-      const mergeResult = await runModelRetry(
-        buildSummaryMergeMessages(partialSummaries, get().steering),
-        (acc) => {
-          if (isCurrentSession()) get()._update(blockId, acc)
-        },
-        (fn) => {
-          if (isCurrentSession()) set({ abortFn: fn })
-        },
-        (n) => {
-          if (isCurrentSession()) get()._post('assistant', `最终汇总连接中断，正在重试（第 ${n} 次）…`, 'narration')
-        },
-        1,
-        {
-          reportSessionId: sessionId,
-          taskType: 'summary',
-          taskKey: mergeTaskId,
-          billingRequestId: mergeTaskId,
-          isVision: false,
-          sourceCount,
-          imageCount,
-          stepId: 'merge-all-groups'
-        }
-      )
-      if (!isCurrentSession()) return
-      if (!mergeResult.ok || !mergeResult.text.trim()) {
-        get()._update(blockId, `${partialSummaries.join('\n\n')}\n\n⚠️ 最终汇总失败：${mergeResult.error || '模型没有返回内容'}`)
-        set({ phase: get().cleanedData ? 'checkpoint1' : 'idle', abortFn: null })
-        return
-      }
-      summaryText = mergeResult.text
-      set((state) => ({
-        taskJournal: {
-          ...state.taskJournal,
-          [mergeTaskId]: {
-            kind: 'summary',
-            status: 'complete',
-            output: mergeResult.text,
-            updatedAt: new Date().toISOString()
-          }
-        }
-      }))
-      await window.api.saveLastProject(buildProjectSnapshot(get()))
-      }
-    }
-    set({ abortFn: null })
-
-    // cleanedData = 汇总(总览+竞品+人群方向) + 各文件完整明细（供后续分析用，不截断）
     const detailFull = get().cleanDetails.map((d) => `### ${d.name}\n${d.text}`).join('\n\n')
     set({
-      cleanedData: `${summaryText}\n\n---\n## 各来源清洗明细\n\n${detailFull}`,
+      cleanedData: `## 各来源清洗明细\n\n${detailFull}`,
       phase: 'checkpoint1'
     })
     get()._post(
       'assistant',
       isRerun
-        ? '✅ 已按你的要求重新归一（见上）。再核对一下「① 资料分类总览」和「竞品情况」；没问题点「确认，继续分析」，还要改继续说。'
-        : '✅ 资料已清洗归一（见上）。请重点核对三处：\n' +
-            '① 最上面的「① 资料分类总览」——每份文件的归属、平台/来源、信息类型对不对。不对就直接说，如「xxx.png 是竞品数据」「这份是自有数据」。\n' +
-            '②「竞品情况」——若没发现竞品资料，我已按 8 类方向给了候选竞品 + 采集清单：可去采集后拖进来打字「重新归一」，或确认用推荐方向继续（会标注待验证），或打字指定竞品名。\n' +
-            '③「初步人群方向」是否对。\n\n都没问题 → 点「确认，继续分析」；要纠偏 → 直接打字。',
+        ? '✅ 未完成资料已补充清洗。请核对文件归属和清洗内容，没问题点「确认，继续分析」。'
+        : '✅ 所有资料已完成清洗并保存。请核对每份文件的归属、平台和清洗内容；确认后软件才会开始资料汇总与经营分析。',
       'checkpoint'
     )
   },
@@ -2098,7 +2111,115 @@ export const useStore = create<StoreState>((set, get) => ({
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
-    const { sopRules, cleanedData } = get()
+    const { sopRules } = get()
+    const sourceCount = topLevelSourceCount(get().sources)
+    const imageCount = sourceImageCount(get().sources)
+    let cleanedData = get().cleanedData
+    if (!cleanedData.includes(CLEAN_DETAIL_MARKER)) {
+      const details = get().cleanDetails.map((detail) => ({ name: detail.name, text: detail.text }))
+      const summaryGroups = planSummaryDetailGroups(details)
+      get()._post(
+        'assistant',
+        summaryGroups.length > 1
+          ? `资料已确认，正在分 ${summaryGroups.length} 组建立完整资料总览……`
+          : '资料已确认，正在建立资料总览……',
+        'narration'
+      )
+      const blockId = get()._post('assistant', '', 'report-block')
+      const partialSummaries: string[] = []
+      for (let index = 0; index < summaryGroups.length; index++) {
+        const groupNumber = index + 1
+        const groupTaskId = `${sessionId}:summary:group-v3:${groupNumber}`
+        const saved = get().taskJournal[groupTaskId]
+        if (saved?.status === 'complete' && saved.output?.trim()) {
+          partialSummaries.push(saved.output)
+          continue
+        }
+        const result = await runModelRetry(
+          buildSummaryGroupMessages(summaryGroups[index], groupNumber, summaryGroups.length, get().steering),
+          (text) => {
+            if (isCurrentSession() && summaryGroups.length === 1) get()._update(blockId, text)
+          },
+          (fn) => {
+            if (isCurrentSession()) set({ abortFn: fn })
+          },
+          undefined,
+          1,
+          {
+            reportSessionId: sessionId,
+            taskType: 'summary',
+            taskKey: groupTaskId,
+            billingRequestId: groupTaskId,
+            isVision: false,
+            sourceCount,
+            imageCount,
+            stepId: `group-${groupNumber}-of-${summaryGroups.length}`
+          }
+        )
+        if (!isCurrentSession()) return
+        if (!result.ok || !result.text.trim()) {
+          get()._update(blockId, `⚠️ 第 ${groupNumber} 组资料汇总失败：${result.error || '没有返回内容'}`)
+          set({ phase: 'checkpoint1', abortFn: null })
+          return
+        }
+        partialSummaries.push(result.text)
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [groupTaskId]: { kind: 'summary', status: 'complete', output: result.text, updatedAt: new Date().toISOString() }
+          }
+        }))
+        await window.api.saveLastProject(buildProjectSnapshot(get()))
+      }
+      let summaryText = partialSummaries[0] || ''
+      if (partialSummaries.length > 1) {
+        const mergeTaskId = `${sessionId}:summary:merge-v3`
+        const saved = get().taskJournal[mergeTaskId]
+        if (saved?.status === 'complete' && saved.output?.trim()) summaryText = saved.output
+        else {
+          const merge = await runModelRetry(
+            buildSummaryMergeMessages(partialSummaries, get().steering),
+            (text) => {
+              if (isCurrentSession()) get()._update(blockId, text)
+            },
+            (fn) => {
+              if (isCurrentSession()) set({ abortFn: fn })
+            },
+            undefined,
+            1,
+            {
+              reportSessionId: sessionId,
+              taskType: 'summary',
+              taskKey: mergeTaskId,
+              billingRequestId: mergeTaskId,
+              isVision: false,
+              sourceCount,
+              imageCount,
+              stepId: 'merge-all-groups'
+            }
+          )
+          if (!isCurrentSession()) return
+          if (!merge.ok || !merge.text.trim()) {
+            get()._update(blockId, `⚠️ 最终资料汇总失败：${merge.error || '没有返回内容'}`)
+            set({ phase: 'checkpoint1', abortFn: null })
+            return
+          }
+          summaryText = merge.text
+          set((state) => ({
+            taskJournal: {
+              ...state.taskJournal,
+              [mergeTaskId]: { kind: 'summary', status: 'complete', output: merge.text, updatedAt: new Date().toISOString() }
+            }
+          }))
+          await window.api.saveLastProject(buildProjectSnapshot(get()))
+        }
+      }
+      const detailFull = get().cleanDetails.map((detail) => `### ${detail.name}\n${detail.text}`).join('\n\n')
+      cleanedData = `${summaryText}${CLEAN_DETAIL_MARKER}\n\n${detailFull}`
+      set({ cleanedData, abortFn: null })
+      get()._update(blockId, summaryText)
+      await window.api.saveLastProject(buildProjectSnapshot(get()))
+    }
     const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)
     let analysisInput = cleanedData
     if (analysisEvidenceGroups.length > 1) {

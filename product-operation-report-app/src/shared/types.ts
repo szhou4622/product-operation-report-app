@@ -484,12 +484,30 @@ export interface ProjectCleanDetailSnapshot {
   id: string
   name: string
   text: string
+  coverage?: CleaningCoverage
+}
+
+export interface CleaningCoverage {
+  mode: 'local_exact' | 'model_batches'
+  recordCount?: number
+  pageCount?: number
+  imageCount?: number
+  batchCount: number
+  verifiedAt: string
+}
+
+export interface CleaningCheckpoint {
+  completeTaskIds: string[]
+  failedTaskIds: string[]
+  notStartedTaskIds: string[]
+  updatedAt: string
 }
 
 export interface ProjectTaskSnapshot {
   kind: 'parse' | 'source_clean' | 'summary' | 'analysis_step' | 'final_part'
   status: 'complete' | 'failed' | 'interrupted'
   output?: string
+  coverage?: CleaningCoverage
   updatedAt: string
 }
 
