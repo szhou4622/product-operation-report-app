@@ -120,6 +120,7 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertGreater(locked, 0)
         self.consume_mock.side_effect = self.fake_consume
         proxy.retry_pending_billing(self.session)
+        self.assertEqual(self.consume_mock.call_args.args[2], request_id)
         with proxy.database() as db:
             request = db.execute(
                 "SELECT status,billing_error FROM model_requests WHERE request_id=?", (request_id,)
@@ -130,6 +131,94 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(request["status"], "success")
         self.assertEqual(request["billing_error"], "")
         self.assertEqual(locked, 0)
+
+    def test_retries_share_logical_task_but_bill_unique_upstream_attempts(self) -> None:
+        logical_billing_id = "report-a:source_clean:file-1:batch-1"
+        first_request_id = "1a4f81b8-1a5b-4e39-830e-1271165bb8ee"
+        second_request_id = "2a4f81b8-1a5b-4e39-830e-1271165bb8ee"
+        self.consume_mock.reset_mock()
+
+        proxy.reserve_request(
+            self.session, first_request_id, "report-a", "source:1", "source_clean",
+            "gpt-5.5", 1, 1000, logical_billing_id,
+        )
+        proxy.settle_request(
+            self.session, first_request_id, "success", "gpt-5.5",
+            {"input_tokens": 1000, "output_tokens": 100, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1000, 300, True,
+        )
+
+        proxy.reserve_request(
+            self.session, second_request_id, "report-a", "source:1", "source_clean",
+            "gpt-5.5", 2, 1000, logical_billing_id,
+        )
+        proxy.settle_request(
+            self.session, second_request_id, "success", "gpt-5.5",
+            {"input_tokens": 1600, "output_tokens": 350, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1600, 900, True,
+        )
+
+        consume_ids = [call.args[2] for call in self.consume_mock.call_args_list]
+        self.assertEqual(consume_ids, [first_request_id, second_request_id])
+        with proxy.database() as db:
+            rows = db.execute(
+                "SELECT request_id,billing_request_id,status FROM model_requests "
+                "WHERE request_id IN (?,?) ORDER BY request_id",
+                (first_request_id, second_request_id),
+            ).fetchall()
+            wallet = db.execute(
+                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()
+        self.assertEqual([row["billing_request_id"] for row in rows], [logical_billing_id, logical_billing_id])
+        self.assertEqual([row["status"] for row in rows], ["success", "success"])
+        self.assertEqual(wallet["locked_milli"], 0)
+
+    def test_legacy_amount_conflict_releases_reservation_without_second_charge(self) -> None:
+        request_id = "3a4f81b8-1a5b-4e39-830e-1271165bb8ee"
+        logical_billing_id = "report-a:source_clean:file-conflict:batch-1"
+        proxy.reserve_request(
+            self.session, request_id, "report-a", "source:conflict", "source_clean",
+            "gpt-5.5", 2, 1400, logical_billing_id,
+        )
+        self.consume_mock.side_effect = proxy.ApiError(409, "request_id 已用于不同的消费请求。")
+        proxy.settle_request(
+            self.session, request_id, "success", "gpt-5.5",
+            {"input_tokens": 1400, "output_tokens": 300, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1400, 900, True,
+        )
+        with proxy.database() as db:
+            before = db.execute(
+                "SELECT status,reserved_milli,billing_error FROM model_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            locked_before = db.execute(
+                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()["locked_milli"]
+        self.assertEqual(before["status"], "billing_pending")
+        self.assertIn("不同的消费请求", before["billing_error"])
+        self.assertEqual(locked_before, before["reserved_milli"])
+
+        self.consume_mock.reset_mock()
+        self.consume_mock.side_effect = self.fake_consume
+        proxy.retry_pending_billing(self.session)
+        self.consume_mock.assert_not_called()
+        with proxy.database() as db:
+            after = db.execute(
+                "SELECT status,charged_milli,billing_result_status,billing_error "
+                "FROM model_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            locked_after = db.execute(
+                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
+            ).fetchone()["locked_milli"]
+        self.assertEqual(after["status"], "billing_conflict_released")
+        self.assertEqual(after["charged_milli"], 0)
+        self.assertEqual(after["billing_result_status"], "billing_conflict_released")
+        self.assertIn("不同的消费请求", after["billing_error"])
+        self.assertEqual(locked_after, 0)
 
     def test_unlimited_license_is_not_blocked_by_zero_balance(self) -> None:
         self.session.unlimited = True

@@ -842,7 +842,9 @@ def reserve_request(session: Session, request_id: str, report_id: str, task_key:
             db.execute("ROLLBACK")
             raise ApiError(429, "当前已有报告正在生成，请等待完成后再试。")
         day_cost = db.execute(
-            "SELECT COALESCE(SUM(cost_cny),0) FROM model_requests WHERE status IN ('success','partial','aborted') AND started_at>=?",
+            "SELECT COALESCE(SUM(cost_cny),0) FROM model_requests "
+            "WHERE status IN ('success','partial','aborted','billing_pending','billing_conflict_released') "
+            "AND started_at>=?",
             (f"{utc_day()}T00:00:00Z",),
         ).fetchone()[0]
         running_reserved_milli = db.execute(
@@ -936,6 +938,40 @@ def record_billing_error(request_id: str, message: str) -> None:
         )
 
 
+def release_legacy_billing_conflict(request_id: str) -> bool:
+    """Release pre-fix logical-ID conflicts without charging a second attempt."""
+    with database() as db:
+        ensure_schema(db)
+        db.execute("BEGIN IMMEDIATE")
+        request_row = db.execute(
+            "SELECT * FROM model_requests WHERE request_id=? AND status='billing_pending'",
+            (request_id,),
+        ).fetchone()
+        if not request_row or "request_id 已用于不同的消费请求" not in str(request_row["billing_error"] or ""):
+            db.execute("ROLLBACK")
+            return False
+        wallet = db.execute(
+            "SELECT * FROM wallets WHERE app_name=? AND code_id=?",
+            (APP_NAME, request_row["code_id"]),
+        ).fetchone()
+        if not wallet:
+            db.execute("ROLLBACK")
+            raise ApiError(403, "积分账户不可用，请重新登录或联系管理员。")
+        locked = max(0, int(wallet["locked_milli"]) - int(request_row["reserved_milli"]))
+        now = utc_now()
+        db.execute(
+            "UPDATE wallets SET locked_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+            (locked, now, APP_NAME, request_row["code_id"]),
+        )
+        db.execute(
+            "UPDATE model_requests SET status='billing_conflict_released',charged_milli=0,"
+            "billing_result_status='billing_conflict_released',ended_at=? WHERE request_id=?",
+            (now, request_id),
+        )
+        db.execute("COMMIT")
+        return True
+
+
 def retry_pending_billing(session: Session) -> None:
     with database() as db:
         ensure_schema(db)
@@ -945,11 +981,17 @@ def retry_pending_billing(session: Session) -> None:
             (APP_NAME, session.code_id),
         ).fetchall()
     for row in pending:
+        if release_legacy_billing_conflict(row["request_id"]):
+            continue
         try:
+            # request_id identifies one actual upstream attempt and therefore one
+            # exact amount. billing_request_id is only the stable logical task
+            # grouping supplied by the client; reusing it for different attempts
+            # would violate /credits/consume idempotency when Token usage differs.
             remaining, unlimited = consume_authoritative_credits(
                 session,
                 int(row["charged_milli"]),
-                row["billing_request_id"] or row["request_id"],
+                row["request_id"],
                 f"product_operation_report:{row['task_type']}",
             )
         except ApiError as error:
@@ -979,7 +1021,6 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
     if not sent_content and not usage:
         charged = 0
         cost_cny = 0
-    billing_request_id = request_id
     task_type = "model"
     with database() as db:
         ensure_schema(db)
@@ -997,7 +1038,6 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
         # The reserve uses the most expensive allowed model and the enforced output cap.
         charged = min(charged, request_row["reserved_milli"])
         now = utc_now()
-        billing_request_id = request_row["billing_request_id"] or request_id
         task_type = request_row["task_type"]
         if charged <= 0:
             locked = max(0, wallet["locked_milli"] - request_row["reserved_milli"])
@@ -1019,10 +1059,13 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
         )
         db.execute("COMMIT")
     try:
+        # Bill the concrete upstream attempt. Network retries of this settlement
+        # reuse request_id via retry_pending_billing, while a new model/fallback
+        # attempt receives a new request_id and may legitimately have a new cost.
         remaining, unlimited = consume_authoritative_credits(
             session,
             charged,
-            billing_request_id,
+            request_id,
             f"product_operation_report:{task_type}",
         )
     except ApiError as error:
