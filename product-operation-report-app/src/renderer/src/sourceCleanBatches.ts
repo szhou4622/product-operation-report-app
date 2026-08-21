@@ -5,6 +5,7 @@ import { SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 // 真实 50k Token 清洗请求在兼容中转上可能超过 90 秒才返回首包。
 // 控制在约 28k 字符，让宽表分成更多但更可靠、单次预留更低的批次。
 const CLEAN_BATCH_CHAR_LIMIT = 28_000
+const CLEAN_BATCH_RECORD_LIMIT = 120
 const MIN_TEXT_SPLIT_AT = 20_000
 console.assert(CLEAN_BATCH_CHAR_LIMIT < SOURCE_TEXT_LIMIT, 'cleaning batch limit must remain below source text limit')
 
@@ -179,7 +180,10 @@ function tablePieces(
     const rowEvidenceId = sourceEvidenceId('R', scope, globalRecordOffset + localIndex + 1)
     const rowCsv = Papa.unparse([[rowEvidenceId, ...row]], { newline: '\n' })
     const candidateLength = headerCsv.length + 1 + currentChars + rowCsv.length
-    if (currentRows.length && candidateLength > CLEAN_BATCH_CHAR_LIMIT) {
+    if (
+      currentRows.length &&
+      (candidateLength > CLEAN_BATCH_CHAR_LIMIT || currentRows.length >= CLEAN_BATCH_RECORD_LIMIT)
+    ) {
       flush(localIndex - 1)
     }
     if (!currentRows.length) currentStart = localIndex
@@ -439,6 +443,7 @@ export function missingSourceCleanEvidenceIds(
 
 export const sourceCleanBatchInternals = {
   CLEAN_BATCH_CHAR_LIMIT,
+  CLEAN_BATCH_RECORD_LIMIT,
   splitCompleteText,
   workbookBlocks,
   normalizedTableRows,

@@ -2701,6 +2701,23 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.match(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.message || '' : '', /提前结束/)
     assert.equal(earlyEofEvents.at(-1)?.type === 'error' ? earlyEofEvents.at(-1)?.usage.source : '', 'missing')
 
+    const stopWithoutSentinelEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () =>
+      responseStream([
+        'data: {"choices":[{"delta":{"content":"兼容完成"},"finish_reason":"stop"}]}\n\n',
+        'data: {"model":"gpt-5.5","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}}\n\n'
+      ])) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试无DONE兼容' }], (event) => stopWithoutSentinelEvents.push(event))
+    assert.equal(stopWithoutSentinelEvents.at(-1)?.type, 'done', 'finish_reason=stop is a valid terminal state without [DONE]')
+    assert.equal(
+      stopWithoutSentinelEvents.at(-1)?.type === 'done' ? stopWithoutSentinelEvents.at(-1)?.full : '',
+      '兼容完成'
+    )
+    assert.equal(
+      stopWithoutSentinelEvents.at(-1)?.type === 'done' ? stopWithoutSentinelEvents.at(-1)?.usage.totalTokens : 0,
+      24
+    )
+
     const normalized = normalizeProviderUsage(
       { prompt_tokens: 12.9, completion_tokens: 3, cache_read_input_tokens: 5, cache_creation_input_tokens: 7 },
       'fallback'
@@ -3999,6 +4016,7 @@ async function testZipExpansionGlobalCountGuard(): Promise<void> {
 }
 
 async function testSourceCleaningFailureIsolation(): Promise<void> {
+  const startedSourceIds: string[] = []
   ;(globalThis as typeof globalThis & { window: unknown }).window = {
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
@@ -4016,18 +4034,15 @@ async function testSourceCleaningFailureIsolation(): Promise<void> {
         context: { sourceId?: string },
         handlers: { onDone?: (value: string) => void; onError?: (value: string) => void }
       ) => {
-        queueMicrotask(() => {
-          if (context.sourceId === 'broken-source') {
-            // 供应商偶发返回“成功但空内容”时，合并函数会抛错；也必须只影响当前文件。
-            handlers.onDone?.('')
-          } else {
-            const evidenceIds = context.sourceId === 'good-source'
-              ? buildSourceCleanBatchPlan({ name: '可正常处理的资料.json', kind: 'doc', text: '{"产品":"酸菜"}' })
-                  .batches.flatMap((batch) => batch.context.evidenceIds)
-              : [...new Set(JSON.stringify(messages).match(/POR-[RTI]-[A-F0-9]{8}-\d{6}/gu) || [])]
+        startedSourceIds.push(context.sourceId || '')
+        if (context.sourceId === 'broken-source') {
+          queueMicrotask(() => handlers.onError?.('模拟上游连接失败'))
+        } else {
+          globalThis.setTimeout(() => {
+            const evidenceIds = [...new Set(JSON.stringify(messages).match(/POR-[RTI]-[A-F0-9]{8}-\d{6}/gu) || [])]
             handlers.onDone?.(`成功资料的完整清洗结果\n${evidenceIds.join('\n')}`)
-          }
-        })
+          }, 10)
+        }
         return { abort: () => undefined }
       }
     }
@@ -4042,13 +4057,13 @@ async function testSourceCleaningFailureIsolation(): Promise<void> {
         text: '# 暂时失败',
         attribution: '自有数据'
       },
-      {
-        id: 'good-source',
-        name: '可正常处理的资料.json',
-        kind: 'doc',
-        text: '{"产品":"酸菜"}',
+      ...Array.from({ length: 5 }, (_, index) => ({
+        id: `good-source-${index + 1}`,
+        name: `可正常处理的资料-${index + 1}.json`,
+        kind: 'doc' as const,
+        text: `{"产品":"酸菜${index + 1}"}`,
         attribution: '自有数据'
-      }
+      }))
     ],
     messages: [],
     cleanedData: '',
@@ -4062,11 +4077,15 @@ async function testSourceCleaningFailureIsolation(): Promise<void> {
 
   await useStore.getState()._runCleaning(false)
 
-  assert.deepEqual(useStore.getState().cleanDetails.map((detail) => detail.id), ['good-source'])
-  assert.equal(useStore.getState().cleaningProgress.done, 1)
+  assert.deepEqual(
+    useStore.getState().cleanDetails.map((detail) => detail.id),
+    ['good-source-1', 'good-source-2', 'good-source-3']
+  )
+  assert.deepEqual(startedSourceIds, ['broken-source', 'good-source-1', 'good-source-2', 'good-source-3'])
+  assert.equal(useStore.getState().cleaningProgress.done, 3)
   assert.equal(useStore.getState().cleaningProgress.failed, 1)
   assert.equal(useStore.getState().phase, 'idle')
-  assert.match(useStore.getState().messages.at(-1)?.text || '', /其他资料已继续清洗并保留/u)
+  assert.match(useStore.getState().messages.at(-1)?.text || '', /没有再启动新的资料/u)
 }
 
 async function testParseFailureBlocksGeneration(): Promise<void> {
@@ -5290,7 +5309,7 @@ async function run(): Promise<void> {
   await testFileCountGuard()
   console.log('Regression: ZIP expansion global count guard')
   await testZipExpansionGlobalCountGuard()
-  console.log('Regression: one source cleaning failure does not block other files')
+  console.log('Regression: one source failure preserves in-flight work and pauses new files')
   await testSourceCleaningFailureIsolation()
   console.log('Regression: parse failures cannot be silently omitted from a report')
   await testParseFailureBlocksGeneration()

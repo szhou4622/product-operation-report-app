@@ -11,7 +11,7 @@ import type {
 
 const SETTINGS_REQUEST_TIMEOUT_MS = 20_000
 const STREAM_FIRST_BYTE_TIMEOUT_MS = 180_000
-const STREAM_IDLE_TIMEOUT_MS = 90_000
+const STREAM_IDLE_TIMEOUT_MS = 180_000
 const STREAM_ABSOLUTE_TIMEOUT_MS = 15 * 60_000
 const MAX_SETTINGS_RESPONSE_BYTES = 2 * 1024 * 1024
 const MAX_ERROR_RESPONSE_BYTES = 16 * 1024
@@ -507,6 +507,19 @@ export async function chatStream(
       const result = processLine(buffer)
       if (result !== 'continue') return
     }
+    const eofFinishError = finishReasonError(finishReason)
+    if (eofFinishError) {
+      emitError(eofFinishError)
+      return
+    }
+    // Some OpenAI-compatible gateways close a valid SSE response immediately
+    // after finish_reason=stop and omit the optional [DONE] sentinel. The
+    // provider has already declared a normal terminal state, so accepting it
+    // avoids discarding a complete, already-billed result.
+    if (finishReason === 'stop' && full.trim()) {
+      emitDone()
+      return
+    }
     emitError(
       full.trim()
         ? '模型连接提前结束，本次内容可能不完整，已保留上一份完整结果。请重试。'
@@ -523,7 +536,7 @@ export async function chatStream(
         ? '本次模型任务已运行超过15分钟，为保护资料和费用已自动停止。请重试未完成的步骤。'
         : timeoutReason === 'first-byte'
           ? '模型准备本批资料超过180秒仍未开始返回，已自动停止。软件会保留其他已完成内容，请稍后重试本批。'
-          : '模型已开始处理，但连续90秒没有返回新数据，已自动停止。请检查网络后重试。')
+          : '模型已开始处理，但连续180秒没有返回新数据，已自动停止。请检查网络后重试。')
       return
     }
     const hint = /fetch failed|ECONNRESET|socket|terminated|network/i.test(msg)

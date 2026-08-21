@@ -1630,12 +1630,13 @@ export const useStore = create<StoreState>((set, get) => ({
 
       const aborts = new Set<() => void>()
       let cancelled = false
+      let pauseAfterFailure = false
       const failures: Array<{ name: string; error: string }> = []
       set({ abortFn: () => { cancelled = true; aborts.forEach((fn) => fn()) } })
 
       let next = 0
       const worker = async (): Promise<void> => {
-        while (!cancelled) {
+        while (!cancelled && !pauseAfterFailure) {
           const i = next++
           if (i >= todo.length) return
           const s = todo[i]
@@ -1737,6 +1738,7 @@ export const useStore = create<StoreState>((set, get) => ({
             const markSourceFailure = (error: string): void => {
               if (sourceFailed) return
               sourceFailed = true
+              pauseAfterFailure = true
               failures.push({ name: s.name, error })
               set((state) => ({
                 cleaningProgress: {
@@ -1790,7 +1792,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     'narration'
                   )
                 }
-                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v5-local-structured:${batch.context.batchIndex}`
+                const batchTaskId = `${sessionId}:source_clean:${s.id}:batch-v6-record-capped:${batch.context.batchIndex}`
                 const savedBatch = get().taskJournal[batchTaskId]
                 if (savedBatch?.status === 'complete' && savedBatch.output?.trim()) {
                   batchOutputs[batchPosition] = savedBatch.output
@@ -1908,6 +1910,7 @@ export const useStore = create<StoreState>((set, get) => ({
               'narration'
             )
           } catch (error) {
+            pauseAfterFailure = true
             failures.push({ name: s.name, error: friendlyError(error) })
             set((st) => ({
               cleaningProgress: {
@@ -1942,7 +1945,7 @@ export const useStore = create<StoreState>((set, get) => ({
         const more = failures.length > 3 ? `\n另有 ${failures.length - 3} 份资料未完成。` : ''
         get()._post(
           'assistant',
-          `⚠️ 有 ${failures.length} 份资料本轮未完成，但其他资料已继续清洗并保留：\n${preview}${more}\n请根据提示处理后再点「开始生成」，软件只会重试未完成的资料。`,
+          `⚠️ 有 ${failures.length} 份资料本轮未完成。发生异常后，软件没有再启动新的资料；当时已经在处理的资料已完成并保留：\n${preview}${more}\n请根据提示处理后再点「开始生成」，软件只会重试未完成的资料。`,
           'error'
         )
         set({ phase: get().cleanedData ? 'checkpoint1' : 'idle' })

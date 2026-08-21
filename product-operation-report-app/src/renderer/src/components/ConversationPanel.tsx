@@ -427,7 +427,7 @@ export default function ConversationPanel(): JSX.Element {
                 <b>AI 清洗归类</b>
                 <span>
                   {cleaningProgress.done}/{cleaningProgress.total} 完成
-                  {cleaningProgress.failed ? `，${cleaningProgress.failed} 个失败` : ''}
+                  {cleaningProgress.failed ? `，${cleaningProgress.failed} 份待重试` : ''}
                 </span>
               </div>
               <div className="progress-track">
@@ -435,7 +435,9 @@ export default function ConversationPanel(): JSX.Element {
               </div>
               {cleaningProgress.running.length > 0 && (
                 <div className="progress-running">
-                  正在清洗：{cleaningProgress.running.join('、')}
+                  {cleaningProgress.failed
+                    ? `异常后正在收尾已启动任务：${cleaningProgress.running.join('、')}；完成后会暂停`
+                    : `正在清洗：${cleaningProgress.running.join('、')}`}
                 </div>
               )}
             </div>
