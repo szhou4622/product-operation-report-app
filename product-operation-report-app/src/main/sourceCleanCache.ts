@@ -193,9 +193,17 @@ function validateInput(input: SourceCleanCacheInput): SourceCleanCacheInput {
   if (!['image', 'doc', 'table', 'other'].includes(input.kind)) throw new Error('清洗缓存文件类型无效。')
   const text = safeString(input.text, 60_000_000)
   const dataUrl = safeString(input.dataUrl, 40_000_000)
-  if (!text && !dataUrl) throw new Error('清洗缓存缺少文件内容。')
+  const attachments = Array.isArray(input.attachments)
+    ? input.attachments.slice(0, 100).flatMap((item) => {
+        if (!item || typeof item !== 'object') return []
+        const attachmentDataUrl = safeString(item.dataUrl, 40_000_000)
+        if (!attachmentDataUrl) return []
+        return [{ name: safeString(item.name, 500), size: Number.isFinite(item.size) ? item.size : undefined, dataUrl: attachmentDataUrl }]
+      })
+    : []
+  if (!text && !dataUrl && !attachments.length) throw new Error('清洗缓存缺少文件内容。')
   return {
-    name: safeString(input.name, 500), kind: input.kind, text, dataUrl,
+    name: safeString(input.name, 500), kind: input.kind, text, dataUrl, attachments,
     attribution: safeString(input.attribution, 100), platform: safeString(input.platform, 200),
     purpose: safeString(input.purpose, 200), note: safeString(input.note, 4_000)
   }
@@ -216,6 +224,10 @@ export function sourceCleanCacheKey(input: SourceCleanCacheInput, model: string)
     clean.name, clean.kind, clean.attribution || '', clean.platform || '', clean.purpose || '', clean.note || '',
     clean.text || '', clean.dataUrl || ''
   ]) updateHash(hash, value)
+  for (const attachment of clean.attachments || []) {
+    updateHash(hash, attachment.name)
+    updateHash(hash, attachment.dataUrl || '')
+  }
   return hash.digest('hex')
 }
 

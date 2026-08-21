@@ -8,6 +8,7 @@ import type {
   ReportResultCacheSnapshot,
   SavedProject,
   SourceCleanCacheInput,
+  SourceImageAttachment,
   StepDependencyMap,
   ProjectTaskSnapshot
 } from '../../shared/types'
@@ -45,6 +46,7 @@ export interface Source {
   name: string
   kind: 'image' | 'doc' | 'table' | 'other'
   dataUrl?: string
+  attachments?: SourceImageAttachment[]
   text?: string
   size?: number
   parsing?: boolean
@@ -84,19 +86,78 @@ export function topLevelSourceCount(sources: Pick<Source, 'id' | 'topLevelId'>[]
   return new Set(sources.map((source) => source.topLevelId || source.id)).size
 }
 
-export function derivedSourceCount(sources: Pick<Source, 'derivedKind'>[]): number {
-  return sources.filter((source) => Boolean(source.derivedKind)).length
+export function derivedSourceCount(sources: Pick<Source, 'derivedKind' | 'attachments'>[]): number {
+  return sources.reduce((sum, source) => sum + (source.derivedKind ? 1 : 0) + (source.attachments?.length || 0), 0)
+}
+
+function sourceHasContent(source: Pick<Source, 'text' | 'dataUrl' | 'attachments'>): boolean {
+  return Boolean(source.text || source.dataUrl || source.attachments?.some((item) => item.dataUrl))
+}
+
+function sourceImageCount(sources: Pick<Source, 'kind' | 'dataUrl' | 'attachments'>[]): number {
+  return sources.reduce(
+    (sum, source) => sum + (source.dataUrl || source.kind === 'image' ? 1 : 0) + (source.attachments?.filter((item) => item.dataUrl).length || 0),
+    0
+  )
+}
+
+function groupLegacyOfficeDerivedSources(sources: Source[]): {
+  sources: Source[]
+  derivedParentIds: Map<string, string>
+} {
+  const parents = new Map(sources.filter((source) => !source.derivedKind).map((source) => [source.id, { ...source }]))
+  const derivedParentIds = new Map<string, string>()
+  const retained: Source[] = []
+  for (const source of sources) {
+    const parentId = source.topLevelId
+    const parent = parentId ? parents.get(parentId) : undefined
+    if (
+      parent && source.kind === 'image' &&
+      (source.derivedKind === 'embedded-image' || source.derivedKind === 'rendered-page')
+    ) {
+      parent.attachments = [
+        ...(parent.attachments || []),
+        { name: source.name, size: source.size, dataUrl: source.dataUrl, error: source.error }
+      ]
+      derivedParentIds.set(source.id, parent.id)
+      continue
+    }
+    if (!source.derivedKind) retained.push(parent || source)
+    else retained.push(source)
+  }
+  return { sources: retained, derivedParentIds }
+}
+
+function groupLegacyOfficeCleanDetails(
+  details: { id: string; name: string; text: string }[],
+  derivedParentIds: Map<string, string>,
+  sources: Source[]
+): { id: string; name: string; text: string }[] {
+  if (!derivedParentIds.size) return details
+  const names = new Map(sources.map((source) => [source.id, source.name]))
+  const grouped = new Map<string, { id: string; name: string; text: string }>()
+  for (const detail of details) {
+    const id = derivedParentIds.get(detail.id) || detail.id
+    const previous = grouped.get(id)
+    grouped.set(id, previous
+      ? { ...previous, text: `${previous.text}\n\n### 内嵌图片清洗补充：${detail.name}\n${detail.text}` }
+      : { id, name: names.get(id) || detail.name, text: detail.text })
+  }
+  return [...grouped.values()]
 }
 
 export function evidenceScopeStats(
-  sources: Pick<Source, 'kind' | 'text' | 'dataUrl'>[],
+  sources: Pick<Source, 'kind' | 'text' | 'dataUrl' | 'attachments'>[],
   cleanDetails: Pick<ProjectCleanDetailSnapshot, 'text'>[] = []
 ): { worksheets: number; pages: number; images: number; records: number } {
   const worksheets = sources.reduce((sum, source) =>
     sum + (source.text?.match(/^###\s*工作表：/gmu)?.length || 0), 0)
   const pages = sources.reduce((sum, source) =>
     sum + (source.text?.match(/^---\s*第\s*\d+\s*页\s*---/gmu)?.length || 0), 0)
-  const images = sources.filter((source) => Boolean(source.dataUrl) || source.kind === 'image').length
+  const images = sources.reduce(
+    (sum, source) => sum + (source.dataUrl || source.kind === 'image' ? 1 : 0) + (source.attachments?.length || 0),
+    0
+  )
   const records = cleanDetails.reduce((sum, detail) => {
     const match = detail.text.match(/原始有效记录[：:]\s*(\d+)\s*条/u) ||
       detail.text.match(/逐行生成并核对\s*(\d+)\s*个/u)
@@ -148,6 +209,7 @@ function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
     kind: source.kind,
     text: source.text,
     dataUrl: source.dataUrl,
+    attachments: source.attachments,
     attribution: source.attribution,
     platform: source.platform,
     purpose: source.purpose,
@@ -157,7 +219,7 @@ function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
 
 function reportResultCacheInput(sources: Source[], userRequirements: string): ReportResultCacheInput {
   return {
-    sources: sources.filter((source) => source.dataUrl || source.text).map(toSourceCleanCacheInput),
+    sources: sources.filter(sourceHasContent).map(toSourceCleanCacheInput),
     userRequirements
   }
 }
@@ -182,7 +244,7 @@ function snapshotForReportCache(state: StoreState): ReportResultCacheSnapshot | 
     const detail = detailsById.get(source.id)
     return detail ? [{ name: source.name, text: detail.text }] : []
   })
-  if (cleanDetails.length !== state.sources.filter((source) => source.dataUrl || source.text).length) return null
+  if (cleanDetails.length !== state.sources.filter(sourceHasContent).length) return null
   return {
     cleanedData: state.cleanedData,
     cleanDetails,
@@ -610,6 +672,15 @@ const downscaleImage = async (file: File, maxDim = 1600, quality = 0.9): Promise
   })
 }
 
+function fileFromDataUrl(dataUrl: string, name: string): File {
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/u.exec(dataUrl)
+  if (!match) throw new Error('内嵌图片数据格式无效')
+  const binary = window.atob(match[2].replace(/\s+/gu, ''))
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
+  return new File([bytes], name, { type: match[1] })
+}
+
 function cleanedSummaryOnly(cleanedData: string): string {
   const index = cleanedData.indexOf(CLEAN_DETAIL_MARKER)
   return index >= 0 ? cleanedData.slice(0, index).trim() : cleanedData
@@ -777,6 +848,23 @@ export const useStore = create<StoreState>((set, get) => ({
         text: `恢复项目时发现 ${lastProject.missingBlobs.length} 个资料块丢失。其他内容已正常恢复，请重新上传：${lastProject.missingBlobs.join('、')}`
       })
     }
+    const restoredSourceState = groupLegacyOfficeDerivedSources(
+      lastProject
+        ? lastProject.sources.map((source) => ({
+            ...source,
+            parsing: false,
+            error:
+              source.error || sourceHasContent(source)
+                ? source.error
+                : '上次文件解析未完成，请删除后重新上传。'
+          }))
+        : []
+    )
+    const restoredCleanDetails = groupLegacyOfficeCleanDetails(
+      Array.isArray(lastProject?.cleanDetails) ? lastProject.cleanDetails : [],
+      restoredSourceState.derivedParentIds,
+      restoredSourceState.sources
+    )
     set({
       initialized: true,
       persistencePaused: false,
@@ -787,19 +875,10 @@ export const useStore = create<StoreState>((set, get) => ({
       sopRules,
       settingsOpen: settings.managedModel?.enabled ? !settings.managedModel.configured : !settings.profiles.length,
       reportReuseOffer: null,
-      sources: lastProject
-        ? lastProject.sources.map((source) => ({
-            ...source,
-            parsing: false,
-            error:
-              source.error || source.text || source.dataUrl
-                ? source.error
-                : '上次文件解析未完成，请删除后重新上传。'
-          }))
-        : [],
+      sources: restoredSourceState.sources,
       messages: restoredMessages,
       cleanedData: lastProject?.cleanedData || '',
-      cleanDetails: Array.isArray(lastProject?.cleanDetails) ? lastProject.cleanDetails : [],
+      cleanDetails: restoredCleanDetails,
       artifacts: restoredArtifacts,
       taskJournal: lastProject?.taskJournal || {},
       reportMarkdown: restoredReport,
@@ -945,7 +1024,7 @@ export const useStore = create<StoreState>((set, get) => ({
         ...source,
         parsing: false,
         error:
-          source.error || source.text || source.dataUrl
+          source.error || sourceHasContent(source)
             ? source.error
             : '上次文件解析未完成，请删除后重新上传。'
       })),
@@ -1003,7 +1082,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const availableSlots = Math.max(0, MAX_SOURCE_FILES - topLevelSourceCount(get().sources))
     let validOverflowCount = 0
     let acceptedBytes = get().sources.reduce(
-      (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
+      (sum, source) => sum + (source.parsing || sourceHasContent(source) ? source.size || 0 : 0),
       0
     )
 
@@ -1131,8 +1210,7 @@ export const useStore = create<StoreState>((set, get) => ({
                 const item = items[index]
                 if (!item.ok || item.kind !== 'image' || !item.dataUrl) continue
                 try {
-                  const blob = await (await fetch(item.dataUrl)).blob()
-                  const imageFile = new File([blob], item.name, { type: blob.type })
+                  const imageFile = fileFromDataUrl(item.dataUrl, item.name)
                   items[index] = { ...item, dataUrl: await downscaleImage(imageFile) }
                 } catch (error) {
                   items[index] = {
@@ -1149,7 +1227,7 @@ export const useStore = create<StoreState>((set, get) => ({
               if (s.analysisSessionId !== sessionId || !s.sources.some((source) => source.id === job.id)) return s
               const retainedSources = s.sources.filter((source) => source.id !== job.id)
               const retainedBytes = retainedSources.reduce(
-                (sum, source) => sum + (source.parsing || source.dataUrl || source.text ? source.size || 0 : 0),
+                (sum, source) => sum + (source.parsing || sourceHasContent(source) ? source.size || 0 : 0),
                 0
               )
               const retainedItems = items
@@ -1219,8 +1297,7 @@ export const useStore = create<StoreState>((set, get) => ({
             (parsed.attachments || []).map(async (item) => {
               if (!item.ok || item.kind !== 'image' || !item.dataUrl) return item
               try {
-                const blob = await (await fetch(item.dataUrl)).blob()
-                const imageFile = new File([blob], item.name, { type: blob.type })
+                const imageFile = fileFromDataUrl(item.dataUrl, item.name)
                 return { ...item, dataUrl: await downscaleImage(imageFile) }
               } catch (error) {
                 return {
@@ -1235,39 +1312,36 @@ export const useStore = create<StoreState>((set, get) => ({
           set((s) => {
             if (s.analysisSessionId !== sessionId) return s
             const retainedSources = s.sources.filter((source) => source.id !== job.id)
-            const parentSources: Source[] = parsed.ok && !parsed.text
-              ? []
-              : [{
-                  id: job.id,
-                  name: job.name,
-                  kind: job.kind,
-                  size: job.file.size,
-                  parsing: false,
-                  text: parsed.ok ? parsed.text : undefined,
-                  error: parsed.ok ? undefined : parsed.error,
-                  warning: parsed.ok ? parsed.warning : undefined,
-                  attribution: job.attribution,
-                  platform: job.platform,
-                  purpose: job.purpose,
-                  topLevelId: job.id
-                }]
-            const attachmentSources: Source[] = attachments.map((item, index) => ({
-              id: crypto.randomUUID(),
+            const groupedAttachments: SourceImageAttachment[] = attachments.map((item) => ({
               name: item.name,
-              kind: 'image',
               size: item.size,
-              parsing: false,
               dataUrl: item.ok ? item.dataUrl : undefined,
-              error: item.ok ? undefined : item.error,
-              warning: index === 0 && !parentSources.length ? parsed.warning : undefined,
+              error: item.ok ? undefined : item.error
+            }))
+            const failedAttachments = groupedAttachments.filter((item) => item.error)
+            const attachmentWarning = groupedAttachments.length
+              ? `已归并读取 ${groupedAttachments.length} 张内嵌图片，作为「${job.name}」的一部分清洗。`
+              : ''
+            const parent: Source = {
+              id: job.id,
+              name: job.name,
+              kind: job.kind,
+              size: job.file.size,
+              parsing: false,
+              text: parsed.text || undefined,
+              attachments: groupedAttachments.length ? groupedAttachments : undefined,
+              error: !parsed.ok
+                ? parsed.error
+                : failedAttachments.length
+                  ? `${failedAttachments.length} 张内嵌图片无法读取：${failedAttachments.slice(0, 3).map((item) => item.name).join('、')}`
+                  : undefined,
+              warning: [parsed.warning, attachmentWarning].filter(Boolean).join(' ') || undefined,
               attribution: job.attribution,
               platform: job.platform,
               purpose: job.purpose,
-              note: `从「${job.name}」自动提取，作为独立图片资料读取。`,
-              topLevelId: job.id,
-              derivedKind: /第\s*\d+\s*页/u.test(item.name) ? 'rendered-page' : 'embedded-image'
-            }))
-            return { sources: [...retainedSources, ...parentSources, ...attachmentSources] }
+              topLevelId: job.id
+            }
+            return { sources: [...retainedSources, parent] }
           })
         } catch (err) {
           set((s) =>
@@ -1314,7 +1388,7 @@ export const useStore = create<StoreState>((set, get) => ({
       if (isRunningPhase(s.phase)) return s
       const changedIds = new Set(
         s.sources
-          .filter((source) => (source.dataUrl || source.text) && !source.attribution)
+          .filter((source) => sourceHasContent(source) && !source.attribution)
           .map((source) => source.id)
       )
       if (!changedIds.size) return s
@@ -1382,12 +1456,12 @@ export const useStore = create<StoreState>((set, get) => ({
       )
       return
     }
-    const unconfirmed = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution)
+    const unconfirmed = sources.filter((s) => sourceHasContent(s) && !s.attribution)
     if (unconfirmed.length) {
       get()._post('assistant', `还有 ${unconfirmed.length} 份资料没有确认归属。请在文件下方点“自有数据”或“竞品数据”。`, 'narration')
       return
     }
-    if (!sources.some((s) => s.dataUrl || s.text)) {
+    if (!sources.some(sourceHasContent)) {
       get()._post('assistant', '还没有可用的资料。请先上传截图/表格/文档/zip/文件夹，再点「开始生成」。', 'narration')
       return
     }
@@ -1428,7 +1502,7 @@ export const useStore = create<StoreState>((set, get) => ({
       await get()._startPaidGeneration()
       return
     }
-    const usable = get().sources.filter((source) => source.dataUrl || source.text)
+    const usable = get().sources.filter(sourceHasContent)
     if (
       usable.length !== offer.snapshot.cleanDetails.length ||
       usable.some((source, index) => source.name !== offer.snapshot!.cleanDetails[index]?.name)
@@ -1527,9 +1601,9 @@ export const useStore = create<StoreState>((set, get) => ({
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'cleaning', cleanedData: '' })
-    const usable = get().sources.filter((s) => s.dataUrl || s.text)
+    const usable = get().sources.filter(sourceHasContent)
     const sourceCount = usable.length
-    const imageCount = usable.filter((s) => s.kind === 'image').length
+    const imageCount = sourceImageCount(usable)
     const usableIds = new Set(usable.map((s) => s.id))
     // 丢掉已删除文件的旧明细；只抽取还没处理过的文件（支持中断续跑 / 补传后只洗新文件）
     set((st) => ({ cleanDetails: st.cleanDetails.filter((d) => usableIds.has(d.id)) }))
@@ -1737,7 +1811,7 @@ export const useStore = create<StoreState>((set, get) => ({
                       taskType: 'source_clean',
                       taskKey: batchTaskId,
                       billingRequestId: batchTaskId,
-                      isVision: s.kind === 'image',
+                      isVision: s.kind === 'image' || Boolean(batch.source.attachments?.length),
                       sourceCount,
                       imageCount,
                       sourceId: s.id,
@@ -1754,7 +1828,7 @@ export const useStore = create<StoreState>((set, get) => ({
                   continue
                 }
                 let verifiedText = res.text
-                const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batchPlan.mode)
+                const missingEvidence = missingSourceCleanEvidenceIds(batch.context, verifiedText, batch.context.mode)
                 if (missingEvidence.length) {
                   get()._post(
                     'assistant',
@@ -1777,7 +1851,7 @@ export const useStore = create<StoreState>((set, get) => ({
                         taskType: 'source_clean',
                         taskKey: repairTaskId,
                         billingRequestId: repairTaskId,
-                        isVision: s.kind === 'image',
+                        isVision: s.kind === 'image' || Boolean(batch.source.attachments?.length),
                         sourceCount,
                         imageCount,
                         sourceId: s.id,
@@ -1785,7 +1859,7 @@ export const useStore = create<StoreState>((set, get) => ({
                       }
                     )
                   )
-                  if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batchPlan.mode).length) {
+                  if (!repair.ok || missingSourceCleanEvidenceIds(batch.context, repair.text, batch.context.mode).length) {
                     markSourceFailure(`第 ${batch.context.batchIndex}/${batch.context.batchCount} 批仍有证据未覆盖，已停止该文件，避免漏资料。`)
                     continue
                   }
@@ -2056,7 +2130,7 @@ export const useStore = create<StoreState>((set, get) => ({
             billingRequestId: taskId,
             isVision: false,
             sourceCount: topLevelSourceCount(get().sources),
-            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            imageCount: sourceImageCount(get().sources),
             stepId: `evidence-digest-${index + 1}`
           }
         )
@@ -2108,7 +2182,7 @@ export const useStore = create<StoreState>((set, get) => ({
               billingRequestId: taskId,
               isVision: false,
               sourceCount: topLevelSourceCount(get().sources),
-              imageCount: get().sources.filter((source) => source.kind === 'image').length,
+              imageCount: sourceImageCount(get().sources),
               stepId: `evidence-digest-merge-${round}-${index + 1}`
             }
           )
@@ -2180,7 +2254,7 @@ export const useStore = create<StoreState>((set, get) => ({
             taskType: 'final_part',
             taskKeyPrefix: finalTaskPrefix,
             sourceCount: topLevelSourceCount(get().sources),
-            imageCount: get().sources.filter((source) => source.kind === 'image').length
+            imageCount: sourceImageCount(get().sources)
           },
           completedParts: completedFinalParts,
           onPartComplete: async (taskId, output) => {
@@ -2260,7 +2334,7 @@ export const useStore = create<StoreState>((set, get) => ({
             billingRequestId: `${sessionId}:analysis_step:${step.id}`,
             isVision: false,
             sourceCount: topLevelSourceCount(get().sources),
-            imageCount: get().sources.filter((source) => source.kind === 'image').length,
+            imageCount: sourceImageCount(get().sources),
             stepId: String(step.id)
           }
         )
@@ -2361,7 +2435,7 @@ export const useStore = create<StoreState>((set, get) => ({
         taskType: 'revision_part',
         taskKeyPrefix: `${sessionId}:revision:${revisionRunId}`,
         sourceCount: get().sources.length,
-        imageCount: get().sources.filter((source) => source.kind === 'image').length
+        imageCount: sourceImageCount(get().sources)
       },
       parts: selectedParts
     })

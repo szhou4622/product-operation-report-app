@@ -2033,6 +2033,9 @@ function testRepairPlanStaticContracts(): void {
   assert.doesNotMatch(table, /sourceForModel/u)
   assert.doesNotMatch(sop, /buildCleanMessages/u)
   assert.match(store, /scheduleCleaningCheckpointSave\(get\)/u)
+  assert.doesNotMatch(store, /fetch\(item\.dataUrl\)/u, 'Office images must not be re-fetched under connect-src none')
+  assert.match(store, /attachments: groupedAttachments/u, 'Office images remain grouped under the uploaded parent file')
+  assert.match(store, /sourceHasContent/u)
   assert.ok(
     store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)') < store.indexOf('for (const step of SOP_STEPS)'),
     'analysis evidence groups are planned once before the step loop'
@@ -2865,6 +2868,10 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(key.length, 64)
   assert.notEqual(sourceCleanCacheKey({ ...source, note: '近7天' }, 'gpt-5.5'), key)
   assert.notEqual(sourceCleanCacheKey({ ...source, text: `${source.text}\n年龄,40-49,20%` }, 'gpt-5.5'), key)
+  assert.notEqual(sourceCleanCacheKey({
+    ...source,
+    attachments: [{ name: '第1页/image1.png', dataUrl: 'data:image/png;base64,AAAA' }]
+  }, 'gpt-5.5'), key, 'embedded image content participates in the parent file cache key')
   const stored = await storeSourceCleanCache(source, 'gpt-5.5', '清洗结果')
   assert.equal(stored.stored, true, 'cache store')
   const hit = await lookupSourceCleanCache(source, 'gpt-5.5')

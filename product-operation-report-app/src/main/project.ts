@@ -317,6 +317,16 @@ function sanitizeSource(value: unknown): ProjectSourceSnapshot | null {
     kind,
     text: optionalString(value.text),
     dataUrl: optionalString(value.dataUrl),
+    attachments: Array.isArray(value.attachments)
+      ? value.attachments.flatMap((item) => {
+          if (!isPlainObject(item)) return []
+          const name = asString(item.name)
+          const dataUrl = optionalString(item.dataUrl)
+          const error = optionalString(item.error)
+          if (!name || (!dataUrl && !error)) return []
+          return [{ name, dataUrl, error, size: optionalNumber(item.size) }]
+        }).slice(0, 100)
+      : undefined,
     error: optionalString(value.error),
     warning: optionalString(value.warning),
     attribution: optionalString(value.attribution),

@@ -29,7 +29,7 @@ export interface SourceCleanBatch {
 }
 
 export interface SourceCleanBatchPlan {
-  mode: 'single' | 'table_rows' | 'text_chunks'
+  mode: 'single' | 'table_rows' | 'text_chunks' | 'mixed_evidence'
   batches: SourceCleanBatch[]
   originalRecordCount?: number
   scheduledRecordCount?: number
@@ -60,6 +60,11 @@ interface TablePiece {
 
 export function sourceEvidenceScope(source: SourceCleanCacheInput): string {
   const content = source.text || source.dataUrl || ''
+  const attachmentScope = (source.attachments || []).map((item) => {
+    const data = item.dataUrl || ''
+    const middle = Math.max(0, Math.floor(data.length / 2) - 256)
+    return [item.name, String(data.length), data.slice(0, 512), data.slice(middle, middle + 512), data.slice(-512)].join('\u0000')
+  }).join('\u0001')
   const middle = Math.max(0, Math.floor(content.length / 2) - 1024)
   // Evidence IDs only need to be compact and stable inside a report. Sampling the beginning,
   // middle and end prevents same-name/same-prefix exports from sharing a scope without hashing
@@ -69,7 +74,8 @@ export function sourceEvidenceScope(source: SourceCleanCacheInput): string {
     String(content.length),
     content.slice(0, 2048),
     content.slice(middle, middle + 2048),
-    content.slice(-2048)
+    content.slice(-2048),
+    attachmentScope
   ].join('\u0000')
   let hash = 0x811c9dc5
   for (let index = 0; index < text.length; index++) {
@@ -252,7 +258,8 @@ function tableBatchPlan(
   } }
 }
 
-export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): SourceCleanBatchPlan {
+function buildTextSourceCleanBatchPlan(input: SourceCleanCacheInput): SourceCleanBatchPlan {
+  const source: SourceCleanCacheInput = { ...input, attachments: undefined }
   const text = source.text || ''
   const scope = sourceEvidenceScope(source)
   if (source.kind === 'image' || !text) {
@@ -316,12 +323,57 @@ export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): Source
   }
 }
 
+export function buildSourceCleanBatchPlan(source: SourceCleanCacheInput): SourceCleanBatchPlan {
+  const base = buildTextSourceCleanBatchPlan(source)
+  const attachments = (source.attachments || []).filter(
+    (item): item is typeof item & { dataUrl: string } => Boolean(item.dataUrl)
+  )
+  if (!attachments.length) return base
+
+  const scope = sourceEvidenceScope(source)
+  const imageBatches: SourceCleanBatch[] = []
+  for (let offset = 0; offset < attachments.length; offset += 4) {
+    const group = attachments.slice(offset, offset + 4)
+    const evidenceIds = group.map((_, index) => sourceEvidenceId('I', scope, offset + index + 1))
+    imageBatches.push({
+      source: {
+        ...source,
+        dataUrl: undefined,
+        text: [
+          '【PPT/Office内嵌图片证据】以下图片属于同一个原始文件，不是独立上传资料。',
+          ...group.map((item, index) => `${evidenceIds[index]} | ${item.name}`)
+        ].join('\n'),
+        attachments: group
+      },
+      context: {
+        batchIndex: 0,
+        batchCount: 0,
+        isMaterialTable: false,
+        originalTextChars: source.text?.length || 0,
+        evidenceIds,
+        mode: 'text_chunks'
+      }
+    })
+  }
+  const textBatches = source.text || source.dataUrl ? base.batches : []
+  const batches = [...textBatches, ...imageBatches]
+  return {
+    ...base,
+    mode: 'mixed_evidence',
+    batches: batches.map((batch, index) => ({
+      ...batch,
+      context: { ...batch.context, batchIndex: index + 1, batchCount: batches.length }
+    })),
+    originalTextChars: source.text?.length || 0
+  }
+}
+
 export function combineSourceCleanBatchOutputs(plan: SourceCleanBatchPlan, outputs: string[]): string {
   if (outputs.length !== plan.batches.length || outputs.some((output) => !output.trim())) {
     throw new Error('\u6e05\u6d17\u6279\u6b21\u4e0d\u5b8c\u6574\uff0c\u672c\u6587\u4ef6\u4e0d\u80fd\u6807\u8bb0\u4e3a\u5df2\u5b8c\u6210\u3002')
   }
   const missing = plan.batches.flatMap((batch, index) =>
-    missingSourceCleanEvidenceIds(batch.context, outputs[index], plan.mode)
+    missingSourceCleanEvidenceIds(batch.context, outputs[index], batch.context.mode)
   )
   if (missing.length) {
     const preview = missing.slice(0, 8).join('\u3001')

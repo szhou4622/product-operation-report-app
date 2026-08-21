@@ -1067,7 +1067,7 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
       }))
       if (!result.ok && !extracted.length) return result
       const warnings = [
-        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们作为独立资料读图` : '',
+        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们归并到原文件中读图` : '',
         images.omittedImages ? `另有 ${images.omittedImages} 张为不支持的格式或超过安全上限，请把关键图片另存为 PNG/JPG 后上传` : ''
       ].filter(Boolean)
       if (images.omittedImages) {
@@ -1133,7 +1133,7 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
       }))
       if (!result.ok && !extracted.length) return result
       const warnings = [
-        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们作为独立资料读图` : '',
+        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们归并到原文件中读图` : '',
         parsed.images.omittedImages ? `另有 ${parsed.images.omittedImages} 张为不支持的格式或超过安全上限，请把关键图片另存为 PNG/JPG 后上传` : ''
       ].filter(Boolean)
       if (parsed.images.omittedImages) {
@@ -1185,7 +1185,7 @@ export async function parseFile(name: string, data: ArrayBuffer): Promise<Parsed
         parsed.emptyTextSlides.length
           ? `第 ${parsed.emptyTextSlides.slice(0, 20).join('、')}${parsed.emptyTextSlides.length > 20 ? '等' : ''} 页没有可提取文字`
           : '',
-        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们作为独立资料读图` : '',
+        extracted.length ? `已自动提取 ${extracted.length} 张内嵌图片，软件将把它们归并到原文件中读图` : '',
         parsed.images.omittedImages ? `另有 ${parsed.images.omittedImages} 张为不支持的格式或超过安全上限` : ''
       ].filter(Boolean)
       if (parsed.images.omittedImages) {

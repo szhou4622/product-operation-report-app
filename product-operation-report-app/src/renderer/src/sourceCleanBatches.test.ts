@@ -73,4 +73,25 @@ describe('row-anchored source cleaning coverage', () => {
       (batch.source.text || '').length <= sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT
     )).toBe(true)
   })
+
+  it('keeps PPT text and embedded images under one source cleaning plan', () => {
+    const plan = buildSourceCleanBatchPlan({
+      name: '产品手卡.pptx',
+      kind: 'doc',
+      text: '--- 第 1 页 ---\n产品卖点',
+      attachments: Array.from({ length: 5 }, (_, index) => ({
+        name: `第1页/内嵌图片/image${index + 1}.png`,
+        dataUrl: `data:image/png;base64,IMAGE${index + 1}`
+      }))
+    })
+    expect(plan.mode).toBe('mixed_evidence')
+    expect(plan.batches).toHaveLength(3)
+    expect(plan.batches[0].source.attachments).toBeUndefined()
+    expect(plan.batches[1].source.attachments).toHaveLength(4)
+    expect(plan.batches[2].source.attachments).toHaveLength(1)
+    const outputs = plan.batches.map((batch) =>
+      `分类：自有数据\n${batch.context.evidenceIds.join('\n')}\n已读取本批内容`
+    )
+    expect(combineSourceCleanBatchOutputs(plan, outputs)).toContain('动态清洗批次：3 批')
+  })
 })

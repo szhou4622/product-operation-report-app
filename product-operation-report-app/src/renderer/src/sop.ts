@@ -1,4 +1,4 @@
-import type { ChatMessage } from '../../shared/types'
+import type { ChatMessage, SourceImageAttachment } from '../../shared/types'
 import { MODEL_RUNTIME_RULES_VERSION, SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 import type { SourceCleanBatchContext } from './sourceCleanBatches'
 import {
@@ -51,6 +51,7 @@ export interface SourceLike {
   kind: string
   text?: string
   dataUrl?: string
+  attachments?: SourceImageAttachment[]
   attribution?: string // 用户指定归属：自有数据/竞品数据
   platform?: string // 用户指定平台/来源
   purpose?: string // 用户指定信息类型
@@ -292,20 +293,33 @@ export function buildExtractMessages(
       '只用文件里真实存在的信息，不要编造。'
     ].filter(Boolean).join('\n')
 
-  if (source.kind === 'image' && source.dataUrl) {
+  const sourceText = batch ? source.text : compactSourceText(source.name, source.text || '')
+  const userText = source.text ? `${instruction}\n\n## 文件内容\n${sourceText}` : instruction
+  const embeddedImages = (source.attachments || []).filter(
+    (item): item is SourceImageAttachment & { dataUrl: string } => Boolean(item.dataUrl)
+  )
+  if ((source.kind === 'image' && source.dataUrl) || embeddedImages.length) {
+    const imageParts = embeddedImages.flatMap((item, index) => [
+      {
+        type: 'text' as const,
+        text: `\n【内嵌图片 ${index + 1}/${embeddedImages.length}】${item.name}${batch?.evidenceIds[index] ? `\n证据ID：${batch.evidenceIds[index]}` : ''}`
+      },
+      { type: 'image' as const, dataUrl: item.dataUrl }
+    ])
     return [
       { role: 'system', content: system },
       {
         role: 'user',
         content: [
-          { type: 'text', text: instruction },
-          { type: 'image', dataUrl: source.dataUrl }
+          { type: 'text', text: userText },
+          ...(source.kind === 'image' && source.dataUrl
+            ? [{ type: 'image' as const, dataUrl: source.dataUrl }]
+            : []),
+          ...imageParts
         ]
       }
     ]
   }
-  const sourceText = batch ? source.text : compactSourceText(source.name, source.text || '')
-  const userText = source.text ? `${instruction}\n\n## 文件内容\n${sourceText}` : instruction
   return [
     { role: 'system', content: system },
     { role: 'user', content: userText }

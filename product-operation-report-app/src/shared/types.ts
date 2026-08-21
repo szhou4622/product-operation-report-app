@@ -366,11 +366,19 @@ export interface CostOptimizationEvent {
   reusedReports: number
 }
 
+export interface SourceImageAttachment {
+  name: string
+  size?: number
+  dataUrl?: string
+  error?: string
+}
+
 export interface SourceCleanCacheInput {
   name: string
   kind: 'image' | 'doc' | 'table' | 'other'
   text?: string
   dataUrl?: string
+  attachments?: SourceImageAttachment[]
   attribution?: string
   platform?: string
   purpose?: string
@@ -451,6 +459,7 @@ export interface ProjectSourceSnapshot {
   kind: 'image' | 'doc' | 'table' | 'other'
   text?: string
   dataUrl?: string
+  attachments?: SourceImageAttachment[]
   error?: string
   warning?: string
   attribution?: string
