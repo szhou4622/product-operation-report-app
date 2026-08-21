@@ -79,15 +79,26 @@ function parseBlock(block: WorkbookBlock): { headers: string[]; body: string[][]
   if (rows.length < 2) return null
   const width = Math.max(...rows.map((row) => row.length))
   if (width < 2 || width > MAX_TABLE_COLUMNS) return null
-  const rawHeaders = Array.from({ length: width }, (_, column) => cleanCell(rows[0][column]))
   const rawBody = rows.slice(1)
-  if (rawHeaders.some((header, column) => !header && rawBody.some((row) => Boolean(row[column])))) return null
+  const usedHeaders = new Set(rows[0].map(cleanCell).filter(Boolean))
+  let unnamedColumn = 0
+  const rawHeaders = Array.from({ length: width }, (_, column) => {
+    const original = cleanCell(rows[0][column])
+    if (original || !rawBody.some((row) => Boolean(row[column]))) return original
+    let generated = ''
+    do {
+      unnamedColumn += 1
+      generated = `未命名附加列${unnamedColumn}`
+    } while (usedHeaders.has(generated))
+    usedHeaders.add(generated)
+    return generated
+  })
   const activeColumns = Array.from({ length: width }, (_, column) => column).filter((column) =>
     Boolean(rawHeaders[column]) && rawBody.some((row) => Boolean(row[column]))
   )
   const removedColumns = rawHeaders.filter((header, column) => Boolean(header) && !activeColumns.includes(column))
-  const compact = rows.map((row) => activeColumns.map((column) => cleanCell(row[column])))
-  const [headers, ...body] = compact
+  const headers = activeColumns.map((column) => rawHeaders[column])
+  const body = rawBody.map((row) => activeColumns.map((column) => cleanCell(row[column])))
   if (!headers.every(Boolean) || new Set(headers).size !== headers.length || !body.length) return null
   const repeatedHeader = body.some((row) => row.every((cell, index) => cell === headers[index]))
   if (repeatedHeader) return null

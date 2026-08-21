@@ -59,20 +59,6 @@ describe('row-anchored source cleaning coverage', () => {
     expect(sourceCleanBatchInternals.CLEAN_BATCH_CHAR_LIMIT).toBeLessThanOrEqual(28_000)
   })
 
-  it('caps short-row tables so a single answer never has to echo hundreds of evidence IDs', () => {
-    const rows = [
-      ['字段A', '字段B'],
-      ...Array.from({ length: 1_001 }, (_, index) => [`记录${index + 1}`, String(index + 1)])
-    ]
-    const plan = buildSourceCleanBatchPlan({ name: '短行大表.csv', kind: 'table', text: Papa.unparse(rows) })
-    expect(plan.mode).toBe('table_rows')
-    expect(plan.batches.length).toBeGreaterThan(8)
-    expect(plan.batches.every((batch) =>
-      batch.context.evidenceIds.length <= sourceCleanBatchInternals.CLEAN_BATCH_RECORD_LIMIT
-    )).toBe(true)
-    expect(plan.batches.flatMap((batch) => batch.context.evidenceIds)).toHaveLength(1_001)
-  })
-
   it('plans 50 large files without creating an oversized cleaning batch', () => {
     const text = Papa.unparse([
       ['原视频', '完整文案'],

@@ -60,7 +60,23 @@ describe('local structured table preparation', () => {
   it('falls back for malformed or unknown table structures', () => {
     expect(preprocessTableForModel('名称,内容\n测试,"引号未闭合').canSkipModel).toBe(false)
     expect(preprocessTableForModel('甲列,乙列\n值1,值2').canSkipModel).toBe(false)
-    expect(preprocessTableForModel('名称,,成交金额\n产品A,未知,100').canSkipModel).toBe(false)
+  })
+
+  it('keeps an occasional extra CSV field in a generated column instead of sending thousands of rows to the model', () => {
+    const text = [
+      '标签类型,标签,占比',
+      ...Array.from({ length: 3_049 }, (_, index) => index === 677
+        ? `电商品类成交偏好,标签${index + 1},0%,14.53%`
+        : `电商品类成交偏好,标签${index + 1},${index % 100}%`)
+    ].join('\n')
+    const result = preprocessTableForModel(text)
+    expect(result.canSkipModel).toBe(true)
+    expect(result.retainedRows).toBe(3_049)
+    expect(result.text).toContain('未命名附加列1')
+    expect(result.text).toContain('0%,14.53%')
+    const detail = buildLocalTableCleanDetail({ name: '画像.csv', kind: 'table', text }, result)
+    expect(detail).toContain('本机完整读取 1 个工作表、3049 条有效记录')
+    expect((detail?.match(/POR-R-/gu) || [])).toHaveLength(3_049)
   })
 
   it('handles the maximum 50-file structured workload without model cleaning', () => {
