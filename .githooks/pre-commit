@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File product-operation-report-app/scripts/pre-commit-secret-guard.ps1

@@ -2,10 +2,17 @@
 
 const { createHash, createPrivateKey, sign } = require('crypto')
 const { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require('fs')
+const { homedir } = require('os')
 const { dirname, join, resolve } = require('path')
 
 const APP_NAME = 'ProductOperationReport'
 const DEFAULT_PUBLIC_ROOT = 'https://update.dadaozixun.com/product-operation-report/releases'
+const DEFAULT_SIGNING_KEY = join(
+  homedir(),
+  '.config',
+  'dadao-update-signing',
+  'ProductOperationReport-update-signing-private.pem'
+)
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
 
 function artifactDefinitions(version) {
@@ -153,7 +160,7 @@ async function buildManifest(options) {
   }
   manifest.signature = signManifest(
     manifest,
-    resolve(options.signingKey || process.env.PRODUCT_REPORT_UPDATE_SIGNING_KEY || join(projectRoot, '.secrets', 'update-signing-private.pem'))
+    resolve(options.signingKey || process.env.PRODUCT_REPORT_UPDATE_SIGNING_KEY || DEFAULT_SIGNING_KEY)
   )
 
   const output = resolve(options.output || join(projectRoot, 'dist', 'update-release', 'latest.json'))
@@ -197,6 +204,7 @@ if (require.main === module) {
 module.exports = {
   APP_NAME,
   DEFAULT_PUBLIC_ROOT,
+  DEFAULT_SIGNING_KEY,
   artifactDefinitions,
   buildManifest,
   compareVersions,

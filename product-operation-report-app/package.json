@@ -16,6 +16,7 @@
     "test:utility": "npm run build && node scripts/run-utility-smoke.cjs",
     "test:packaged-utility": "node scripts/run-packaged-utility-smoke.cjs",
     "test:managed-model": "node scripts/run-managed-model-smoke.cjs",
+    "hooks:install": "git config core.hooksPath .githooks",
     "config:managed:import": "electron scripts/import-managed-model-config.cjs",
     "config:managed:set-key": "electron scripts/set-managed-model-key.cjs",
     "update:prepare": "node scripts/prepare-update-release.cjs",
