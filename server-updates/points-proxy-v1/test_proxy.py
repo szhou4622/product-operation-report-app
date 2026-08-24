@@ -73,6 +73,26 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(row["description"], "资料汇总")
         self.assertEqual(wallet["locked_milli"], 0)
 
+    def test_same_running_task_is_not_submitted_twice(self) -> None:
+        first_request_id = "d4f81b86-1a5b-4e39-830e-1271165bb8ee"
+        second_request_id = "e4f81b86-1a5b-4e39-830e-1271165bb8ee"
+        proxy.reserve_request(
+            self.session, first_request_id, "report-a", "evidence:1", "summary",
+            "gpt-5.5", 1, 1000, "report-a:evidence:1",
+        )
+        with self.assertRaises(proxy.ApiError) as caught:
+            proxy.reserve_request(
+                self.session, second_request_id, "report-a", "evidence:1", "summary",
+                "gpt-5.5", 2, 1000, "report-a:evidence:1",
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("仍在服务器处理中", caught.exception.message)
+        with proxy.database() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM model_requests WHERE task_key='evidence:1'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
     def test_stream_heartbeat_and_safe_completion_without_provider_done(self) -> None:
         class SlowStream:
             def __iter__(self):
@@ -85,6 +105,26 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertTrue(proxy.provider_stream_completed(False, "stop", None, True))
         self.assertTrue(proxy.provider_stream_completed(False, "", {"input_tokens": 1}, True))
         self.assertFalse(proxy.provider_stream_completed(False, "", None, True))
+
+    def test_heartbeat_starts_before_provider_returns_response_headers(self) -> None:
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+
+        def slow_open(*_args):
+            time.sleep(0.03)
+            return Stream()
+
+        with patch.object(proxy, "open_provider_stream", side_effect=slow_open):
+            items = list(proxy.provider_request_items((), b"{}", "request", heartbeat_seconds=0.005))
+        self.assertEqual(items[0][0], "heartbeat")
+        self.assertTrue(any(kind == "line" for kind, _value in items))
 
     def test_session_refresh_replaces_stale_proxy_balance_with_license_balance(self) -> None:
         payload = {
@@ -165,7 +205,7 @@ class ProxyLedgerTests(unittest.TestCase):
 
         proxy.reserve_request(
             self.session, second_request_id, "report-a", "source:1", "source_clean",
-            "gpt-5.5", 2, 1000, logical_billing_id,
+            "gpt-5.5", 1, 1000, logical_billing_id,
         )
         proxy.settle_request(
             self.session, second_request_id, "success", "gpt-5.5",
@@ -178,7 +218,7 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(consume_ids, [first_request_id, second_request_id])
         with proxy.database() as db:
             rows = db.execute(
-                "SELECT request_id,billing_request_id,status FROM model_requests "
+                "SELECT request_id,billing_request_id,status,attempt FROM model_requests "
                 "WHERE request_id IN (?,?) ORDER BY request_id",
                 (first_request_id, second_request_id),
             ).fetchall()
@@ -187,6 +227,7 @@ class ProxyLedgerTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual([row["billing_request_id"] for row in rows], [logical_billing_id, logical_billing_id])
         self.assertEqual([row["status"] for row in rows], ["success", "success"])
+        self.assertEqual([row["attempt"] for row in rows], [1, 2])
         self.assertEqual(wallet["locked_milli"], 0)
 
     def test_legacy_amount_conflict_releases_reservation_without_second_charge(self) -> None:

@@ -1,6 +1,7 @@
 import { dialog } from 'electron'
 import { rename, rm, writeFile } from 'fs/promises'
 import type { ExportResult } from '../shared/types'
+import { reportMarkdownForDisplay } from '../shared/reportDisplay'
 import { markdownToHtmlDocument, stripProductVisualBrief } from './htmlReport'
 
 async function writeExportAtomically(filePath: string, content: string | Uint8Array): Promise<void> {
@@ -21,7 +22,10 @@ export async function exportMarkdown(content: string, defaultName: string): Prom
   })
   if (canceled || !filePath) return { ok: false, canceled: true }
   try {
-    await writeExportAtomically(filePath, Buffer.from(stripProductVisualBrief(content), 'utf8'))
+    await writeExportAtomically(
+      filePath,
+      Buffer.from(stripProductVisualBrief(reportMarkdownForDisplay(content)), 'utf8')
+    )
     return { ok: true, path: filePath }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -94,7 +98,7 @@ async function markdownToDocxBuffer(md: string): Promise<Buffer> {
     6: HeadingLevel.HEADING_6
   }
 
-  const tokens = marked.lexer(stripProductVisualBrief(md)) as any[]
+  const tokens = marked.lexer(stripProductVisualBrief(reportMarkdownForDisplay(md))) as any[]
   const children: any[] = [
     new Paragraph({
       heading: HeadingLevel.TITLE,

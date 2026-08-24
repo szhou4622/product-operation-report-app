@@ -192,7 +192,45 @@ const KEYWORD_STOP_WORDS = new Set(
     '中有',
     '即可',
     '一次',
-    '一袋'
+    '一袋',
+    '部分',
+    '记载',
+    '出现',
+    '来源',
+    '证据',
+    '文件',
+    '表格',
+    '数据表',
+    '服务',
+    '项目',
+    '知道',
+    '视频',
+    '图片',
+    '文档',
+    '记录',
+    '画像',
+    '成交',
+    '购买',
+    '平台',
+    '截图',
+    '页面',
+    '原始',
+    '手卡',
+    '核验',
+    '规格',
+    'csv',
+    'tsv',
+    'xlsx',
+    'xls',
+    'pptx',
+    'ppt',
+    'docx',
+    'doc',
+    'pdf',
+    'txt',
+    'markdown',
+    'html',
+    'zip'
   ].map((item) => item.toLocaleLowerCase('zh-CN'))
 )
 
@@ -542,17 +580,43 @@ function buildContentMix(section: HtmlReportSection): HtmlReportContentMixPresen
 }
 
 function keywordTokens(value: string): string[] {
-  const normalized = text(value)
-  if (!normalized || PLACEHOLDER_PATTERN.test(normalized)) return []
+  let normalized = text(value)
+    .replace(/(?:来源|对应证据|证据(?:ID|编号)?|数据来源)[：:][\s\S]*$/u, '')
+    .replace(/https?:\/\/\S+/giu, ' ')
+    .replace(/[^\s，,；;。]*\.(?:csv|tsv|xlsx?|pptx?|docx?|pdf|txt|md|markdown|html?|zip)\b/giu, ' ')
+  if (!normalized || /^(?:需补充|待补证|待确认|未知|暂无)[。.!！\s]*$/u.test(normalized)) return []
+  normalized = normalized.replace(/需补充|待补证|待确认|未知|暂无/gu, ' ')
+  const phrasePatterns = [
+    /免[\p{Script=Han}]{1,4}/gu,
+    /(?:不|低|少|减)[\p{Script=Han}\d.%]{1,7}/gu,
+    /[\p{Script=Han}]{1,7}(?:益生菌|发酵|萃取|烘焙|冻干|压榨|直投|芥菜|原料|材质|面料)/gu,
+    /[鲜脆爽酸香甜咸辣糯软酥]{2,6}/gu,
+    /\d+(?:\.\d+)?(?:天|小时|个月|年|%)(?:恒温|低温|自然)?(?:发酵|熟成|腌制|烘焙)?/gu
+  ]
+  const phrases = phrasePatterns
+    .flatMap((pattern) => normalized.match(pattern) || [])
+    .map((phrase) => phrase.trim())
+    .filter((phrase) => phrase.length >= 2 && phrase.length <= 14)
   const segmenter = new Intl.Segmenter('zh-CN', { granularity: 'word' })
-  return Array.from(segmenter.segment(normalized))
+  const words = Array.from(segmenter.segment(normalized))
     .filter((segment) => segment.isWordLike)
     .map((segment) => segment.segment.trim())
     .filter((token) => {
       if (!/^(?:[\p{Script=Han}]{2,8}|[A-Za-z][A-Za-z0-9.+-]{1,15})$/u.test(token)) return false
       const normalizedToken = token.toLocaleLowerCase('zh-CN')
-      return !KEYWORD_STOP_WORDS.has(normalizedToken) && !/^\d/.test(normalizedToken)
+      return (
+        !KEYWORD_STOP_WORDS.has(normalizedToken) &&
+        !/^\d/.test(normalizedToken) &&
+        !/文件|数据|来源|服务|项目|视频|图片|文档|记录|画像|成交|购买|证据|平台|补证|核验/u.test(token)
+      )
     })
+  return Array.from(new Set([...phrases, ...words])).filter((token) => {
+    const normalizedToken = token.toLocaleLowerCase('zh-CN')
+    return (
+      !KEYWORD_STOP_WORDS.has(normalizedToken) &&
+      !/文件|数据|来源|服务|项目|视频|图片|文档|记录|画像|成交|购买|证据|平台|补证|核验/u.test(token)
+    )
+  })
 }
 
 function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPresentation | null {
@@ -561,13 +625,22 @@ function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPr
   )
   if (tableIndex < 0) return null
   const table = section.tables[tableIndex]
+  const sellingPointColumns = table.headers
+    .map((header, index) => ({ header: text(header), index }))
+    .filter(({ header, index }) =>
+      index > 0 &&
+      /(?:我方|产品|核心|主要|原始|可用).*卖点|卖点(?:原文|表达|内容)?/u.test(header) &&
+      !/好处|证据|来源|依据|限制|备注|补充|状态|维度/u.test(header)
+    )
+    .map(({ index }) => index)
+  if (sellingPointColumns.length === 0) return null
   const entries = new Map<
     string,
     { label: string; count: number; sources: Map<string, HtmlReportSourceRef> }
   >()
   table.rows.forEach((row, rowIndex) => {
-    row.slice(1).forEach((rawValue, offset) => {
-      const columnIndex = offset + 1
+    sellingPointColumns.forEach((columnIndex) => {
+      const rawValue = row[columnIndex] || ''
       const source = sourceRef(section, tableIndex, rowIndex, columnIndex)
       keywordTokens(rawValue).forEach((label) => {
         const key = label.toLocaleLowerCase('zh-CN')
@@ -595,7 +668,7 @@ function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPr
       | 5
   }
   return {
-    title: '卖点原文高频词',
+    title: '卖点关键词频次',
     tableIndex,
     totalOccurrences: candidates.reduce((sum, entry) => sum + entry.count, 0),
     items: candidates.map((entry) => ({

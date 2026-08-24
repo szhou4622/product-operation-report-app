@@ -836,6 +836,23 @@ def reserve_request(session: Session, request_id: str, report_id: str, task_key:
         if db.execute("SELECT 1 FROM model_requests WHERE request_id=?", (request_id,)).fetchone():
             db.execute("ROLLBACK")
             raise ApiError(409, "检测到重复模型请求，已阻止重复扣费。")
+        same_task_running = db.execute(
+            "SELECT 1 FROM model_requests WHERE app_name=? AND code_id=? AND task_key=? AND model=? "
+            "AND status='running' LIMIT 1",
+            (APP_NAME, session.code_id, task_key, model),
+        ).fetchone()
+        if same_task_running:
+            db.execute("ROLLBACK")
+            raise ApiError(409, "同一批资料仍在服务器处理中，请稍等后再继续，不会重复扣费。")
+        previous_attempt = db.execute(
+            "SELECT COALESCE(MAX(attempt),0) FROM model_requests "
+            "WHERE app_name=? AND code_id=? AND task_key=? AND model=?",
+            (APP_NAME, session.code_id, task_key, model),
+        ).fetchone()[0]
+        # A user may retry the same saved task after an app restart. The client
+        # attempt counter is process-local, so make the persisted audit attempt
+        # monotonic on the server instead of leaking a SQLite uniqueness error.
+        stored_attempt = max(int(attempt), int(previous_attempt) + 1)
         active = db.execute(
             "SELECT report_session_id FROM model_requests WHERE app_name=? AND code_id=? AND status='running'",
             (APP_NAME, session.code_id),
@@ -879,7 +896,7 @@ def reserve_request(session: Session, request_id: str, report_id: str, task_key:
         db.execute(
             "INSERT INTO model_requests(request_id,app_name,code_id,machine_code,report_session_id,task_key,task_type,model,attempt,status,reserved_milli,input_estimate,started_at,billing_request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, APP_NAME, session.code_id, session.machine_code, report_id, task_key, task_type,
-             model, attempt, "running", reserve, input_estimate, now, billing_request_id or request_id),
+             model, stored_attempt, "running", reserve, input_estimate, now, billing_request_id or request_id),
         )
         db.execute("COMMIT")
     return reserve
@@ -1163,6 +1180,47 @@ def provider_stream_items(upstream: Any, heartbeat_seconds: float = STREAM_HEART
         yield kind, value
 
 
+def provider_request_items(
+    candidates: tuple[ProviderRouteSnapshot, ...],
+    upstream_data: bytes,
+    request_id: str,
+    heartbeat_seconds: float = STREAM_HEARTBEAT_SECONDS,
+):
+    """Open and read an upstream request while heartbeats are already flowing.
+
+    Some providers do not return HTTP response headers until prompt preparation
+    has finished. Opening the provider before responding to the desktop leaves
+    the client completely silent during that interval. This queue starts the
+    blocking connection on a worker so the public SSE response can remain alive
+    from the first second without persisting prompts or model output.
+    """
+    events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=256)
+
+    def open_and_read() -> None:
+        try:
+            upstream = open_provider_stream(candidates, upstream_data, request_id)
+            with upstream:
+                for raw_line in upstream:
+                    events.put(("line", raw_line))
+        except BaseException as error:  # transferred back to the request thread
+            events.put(("error", error))
+        finally:
+            events.put(("done", None))
+
+    threading.Thread(target=open_and_read, name="por-provider-request", daemon=True).start()
+    while True:
+        try:
+            kind, value = events.get(timeout=max(0.01, heartbeat_seconds))
+        except queue.Empty:
+            yield "heartbeat", b": heartbeat\n\n"
+            continue
+        if kind == "done":
+            return
+        if kind == "error":
+            raise value
+        yield kind, value
+
+
 def provider_stream_completed(saw_done: bool, finish_reason: str, usage: dict[str, Any] | None,
                               sent_content: bool) -> bool:
     return bool(sent_content and (saw_done or finish_reason == "stop" or usage))
@@ -1363,24 +1421,15 @@ class Handler(BaseHTTPRequestHandler):
         saw_done = False
         finish_reason = ""
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
             try:
-                upstream = open_provider_stream(provider_candidates, upstream_data, request_id)
-            except HTTPError as error:
-                error.read(16 * 1024)
-                settle_request(session, request_id, "failed", model, None, input_estimate, 0, False)
-                if error.code in (401, 403, 404, 408, 425, 429) or error.code >= 500:
-                    raise ApiError(503, f"provider_route_unavailable：模型线路暂时不可用（{error.code}）") from error
-                raise ApiError(error.code, f"模型服务拒绝请求（{error.code}）。") from error
-            except (URLError, TimeoutError, OSError) as error:
-                settle_request(session, request_id, "failed", model, None, input_estimate, 0, False)
-                raise ApiError(503, "provider_route_unavailable：模型线路连接失败。") from error
-            with upstream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache, no-store")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-                for item_type, raw_line in provider_stream_items(upstream):
+                for item_type, raw_line in provider_request_items(
+                    provider_candidates, upstream_data, request_id
+                ):
                     if item_type == "heartbeat":
                         if client_open:
                             try:
@@ -1417,15 +1466,40 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             client_open = False
-                completed = provider_stream_completed(saw_done, finish_reason, usage, sent_content)
-                if completed and not saw_done and client_open:
+            except HTTPError as error:
+                error.read(16 * 1024)
+                message = (
+                    f"provider_route_unavailable：模型线路暂时不可用（{error.code}）"
+                    if error.code in (401, 403, 404, 408, 425, 429) or error.code >= 500
+                    else f"模型服务拒绝请求（{error.code}）。"
+                )
+                if client_open:
+                    payload = json.dumps({"error": {"message": message}}, ensure_ascii=False).encode("utf-8")
                     try:
-                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.write(b"data: " + payload + b"\n\n")
                         self.wfile.flush()
-                        saw_done = True
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         client_open = False
-                final_status = "success" if completed else "partial" if sent_content else "failed"
+            except (URLError, TimeoutError, OSError):
+                if client_open:
+                    payload = json.dumps(
+                        {"error": {"message": "provider_route_unavailable：模型线路连接失败。"}},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    try:
+                        self.wfile.write(b"data: " + payload + b"\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        client_open = False
+            completed = provider_stream_completed(saw_done, finish_reason, usage, sent_content)
+            if completed and not saw_done and client_open:
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    saw_done = True
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    client_open = False
+            final_status = "success" if completed else "partial" if sent_content else "failed"
         except ApiError:
             if final_status == "failed" and (usage or sent_content):
                 final_status = "partial"

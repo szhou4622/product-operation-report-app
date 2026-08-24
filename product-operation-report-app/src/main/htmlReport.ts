@@ -1,4 +1,5 @@
 import { marked } from 'marked'
+import { reportMarkdownForDisplay } from '../shared/reportDisplay'
 import {
   buildHtmlReportPresentation,
   type HtmlReportDistributionPresentation,
@@ -620,7 +621,7 @@ function renderKeywordCloud(cloud: HtmlReportKeywordCloudPresentation | null): s
   return `<section class="keyword-panel" aria-labelledby="keyword-cloud-title">
     <header>
       <div>
-        <small>从原始卖点表统计</small>
+        <small>仅统计“我方产品卖点”字段</small>
         <h3 id="keyword-cloud-title">${escapeHtml(cloud.title)}</h3>
       </div>
       <span>${cloud.items.length} 个高频词 · ${cloud.totalOccurrences} 次出现</span>
@@ -640,7 +641,7 @@ function renderKeywordCloud(cloud: HtmlReportKeywordCloudPresentation | null): s
         )
         .join('')}
     </div>
-    <p class="visual-note">字号只表示词语在原始卖点表中的出现频次；已过滤“产品、用户、卖点”等通用词，点击导出的原表可核对原文。</p>
+    <p class="visual-note">字号只表示关键词在“我方产品卖点”字段中的出现频次；文件名、扩展名、来源说明、证据编号和通用业务词均不参与统计，完整表格可核对原文。</p>
   </section>`
 }
 
@@ -1232,8 +1233,9 @@ function renderToc(headings: HeadingInfo[]): string {
 }
 
 export async function markdownToHtmlDocument(markdown: string): Promise<string> {
-  const clean = stripProductVisualBrief(markdown)
-  const model = parseHtmlReportModel(markdown)
+  const displayMarkdown = reportMarkdownForDisplay(markdown)
+  const clean = stripProductVisualBrief(displayMarkdown)
+  const model = parseHtmlReportModel(displayMarkdown)
   const presentation = buildHtmlReportPresentation(model)
   const headings = extractHeadings(clean)
   const rendered = String(

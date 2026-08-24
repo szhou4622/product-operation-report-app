@@ -110,6 +110,7 @@ import {
   buildStepMessages,
   buildSummaryMessages,
   COMPACT_RUNTIME_RULES,
+  planAnalysisEvidenceGroups,
   planSummaryDetailGroups
 } from '../src/renderer/src/sop'
 import { FINAL_REPORT_PARTS } from '../src/renderer/src/reportTemplate'
@@ -2184,10 +2185,12 @@ function testRepairPlanStaticContracts(): void {
   assert.match(store, /attachments: groupedAttachments/u, 'Office images remain grouped under the uploaded parent file')
   assert.match(store, /sourceHasContent/u)
   assert.ok(
-    store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)') < store.indexOf('for (const step of SOP_STEPS)'),
+    store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(evidenceSeed)') < store.indexOf('for (const step of SOP_STEPS)'),
     'analysis evidence groups are planned once before the step loop'
   )
-  assert.match(store, /:evidence_digest:v1:/u)
+  assert.match(store, /completedSummaryGroups/u)
+  assert.match(store, /analysisEvidenceSeed/u)
+  assert.match(store, /:evidence_digest:v2:/u)
   assert.match(store, /cleanedData: analysisInput/u)
   assert.match(workflow, /npm run test:regression/u)
   assert.match(workflow, /npm run test:update-release/u)
@@ -3314,6 +3317,9 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   })
   assert.match(String(digestMessages[1].content), /POR-R-ABCDEF12-000001/u)
   assert.match(String(digestMessages[1].content), /全部分析步骤|证据ID/u)
+  const evidenceGroups = planAnalysisEvidenceGroups('证据'.repeat(120_000))
+  assert.ok(evidenceGroups.length >= 3, 'large ledgers are split into responsive provider batches')
+  assert.ok(evidenceGroups.every((group) => group.length <= 45_000))
   const step1 = buildStepMessages({ stepId: 1, stepTitle: '确定产品', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
   const step2 = buildStepMessages({ stepId: 2, stepTitle: '卖点拆解', sopRules: '', cleanedData: sharedData, priorOutputs: [] })
   assert.deepEqual(step1[0], step2[0])
@@ -4894,22 +4900,26 @@ async function testHtmlReportRenderer(): Promise<void> {
 ## 5. 产品全量卖点拆解
 | 卖点维度 | 我方产品卖点 | 用户能感知的好处 |
 |---|---|---|
-| 原料 | 自然发酵酸菜，配料简单 | 家庭做菜能直接感知酸菜发酵风味 |
-| 使用 | 酸菜分袋，快速做菜 | 家庭晚餐做菜更快速 |
-| 信任 | 配料清晰，发酵过程可见 | 家庭选择酸菜时更容易核对配料 |
-| 场景 | 家庭日常酸菜做法 | 快速完成一顿家庭饭菜 |`
+| 原料 | 免清洗、免切、鲜脆、不咸纯酸；来源：项目数据.csv | 家庭做菜更方便 |
+| 使用 | 免清洗、免切、鲜脆、不咸纯酸；来源：项目数据.csv | 家庭晚餐更快速 |
+| 工艺 | 植物基益生菌直投式发酵、小叶芥菜、酸香；来源：产品手卡.pptx | 项目资料记载 |
+| 口感 | 植物基益生菌直投式发酵、小叶芥菜、酸香；来源：产品手卡.pptx | 用户购买更放心 |`
   const keywordModel = parseHtmlReportModel(keywordMarkdown)
   const keywordPlan = buildHtmlReportPresentation(keywordModel).sections.find(
     (section) => section.sectionNumber === '5'
   )
   assert.ok(keywordPlan?.keywordCloud)
   assert.ok((keywordPlan?.keywordCloud?.items.length || 0) >= 6)
-  assert.ok(keywordPlan?.keywordCloud?.items.some((item) => item.label === '家庭'))
-  assert.ok(keywordPlan?.keywordCloud?.items.some((item) => item.label === '酸菜'))
+  assert.ok(keywordPlan?.keywordCloud?.items.some((item) => /免清洗|免切|鲜脆|发酵|芥菜|酸香/u.test(item.label)))
+  assert.doesNotMatch(
+    (keywordPlan?.keywordCloud?.items || []).map((item) => item.label).join('、'),
+    /项目|数据|csv|pptx|来源|购买|家庭/u
+  )
   const keywordSection = keywordModel.sections.find((section) => section.number === '5')
   for (const item of keywordPlan?.keywordCloud?.items || []) {
     assert.ok(item.count >= 2)
     for (const source of item.sources) {
+      assert.equal(source.columnIndex, 1, 'keyword provenance must stay in the selling-point column')
       assert.equal(
         keywordSection?.tables[source.tableIndex!]?.rows[source.rowIndex!]?.[source.columnIndex!],
         source.rawValue
@@ -4918,7 +4928,7 @@ async function testHtmlReportRenderer(): Promise<void> {
   }
   const keywordHtml = await markdownToHtmlDocument(keywordMarkdown)
   assert.match(keywordHtml, /class="word-cloud"/)
-  assert.match(keywordHtml, /卖点原文高频词/)
+  assert.match(keywordHtml, /卖点关键词频次/)
   assert.match(keywordHtml, /data-count="\d+"/)
 
   const sparseKeywordPlan = buildHtmlReportPresentation(

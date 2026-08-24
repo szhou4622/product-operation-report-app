@@ -89,9 +89,13 @@ const SOURCE_LINE_CHAR_LIMIT = 1200
 const SUMMARY_TOTAL_LIMIT = 180000
 const SUMMARY_DETAIL_LIMIT = 12000
 const ANALYSIS_CONTEXT_LIMIT = 220000
-const ANALYSIS_EVIDENCE_GROUP_LIMIT = 120000
-const SUMMARY_GROUP_CHAR_LIMIT = 150000
-const SUMMARY_PART_CHAR_LIMIT = 70000
+// Large Chinese evidence batches can spend several minutes in provider-side
+// prompt preparation before the first token is emitted. Keep each upstream
+// request comfortably below that slow-start range; all chunks are still sent
+// and consolidated, so this changes latency rather than evidence coverage.
+const ANALYSIS_EVIDENCE_GROUP_LIMIT = 45000
+const SUMMARY_GROUP_CHAR_LIMIT = 70000
+const SUMMARY_PART_CHAR_LIMIT = 45000
 
 function compactSourceText(name: string, text: string): string {
   if (text.length <= SOURCE_TEXT_LIMIT) return text

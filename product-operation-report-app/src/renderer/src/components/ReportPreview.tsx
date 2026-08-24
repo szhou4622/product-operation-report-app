@@ -1,11 +1,13 @@
 import { useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { buildEvidenceSourceNameMap, reportMarkdownForDisplay } from '../../../shared/reportDisplay'
 import { useStore } from '../store'
 import { validateReport, validateReportStructure } from '../validate'
 
 export default function ReportPreview(): JSX.Element {
   const reportMarkdown = useStore((s) => s.reportMarkdown)
+  const cleanDetails = useStore((s) => s.cleanDetails)
   const reportStale = useStore((s) => s.reportStale)
   const artifacts = useStore((s) => s.artifacts)
   const phase = useStore((s) => s.phase)
@@ -17,6 +19,14 @@ export default function ReportPreview(): JSX.Element {
   const showLastExportInFolder = useStore((s) => s.showLastExportInFolder)
 
   const reportGenerating = phase === 'cleaning' || phase === 'analyzing'
+  const evidenceSourceNames = useMemo(
+    () => buildEvidenceSourceNameMap(cleanDetails),
+    [cleanDetails]
+  )
+  const displayReportMarkdown = useMemo(
+    () => reportMarkdownForDisplay(reportMarkdown, evidenceSourceNames),
+    [reportMarkdown, evidenceSourceNames]
+  )
   const exporting = exportStatus === '导出中…'
   const warnings = useMemo(
     () => (reportGenerating ? [] : validateReport(reportMarkdown)),
@@ -31,13 +41,13 @@ export default function ReportPreview(): JSX.Element {
     validateReportStructure(reportMarkdown).length === 0
   const headings = useMemo(
     () =>
-      reportMarkdown
+      displayReportMarkdown
         .split('\n')
         .map((line) => line.match(/^(#{1,3})\s+(.+)$/))
         .filter((m): m is RegExpMatchArray => Boolean(m))
         .slice(0, 18)
         .map((m) => ({ level: m[1].length, text: m[2].replace(/\*\*/g, '') })),
-    [reportMarkdown]
+    [displayReportMarkdown]
   )
 
   return (
@@ -119,7 +129,7 @@ export default function ReportPreview(): JSX.Element {
                 </div>
               )}
               <div className="markdown-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportMarkdown}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayReportMarkdown}</ReactMarkdown>
               </div>
             </main>
           </div>

@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { buildEvidenceSourceNameMap, reportMarkdownForDisplay } from '../../shared/reportDisplay'
 import type {
   AppSettings,
   CostOptimizationEvent,
@@ -70,6 +71,31 @@ const PARSE_CONCURRENCY = 2
 export const MAX_CLEANING_CONCURRENCY = 4
 const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 const CLEAN_DETAIL_MARKER = '\n\n---\n## 各来源清洗明细'
+
+function completedSummaryGroups(
+  taskJournal: Record<string, ProjectTaskSnapshot>,
+  sessionId: string
+): string[] {
+  const prefix = `${sessionId}:summary:group-v3:`
+  return Object.entries(taskJournal)
+    .filter(([key, task]) => key.startsWith(prefix) && task.status === 'complete' && Boolean(task.output?.trim()))
+    .sort(([left], [right]) => Number(left.slice(prefix.length)) - Number(right.slice(prefix.length)))
+    .map(([, task]) => task.output!.trim())
+}
+
+function analysisEvidenceSeed(
+  cleanedData: string,
+  summaryGroups: string[]
+): string {
+  if (!summaryGroups.length) return cleanedData
+  const markerAt = cleanedData.indexOf(CLEAN_DETAIL_MARKER)
+  const overview = (markerAt >= 0 ? cleanedData.slice(0, markerAt) : cleanedData).trim()
+  return [
+    overview ? `## 资料总览\n${overview}` : '',
+    '## 已完成的分组证据汇总',
+    summaryGroups.map((output, index) => `### 证据汇总 ${index + 1}/${summaryGroups.length}\n${output}`).join('\n\n')
+  ].filter(Boolean).join('\n\n')
+}
 const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
@@ -2115,6 +2141,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const sourceCount = topLevelSourceCount(get().sources)
     const imageCount = sourceImageCount(get().sources)
     let cleanedData = get().cleanedData
+    let reusableSummaryGroups = completedSummaryGroups(get().taskJournal, sessionId)
     if (!cleanedData.includes(CLEAN_DETAIL_MARKER)) {
       const details = get().cleanDetails.map((detail) => ({ name: detail.name, text: detail.text }))
       const summaryGroups = planSummaryDetailGroups(details)
@@ -2216,12 +2243,24 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       const detailFull = get().cleanDetails.map((detail) => `### ${detail.name}\n${detail.text}`).join('\n\n')
       cleanedData = `${summaryText}${CLEAN_DETAIL_MARKER}\n\n${detailFull}`
+      reusableSummaryGroups = partialSummaries
       set({ cleanedData, abortFn: null })
       get()._update(blockId, summaryText)
       await window.api.saveLastProject(buildProjectSnapshot(get()))
     }
-    const analysisEvidenceGroups = planAnalysisEvidenceGroups(cleanedData)
-    let analysisInput = cleanedData
+    if (!reusableSummaryGroups.length) {
+      reusableSummaryGroups = completedSummaryGroups(get().taskJournal, sessionId)
+    }
+    const evidenceSeed = analysisEvidenceSeed(cleanedData, reusableSummaryGroups)
+    const analysisEvidenceGroups = planAnalysisEvidenceGroups(evidenceSeed)
+    let analysisInput = evidenceSeed
+    if (reusableSummaryGroups.length) {
+      get()._post(
+        'assistant',
+        `已复用 ${reusableSummaryGroups.length} 组完整汇总证据，不再把全部清洗明细重复发送一次。`,
+        'narration'
+      )
+    }
     if (analysisEvidenceGroups.length > 1) {
       get()._post(
         'assistant',
@@ -2231,7 +2270,7 @@ export const useStore = create<StoreState>((set, get) => ({
       const digestOutputs: string[] = []
       let digestFailure = ''
       for (let index = 0; index < analysisEvidenceGroups.length; index++) {
-        const taskId = `${sessionId}:evidence_digest:v1:source:${index + 1}`
+        const taskId = `${sessionId}:evidence_digest:v2:source:${index + 1}`
         const saved = get().taskJournal[taskId]
         if (saved?.status === 'complete' && saved.output?.trim()) {
           digestOutputs.push(saved.output)
@@ -2249,7 +2288,7 @@ export const useStore = create<StoreState>((set, get) => ({
           1,
           {
             reportSessionId: sessionId,
-            taskType: 'analysis_step',
+            taskType: 'summary',
             taskKey: taskId,
             billingRequestId: taskId,
             isVision: false,
@@ -2283,7 +2322,7 @@ export const useStore = create<StoreState>((set, get) => ({
         const groups = planAnalysisEvidenceGroups(evidenceDigest)
         const consolidated: string[] = []
         for (let index = 0; index < groups.length; index++) {
-          const taskId = `${sessionId}:evidence_digest:v1:${round}:${index + 1}`
+          const taskId = `${sessionId}:evidence_digest:v2:${round}:${index + 1}`
           const saved = get().taskJournal[taskId]
           if (saved?.status === 'complete' && saved.output?.trim()) {
             consolidated.push(saved.output)
@@ -2301,7 +2340,7 @@ export const useStore = create<StoreState>((set, get) => ({
             1,
             {
               reportSessionId: sessionId,
-              taskType: 'analysis_step',
+              taskType: 'summary',
               taskKey: taskId,
               billingRequestId: taskId,
               isVision: false,
@@ -2722,7 +2761,7 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   exportReport: async (format) => {
-    const { reportMarkdown: md, phase, artifacts, reportStale, exportStatus } = get()
+    const { reportMarkdown: md, cleanDetails, phase, artifacts, reportStale, exportStatus } = get()
     if (exportStatus === '导出中…') return
     if (phase === 'cleaning' || phase === 'analyzing') {
       set({ exportStatus: '报告仍在生成，请完成后再导出。' })
@@ -2747,13 +2786,14 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     set({ exportStatus: '导出中…', lastExportPath: '' })
     const name = defaultReportName(format)
+    const displayMarkdown = reportMarkdownForDisplay(md, buildEvidenceSourceNameMap(cleanDetails))
     try {
       const res =
         format === 'html'
-          ? await window.api.exportHtml(md, name)
+          ? await window.api.exportHtml(displayMarkdown, name)
           : format === 'md'
-            ? await window.api.exportMarkdown(md, name)
-            : await window.api.exportDocx(md, name)
+            ? await window.api.exportMarkdown(displayMarkdown, name)
+            : await window.api.exportDocx(displayMarkdown, name)
       if (res.ok) set({ exportStatus: `已导出：${res.path}`, lastExportPath: res.path || '' })
       else if (res.canceled) set({ exportStatus: '', lastExportPath: '' })
       else set({ exportStatus: `导出失败：${friendlyError(res.error)}`, lastExportPath: '' })
