@@ -17,9 +17,12 @@ describe('v1 report modules', () => {
     expect([...REPORT_MODULES].sort((left, right) => left.id - right.id).map((module) => module.id)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
   })
 
-  it('blocks missing product supply while skipping only directly missing modules', () => {
-    const blocked = evaluateSourceSufficiency(REPORT_MODULES, ['audience-data', 'material-data'])
-    expect(blocked.blocked).toContain('产品')
+  it('never blocks the report and analyzes every module that has usable source data', () => {
+    const missingProduct = evaluateSourceSufficiency(REPORT_MODULES, ['audience-data', 'material-data'])
+    expect(missingProduct.blocked).toBeNull()
+    expect(missingProduct.skipped.get('product-info')).toContain('暂无分析')
+    expect(missingProduct.skipped.has('platform-audience')).toBe(false)
+    expect(missingProduct.partial.get('platform-audience')).toContain('经营与交易数据')
     const allowed = evaluateSourceSufficiency(REPORT_MODULES, [
       'product-supply', 'audience-data', 'business-data', 'material-data'
     ])

@@ -2268,7 +2268,6 @@ export const useStore = create<StoreState>((set, get) => ({
       const skippedReason = sufficiency.skipped.get(module.key)
       if (skippedReason) {
         updateModuleState(module.key, { status: 'skipped', message: skippedReason, updatedAt: new Date().toISOString() })
-        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: skippedReason } }))
         return
       }
       const savedTaskId = `${sessionId}:module:v1:${module.key}`
@@ -2278,8 +2277,6 @@ export const useStore = create<StoreState>((set, get) => ({
         updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
         return
       }
-      updateModuleState(module.key, { status: 'running', updatedAt: new Date().toISOString() })
-      const prompt = await window.api.getModulePrompt(module.key)
       const moduleSources = get().sources.flatMap((source) => {
         if (!source.kindV1 || !module.requiredSources.includes(source.kindV1)) return []
         const text = detailsById.get(source.id)
@@ -2290,10 +2287,20 @@ export const useStore = create<StoreState>((set, get) => ({
         const output = dependency ? get().artifacts[dependency.id] : ''
         return dependency && output ? [{ key, title: `M${dependency.id} ${dependency.title}`, output }] : []
       })
-      const missingDependencies = module.dependsOn.flatMap((key) => {
+      if (module.dependsOn.length > 0 && module.requiredSources.length === 0 && upstream.length === 0) {
+        const message = `暂无分析：缺少${module.dependsOn.map((key) => moduleByTitle(key)).join('、')}的可用结果。`
+        updateModuleState(module.key, { status: 'skipped', message, updatedAt: new Date().toISOString() })
+        return
+      }
+      updateModuleState(module.key, { status: 'running', updatedAt: new Date().toISOString() })
+      const prompt = await window.api.getModulePrompt(module.key)
+      const missingDependencies = [
+        ...module.dependsOn.flatMap((key) => {
         const dependency = moduleByKey.get(key)
         return dependency && !get().artifacts[dependency.id] ? [`M${dependency.id} ${dependency.title}`] : []
-      })
+        }),
+        ...(sufficiency.partial.get(module.key) ? [sufficiency.partial.get(module.key)!] : [])
+      ]
       const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements: get().steering })
       if (module.key === 'benchmark-brands') {
         const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']

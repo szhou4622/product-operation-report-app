@@ -26,6 +26,7 @@ export interface ModuleContext {
 export interface SourceSufficiency {
   available: Set<SourceKindV1>
   skipped: Map<ModuleKey, string>
+  partial: Map<ModuleKey, string>
   blocked: string | null
 }
 
@@ -43,15 +44,17 @@ export function evaluateSourceSufficiency(
 ): SourceSufficiency {
   const available = new Set(kinds.filter((kind): kind is SourceKindV1 => Boolean(kind)))
   const skipped = new Map<ModuleKey, string>()
-  let blocked: string | null = null
+  const partial = new Map<ModuleKey, string>()
   for (const module of modules) {
+    if (!module.requiredSources.length) continue
     const missing = module.requiredSources.filter((kind) => !available.has(kind))
     if (!missing.length) continue
     const labels = missing.map((kind) => SOURCE_KIND_LABELS[kind]).join('、')
-    if (module.hardRequired) blocked = `缺少${labels}，无法开始分析。请至少上传并确认一份产品资料。`
-    else skipped.set(module.key, `本模块因缺少${labels}未输出。`)
+    const hasAnyUsableSource = module.requiredSources.some((kind) => available.has(kind))
+    if (hasAnyUsableSource) partial.set(module.key, `未上传${labels}，本模块仅根据现有资料分析。`)
+    else skipped.set(module.key, `暂无分析：未上传${labels}。`)
   }
-  return { available, skipped, blocked }
+  return { available, skipped, partial, blocked: null }
 }
 
 export const MODULE_TASK_TYPES: Record<ModuleKey, ModelTaskType> = {
