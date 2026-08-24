@@ -2471,7 +2471,23 @@ export const useStore = create<StoreState>((set, get) => ({
     }))
     await window.api.saveLastProject(buildProjectSnapshot(get()))
     await storeCompleteReportResult(get()).catch(() => undefined)
-    get()._post('assistant', '✅ 8模块分析已完成。失败或缺资料的模块已在报告中明确标注，可直接检查并导出。', 'checkpoint')
+    const finishedStates = REPORT_MODULES.map((module) => get().moduleStates[module.key]?.status)
+    const failedCount = finishedStates.filter((status) => status === 'failed').length
+    const skippedCount = finishedStates.filter((status) => status === 'skipped').length
+    const doneCount = finishedStates.filter((status) => status === 'done').length
+    if (failedCount > 0) {
+      get()._post(
+        'assistant',
+        `⚠️ 8模块流程已结束：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个、失败 ${failedCount} 个。失败模块没有生成内容，可在左侧点击“重试本模块”；已有结果均已保留。`,
+        'error'
+      )
+    } else {
+      get()._post(
+        'assistant',
+        `✅ 8模块分析已完成：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个。可直接检查并导出。`,
+        'checkpoint'
+      )
+    }
     return
 
     const { sopRules } = get()
