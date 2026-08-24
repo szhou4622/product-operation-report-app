@@ -138,7 +138,9 @@ function parseWallet(value: unknown): PointsWalletStatus {
       pointsPerCny: finiteNumber(pricing.pointsPerCny),
       cnyPerCostPoint: finiteNumber(pricing.cnyPerCostPoint),
       costRate: finiteNumber(pricing.costRate),
-      chargeMultiplier: finiteNumber(pricing.chargeMultiplier)
+      chargeMultiplier: finiteNumber(pricing.chargeMultiplier),
+      webSearchUsdPerCall: finiteNumber(pricing.webSearchUsdPerCall),
+      webSearchReportLimit: finiteNumber(pricing.webSearchReportLimit)
     },
     ledger: parseLedger(wallet.ledger)
   }

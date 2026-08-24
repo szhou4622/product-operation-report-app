@@ -3469,7 +3469,11 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   useStore.setState({
     reportReuseOffer: null,
     analysisSessionId: 'reuse-session',
-    sources: reportInput.sources.map((item, index) => ({ ...item, id: `source-${index}` })),
+    sources: reportInput.sources.map((item, index) => ({
+      ...item,
+      id: `source-${index}`,
+      kindV1: index === 0 ? 'product-supply' as const : 'material-data' as const
+    })),
     messages: [],
     cleanedData: '',
     cleanDetails: [],
@@ -3483,7 +3487,7 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(useStore.getState().reportReuseOffer?.cacheKey, reportHit.cacheKey)
   await useStore.getState().acceptReportReuse()
   assert.equal(modelOrBillingCalls, 0, 'full report reuse does not call model or points billing')
-  assert.equal(useStore.getState().phase, 'checkpoint2')
+  assert.equal(useStore.getState().phase, 'done')
   assert.equal(useStore.getState().reportMarkdown, completeReport)
   assert.match(useStore.getState().messages.at(-1)?.text || '', /已恢复上次的完整报告/u)
   assert.doesNotMatch(useStore.getState().messages.at(-1)?.text || '', /Token|扣除|计费|毛利/u)
@@ -4191,7 +4195,16 @@ async function testPrivacyMustMatchEndpoint(): Promise<void> {
       privacyEndpoint: 'https://old.example/v1'
     },
     phase: 'idle',
-    sources: [{ id: 'safe', name: '自有资料.txt', kind: 'doc', text: '内容', attribution: '自有数据' }],
+    sources: [
+      {
+        id: 'safe',
+        name: '自有资料.txt',
+        kind: 'doc',
+        kindV1: 'product-supply',
+        text: '内容',
+        attribution: '自有数据'
+      }
+    ],
     messages: [],
     cleanedData: '',
     cleanDetails: [],

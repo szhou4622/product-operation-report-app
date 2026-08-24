@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "modules": [
+    {
+      "id": "M1",
+      "title": "产品信息",
+      "fileName": "M1-product-info.md",
+      "systemPromptSha256": "dec4c6304cc3c1388c0b69d2beb3d62ec38bf2006b80a0bf5aa840c97928d62e",
+      "systemPromptChars": 3281,
+      "outputTemplateChars": 149
+    },
+    {
+      "id": "M2",
+      "title": "平台人群数据",
+      "fileName": "M2-platform-audience.md",
+      "systemPromptSha256": "7688b18598ecb02ecf67fd5343657e75896ac5c302f83d1e5eff96d199c462e4",
+      "systemPromptChars": 3991,
+      "outputTemplateChars": 114
+    },
+    {
+      "id": "M3",
+      "title": "内容素材判断",
+      "fileName": "M3-material-review.md",
+      "systemPromptSha256": "e5ee1245afdba429bbb9c0f1239499d2d5f84b26761a9d267371c5671164ad4f",
+      "systemPromptChars": 4082,
+      "outputTemplateChars": 327
+    },
+    {
+      "id": "M4",
+      "title": "对标推荐",
+      "fileName": "M4-benchmark-brands.md",
+      "systemPromptSha256": "edb08ebe8cf2cd65158936be07b9f21670b554f6830ee96ad640a5f6597efbd5",
+      "systemPromptChars": 4987,
+      "outputTemplateChars": 489
+    },
+    {
+      "id": "M5",
+      "title": "产品卖点",
+      "fileName": "M5-selling-points.md",
+      "systemPromptSha256": "3b47199a64b5554054d58c6a6f254d3866958b59d9ef5fb56013cf1ea08733a4",
+      "systemPromptChars": 5440,
+      "outputTemplateChars": 294
+    },
+    {
+      "id": "M6",
+      "title": "用户真实需求VOC",
+      "fileName": "M6-voc.md",
+      "systemPromptSha256": "a593437e96be1952dcde5ee74935489c6a4007125c8c8a7426d1c0b288af27dc",
+      "systemPromptChars": 5729,
+      "outputTemplateChars": 318
+    },
+    {
+      "id": "M7",
+      "title": "总结卖点排序",
+      "fileName": "M7-selling-point-ranking.md",
+      "systemPromptSha256": "01182d711f08a935f707ee87895a78f79d61b032518ab2a6cd20162e91a56edc",
+      "systemPromptChars": 6144,
+      "outputTemplateChars": 350
+    },
+    {
+      "id": "M8",
+      "title": "核心人群×卖点×场景匹配",
+      "fileName": "M8-audience-sp-scene.md",
+      "systemPromptSha256": "a25debbcad49201dde182bbb24fbd981855743a7b7f7c2c39ad66ef2dc37f941",
+      "systemPromptChars": 7345,
+      "outputTemplateChars": 333
+    }
+  ]
+}

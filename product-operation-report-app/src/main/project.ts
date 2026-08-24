@@ -21,7 +21,10 @@ import type {
   ProjectStoragePreflight,
   ProjectSourceSnapshot,
   ProjectTaskSnapshot,
-  SavedProject
+  SavedProject,
+  ModuleKey,
+  ModuleRunState,
+  SourceKindV1
 } from '../shared/types'
 
 type PlainRecord = Record<string, unknown>
@@ -333,6 +336,9 @@ function sanitizeSource(value: unknown): ProjectSourceSnapshot | null {
     attribution: optionalString(value.attribution),
     platform: optionalString(value.platform),
     purpose: optionalString(value.purpose),
+    kindV1: ['product-supply', 'business-data', 'material-data', 'audience-data', 'voice-data'].includes(asString(value.kindV1))
+      ? value.kindV1 as SourceKindV1
+      : undefined,
     note: optionalString(value.note),
     size: optionalNumber(value.size),
     topLevelId: optionalString(value.topLevelId),
@@ -397,7 +403,7 @@ function sanitizeArtifactRecord(value: unknown): Record<number, string> {
 
 function sanitizeTaskJournal(value: unknown): Record<string, ProjectTaskSnapshot> {
   if (!isPlainObject(value)) return {}
-  const allowedKinds = new Set<ProjectTaskSnapshot['kind']>(['parse', 'source_clean', 'summary', 'analysis_step', 'final_part'])
+  const allowedKinds = new Set<ProjectTaskSnapshot['kind']>(['parse', 'source_clean', 'summary', 'analysis_step', 'final_part', 'module'])
   const allowedStatuses = new Set<ProjectTaskSnapshot['status']>(['complete', 'failed', 'interrupted'])
   const result: Record<string, ProjectTaskSnapshot> = {}
   for (const [key, raw] of Object.entries(value)) {
@@ -409,6 +415,25 @@ function sanitizeTaskJournal(value: unknown): Record<string, ProjectTaskSnapshot
       status: raw.status as ProjectTaskSnapshot['status'],
       output: optionalString(raw.output),
       coverage: sanitizeCleaningCoverage(raw.coverage),
+      updatedAt: optionalString(raw.updatedAt) || new Date().toISOString()
+    }
+  }
+  return result
+}
+
+function sanitizeModuleStates(value: unknown): Partial<Record<ModuleKey, ModuleRunState>> {
+  if (!isPlainObject(value)) return {}
+  const keys = new Set<ModuleKey>([
+    'product-info', 'platform-audience', 'material-review', 'benchmark-brands',
+    'selling-points', 'voc', 'selling-point-ranking', 'audience-sp-scene'
+  ])
+  const statuses = new Set<ModuleRunState['status']>(['pending', 'running', 'done', 'failed', 'skipped'])
+  const result: Partial<Record<ModuleKey, ModuleRunState>> = {}
+  for (const [key, raw] of Object.entries(value)) {
+    if (!keys.has(key as ModuleKey) || !isPlainObject(raw) || !statuses.has(raw.status as ModuleRunState['status'])) continue
+    result[key as ModuleKey] = {
+      status: raw.status as ModuleRunState['status'],
+      message: optionalString(raw.message),
       updatedAt: optionalString(raw.updatedAt) || new Date().toISOString()
     }
   }
@@ -447,7 +472,11 @@ function sanitizeProject(value: unknown): SavedProject {
     updatedAt: optionalString(input.updatedAt) || new Date().toISOString(),
     missingBlobs: Array.isArray(input.missingBlobs)
       ? input.missingBlobs.filter((item): item is string => typeof item === 'string').slice(0, 200)
-      : undefined
+      : undefined,
+    engineVersion: input.engineVersion === 'v1' ? 'v1' : undefined,
+    readOnly: Boolean(input.readOnly),
+    legacyNotice: optionalString(input.legacyNotice),
+    moduleStates: sanitizeModuleStates(input.moduleStates)
   }
 }
 

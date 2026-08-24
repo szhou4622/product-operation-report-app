@@ -1,4 +1,4 @@
-import { SOP_STEPS } from '../../../shared/types'
+import { REPORT_MODULES } from '../../../shared/types'
 import { derivedSourceCount, topLevelSourceCount, useStore } from '../store'
 
 const MACROS = [
@@ -10,18 +10,15 @@ const MACROS = [
 ]
 
 const ANALYSIS_COPY: Record<number, { title: string; desc: string }> = {
-  1: { title: '确定产品', desc: '产品、规格、价格、定位' },
-  2: { title: '12维卖点', desc: '包装、价格、工艺、场景等' },
-  3: { title: '竞品卖点', desc: '竞品素材与卖点拆解' },
-  4: { title: '自有卖点排序', desc: '按用户决策价值排序' },
-  5: { title: '人群画像', desc: '核心人群与购买动机' },
-  6: { title: '痛点场景卖点矩阵', desc: '人群 x 痛点 x 场景 x 卖点' },
-  7: { title: '视频号主线', desc: '3-5条内容主线' },
-  8: { title: '执行选题表', desc: '可交付的选题与脚本方向' },
-  9: { title: '成稿生成', desc: '整合为正式经营报告' }
+  1: { title: '产品信息', desc: '9维客观产品事实' },
+  2: { title: '平台人群数据', desc: '按平台隔离成交画像' },
+  3: { title: '内容素材判断', desc: '自有与竞品框架汇总' },
+  4: { title: '对标推荐', desc: '7维真实品牌搜索' },
+  5: { title: '产品卖点', desc: '四大需求买点翻译' },
+  6: { title: '用户真实需求VOC', desc: '频次、占比与代表原话' },
+  7: { title: '总结卖点排序', desc: '真实卖点TOP10分档' },
+  8: { title: '人群×卖点×场景', desc: 'TOP5真实匹配组合' }
 }
-
-const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 
 type TaskStatus = 'done' | 'active' | 'paused' | 'idle'
 
@@ -47,20 +44,22 @@ export default function PhaseTracker(): JSX.Element {
   const cleaningProgress = useStore((s) => s.cleaningProgress)
   const reportMarkdown = useStore((s) => s.reportMarkdown)
   const artifacts = useStore((s) => s.artifacts)
+  const moduleStates = useStore((s) => s.moduleStates)
+  const readOnly = useStore((s) => s.readOnly)
+  const retryModule = useStore((s) => s.retryModule)
   const ai = activeIndex(phase)
   const uploadedFileCount = topLevelSourceCount(sources)
   const parsedFileCount = topLevelSourceCount(sources.filter((source) => source.dataUrl || source.text))
   const competitorFileCount = topLevelSourceCount(sources.filter((source) => /竞品数据|竞品|对标|对手/.test(source.attribution ?? '')))
   const derivedCount = derivedSourceCount(sources)
 
-  const analysisTasks = SOP_STEPS.map((step) => ({
-    id: step.id,
-    confirm: step.confirm,
-    title: ANALYSIS_COPY[step.id]?.title ?? step.title,
-    desc: ANALYSIS_COPY[step.id]?.desc ?? ''
+  const analysisTasks = [...REPORT_MODULES].sort((left, right) => left.id - right.id).map((module) => ({
+    id: module.id,
+    key: module.key,
+    title: ANALYSIS_COPY[module.id]?.title ?? module.title,
+    desc: ANALYSIS_COPY[module.id]?.desc ?? ''
   }))
   const isTaskDone = (id: number): boolean => {
-    if (id === REPORT_STEP_ID) return Boolean(artifacts[id]) || phase === 'checkpoint2' || phase === 'done'
     return Boolean(artifacts[id])
   }
   const doneCount = analysisTasks.filter((task) => isTaskDone(task.id)).length
@@ -68,10 +67,8 @@ export default function PhaseTracker(): JSX.Element {
 
   const getTaskStatus = (id: number): TaskStatus => {
     if (isTaskDone(id)) return 'done'
-    if (phase === 'analyzing') {
-      if (id === firstPending?.id) return 'active'
-      if (id === REPORT_STEP_ID && reportMarkdown) return 'active'
-    }
+    if (phase === 'analyzing' && moduleStates[analysisTasks.find((task) => task.id === id)?.key || 'product-info']?.status === 'running') return 'active'
+    if (moduleStates[analysisTasks.find((task) => task.id === id)?.key || 'product-info']?.status === 'failed') return 'paused'
     if (phase === 'checkpoint1' && id === firstPending?.id && doneCount > 0) return 'paused'
     return 'idle'
   }
@@ -100,8 +97,8 @@ export default function PhaseTracker(): JSX.Element {
         <div className="analysis-flow">
           <div className="analysis-flow-head">
             <div>
-              <b>9 项自动分析</b>
-              <span>{phase === 'analyzing' ? '系统正在逐项处理' : '确认资料后自动完成'}</span>
+              <b>8 模块自动分析</b>
+              <span>{readOnly ? '旧报告只读' : phase === 'analyzing' ? '按四波并行处理' : '确认资料后自动完成'}</span>
             </div>
             <em>
               {doneCount}/{analysisTasks.length}
@@ -122,7 +119,11 @@ export default function PhaseTracker(): JSX.Element {
                     </div>
                     <div className="analysis-task-desc">{task.desc}</div>
                   </div>
-                  <span className="analysis-task-status">{taskLabel(status)}</span>
+                  {moduleStates[task.key]?.status === 'failed' && !readOnly ? (
+                    <button className="btn xs" type="button" onClick={() => void retryModule(task.key)}>重试本模块</button>
+                  ) : (
+                    <span className="analysis-task-status">{taskLabel(status)}</span>
+                  )}
                 </div>
               )
             })}
@@ -180,7 +181,7 @@ export default function PhaseTracker(): JSX.Element {
           )}
         </div>
         <div className="macro-note">
-          只需确认两次：资料整理完成后一次、报告初稿完成后一次。过程中可随时补充要求。
+          新版只需确认一次：资料整理完成后确认，随后8个模块自动完成并生成报告。
         </div>
       </div>
     </div>

@@ -134,6 +134,8 @@ export interface PointsPricingInfo {
   pointsPerCny: number
   cnyPerCostPoint: number
   costRate: number
+  webSearchUsdPerCall?: number
+  webSearchReportLimit?: number
   chargeMultiplier: number
 }
 
@@ -221,6 +223,14 @@ export type ModelTaskType =
   | 'analysis_step'
   | 'final_part'
   | 'revision_part'
+  | 'module_product_info'
+  | 'module_platform_audience'
+  | 'module_material_review'
+  | 'module_benchmark'
+  | 'module_selling_points'
+  | 'module_voc'
+  | 'module_ranking'
+  | 'module_audience_sp_scene'
 
 /** 每次模型请求必须携带的、与提示词内容无关的计量上下文。 */
 export interface ModelTaskContext {
@@ -383,6 +393,7 @@ export interface SourceCleanCacheInput {
   attribution?: string
   platform?: string
   purpose?: string
+  kindV1?: SourceKindV1
   note?: string
 }
 
@@ -471,6 +482,7 @@ export interface ProjectSourceSnapshot {
   /** Root upload selected by the user. Derived pages/images/ZIP entries share this id. */
   topLevelId?: string
   derivedKind?: 'archive-entry' | 'embedded-image' | 'rendered-page' | 'converted-page'
+  kindV1?: SourceKindV1
 }
 
 export interface ProjectMessageSnapshot {
@@ -504,7 +516,7 @@ export interface CleaningCheckpoint {
 }
 
 export interface ProjectTaskSnapshot {
-  kind: 'parse' | 'source_clean' | 'summary' | 'analysis_step' | 'final_part'
+  kind: 'parse' | 'source_clean' | 'summary' | 'analysis_step' | 'final_part' | 'module'
   status: 'complete' | 'failed' | 'interrupted'
   output?: string
   coverage?: CleaningCoverage
@@ -529,6 +541,10 @@ export interface SavedProject {
   updatedAt: string
   /** Missing external data chunks encountered during recovery; unaffected project content remains usable. */
   missingBlobs?: string[]
+  engineVersion?: 'v1'
+  readOnly?: boolean
+  legacyNotice?: string
+  moduleStates?: Partial<Record<ModuleKey, ModuleRunState>>
 }
 
 export interface ProjectStoragePreflight {
@@ -597,7 +613,64 @@ export type ChatStreamEvent =
   | { type: 'done'; full: string; usage: ModelTokenUsage }
   | { type: 'error'; message: string; usage: ModelTokenUsage }
 
-/** SOP 步骤定义（阶段一仅静态展示） */
+export type ModuleKey =
+  | 'product-info'
+  | 'platform-audience'
+  | 'material-review'
+  | 'benchmark-brands'
+  | 'selling-points'
+  | 'voc'
+  | 'selling-point-ranking'
+  | 'audience-sp-scene'
+
+export type SourceKindV1 =
+  | 'product-supply'
+  | 'business-data'
+  | 'material-data'
+  | 'audience-data'
+  | 'voice-data'
+
+export interface ReportModule {
+  id: number
+  key: ModuleKey
+  title: string
+  wave: 1 | 2 | 3 | 4
+  dependsOn: ModuleKey[]
+  requiredSources: SourceKindV1[]
+  hardRequired: boolean
+  needsWebSearch: boolean
+  promptFile: string
+}
+
+export interface ModulePrompt {
+  key: ModuleKey
+  systemPrompt: string
+  outputTemplate: string
+  validation: string
+  inputDescription: string
+  purpose: string
+}
+
+export type ModuleRunStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+
+export interface ModuleRunState {
+  status: ModuleRunStatus
+  message?: string
+  updatedAt: string
+}
+
+export const REPORT_MODULES: ReportModule[] = [
+  { id: 1, key: 'product-info', title: '产品信息', wave: 1, dependsOn: [], requiredSources: ['product-supply'], hardRequired: true, needsWebSearch: false, promptFile: 'M1-product-info.md' },
+  { id: 2, key: 'platform-audience', title: '平台人群数据', wave: 1, dependsOn: [], requiredSources: ['audience-data', 'business-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M2-platform-audience.md' },
+  { id: 3, key: 'material-review', title: '内容素材判断', wave: 1, dependsOn: [], requiredSources: ['material-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M3-material-review.md' },
+  { id: 6, key: 'voc', title: '用户真实需求VOC', wave: 1, dependsOn: [], requiredSources: ['voice-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M6-voc.md' },
+  { id: 5, key: 'selling-points', title: '产品卖点', wave: 2, dependsOn: ['product-info'], requiredSources: ['material-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M5-selling-points.md' },
+  { id: 4, key: 'benchmark-brands', title: '对标推荐', wave: 3, dependsOn: ['product-info', 'platform-audience', 'material-review'], requiredSources: [], hardRequired: false, needsWebSearch: true, promptFile: 'M4-benchmark-brands.md' },
+  { id: 7, key: 'selling-point-ranking', title: '总结卖点排序', wave: 3, dependsOn: ['selling-points', 'material-review'], requiredSources: [], hardRequired: false, needsWebSearch: false, promptFile: 'M7-selling-point-ranking.md' },
+  { id: 8, key: 'audience-sp-scene', title: '核心人群×卖点×场景匹配', wave: 4, dependsOn: ['platform-audience', 'selling-points', 'voc', 'selling-point-ranking'], requiredSources: [], hardRequired: false, needsWebSearch: false, promptFile: 'M8-audience-sp-scene.md' }
+]
+
+/** Legacy 0.4.x steps are retained only for read-only project display. */
 export interface SopStep {
   id: number
   key: string
@@ -605,7 +678,7 @@ export interface SopStep {
   confirm: boolean // 是否为人工确认点
 }
 
-export const SOP_STEPS: SopStep[] = [
+export const LEGACY_SOP_STEPS: SopStep[] = [
   { id: 1, key: 'product', title: '确定产品', confirm: true },
   { id: 2, key: 'own-sellingpoints', title: '12维产品卖点拆解', confirm: false },
   { id: 3, key: 'competitor-sellingpoints', title: '竞品卖点拆解', confirm: false },
@@ -616,3 +689,6 @@ export const SOP_STEPS: SopStep[] = [
   { id: 8, key: 'execution', title: '执行选题表', confirm: true },
   { id: 9, key: 'report', title: '成稿', confirm: true }
 ]
+
+/** @deprecated v1 analysis uses REPORT_MODULES. Kept for legacy read-only rendering. */
+export const SOP_STEPS = LEGACY_SOP_STEPS

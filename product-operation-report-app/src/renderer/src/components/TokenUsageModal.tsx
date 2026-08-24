@@ -6,7 +6,15 @@ const STAGE_LABELS: Record<ModelTaskType, string> = {
   summary: '资料汇总',
   analysis_step: '分析步骤 1–8',
   final_part: '四段成稿',
-  revision_part: '报告修订'
+  revision_part: '报告修订',
+  module_product_info: 'M1 产品信息',
+  module_platform_audience: 'M2 平台人群',
+  module_material_review: 'M3 素材判断',
+  module_benchmark: 'M4 对标推荐',
+  module_selling_points: 'M5 产品卖点',
+  module_voc: 'M6 用户VOC',
+  module_ranking: 'M7 卖点排序',
+  module_audience_sp_scene: 'M8 人群卖点场景'
 }
 
 function formatTokens(value: number): string {

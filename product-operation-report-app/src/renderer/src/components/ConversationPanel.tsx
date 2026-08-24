@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
+import type { SourceKindV1 } from '../../../shared/types'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { derivedSourceCount, evidenceScopeStats, topLevelSourceCount, useStore } from '../store'
@@ -7,6 +8,8 @@ import { derivedSourceCount, evidenceScopeStats, topLevelSourceCount, useStore }
 export default function ConversationPanel(): JSX.Element {
   const sources = useStore((s) => s.sources)
   const phase = useStore((s) => s.phase)
+  const readOnly = useStore((s) => s.readOnly)
+  const legacyNotice = useStore((s) => s.legacyNotice)
   const messages = useStore((s) => s.messages)
   const cleaningProgress = useStore((s) => s.cleaningProgress)
   const cleanDetails = useStore((s) => s.cleanDetails)
@@ -15,7 +18,7 @@ export default function ConversationPanel(): JSX.Element {
   const setSourceAttribution = useStore((s) => s.setSourceAttribution)
   const setUnconfirmedAttribution = useStore((s) => s.setUnconfirmedAttribution)
   const setSourcePlatform = useStore((s) => s.setSourcePlatform)
-  const setSourcePurpose = useStore((s) => s.setSourcePurpose)
+  const setSourceKindV1 = useStore((s) => s.setSourceKindV1)
   const setSourceNote = useStore((s) => s.setSourceNote)
   const startGeneration = useStore((s) => s.startGeneration)
   const confirmCheckpoint = useStore((s) => s.confirmCheckpoint)
@@ -51,8 +54,9 @@ export default function ConversationPanel(): JSX.Element {
   const parsedCount = sources.filter((s) => s.dataUrl || s.text).length
   const parsingCount = sources.filter((s) => s.parsing).length
   const processedCount = sources.filter((s) => !s.parsing).length
-  const importLocked = running || parsingCount > 0
+  const importLocked = readOnly || running || parsingCount > 0
   const unconfirmedCount = sources.filter((s) => (s.dataUrl || s.text) && !s.attribution).length
+  const unconfirmedKindCount = sources.filter((s) => (s.dataUrl || s.text) && !s.kindV1).length
   const confirmedAttributionCount = sources.filter(
     (s) => (s.dataUrl || s.text) && Boolean(s.attribution)
   ).length
@@ -144,6 +148,7 @@ export default function ConversationPanel(): JSX.Element {
       }}
     >
       <div className="pane-title">{phaseTitle}</div>
+      {readOnly && <div className="src-tip">{legacyNotice || '此报告由旧版本生成，仅支持查看导出'}</div>}
 
       {/* 数据源条 */}
       <div className="src-strip" style={{ height: sources.length > 0 ? sourceHeight : undefined }}>
@@ -362,14 +367,20 @@ export default function ConversationPanel(): JSX.Element {
                       disabled={importLocked}
                       onChange={(e) => setSourcePlatform(s.id, e.target.value)}
                     />
-                    <input
+                    <select
                       className="src-select"
-                      list="source-purpose-options"
-                      placeholder="信息类型（选填）"
-                      value={s.purpose ?? ''}
+                      aria-label="业务资料类型"
+                      value={s.kindV1 ?? ''}
                       disabled={importLocked}
-                      onChange={(e) => setSourcePurpose(s.id, e.target.value)}
-                    />
+                      onChange={(e) => setSourceKindV1(s.id, e.target.value as SourceKindV1)}
+                    >
+                      <option value="">选择资料类型（必选）</option>
+                      <option value="product-supply">产品与供给资料</option>
+                      <option value="business-data">经营与交易数据</option>
+                      <option value="material-data">内容素材与表现数据</option>
+                      <option value="audience-data">人群与行为画像</option>
+                      <option value="voice-data">用户声音与反馈</option>
+                    </select>
                     <span className={`src-status ${s.parsing ? 'parsing' : s.error ? 'error' : 'ready'}`}>
                       {s.parsing
                         ? '解析中'
@@ -565,13 +576,15 @@ export default function ConversationPanel(): JSX.Element {
           {phase === 'idle' && (
             <button
               className="btn primary big"
-              disabled={!hasUsable || parsingCount > 0 || unconfirmedCount > 0}
+              disabled={!hasUsable || parsingCount > 0 || unconfirmedCount > 0 || unconfirmedKindCount > 0}
               onClick={() => void startGeneration()}
             >
               {parsingCount > 0
                 ? `正在读取资料（还有 ${parsingCount} 份）`
                 : unconfirmedCount > 0
                   ? `请先确认 ${unconfirmedCount} 份资料归属`
+                  : unconfirmedKindCount > 0
+                    ? `请先选择 ${unconfirmedKindCount} 份资料类型`
                   : '开始生成报告'}
             </button>
           )}

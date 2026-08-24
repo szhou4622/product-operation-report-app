@@ -24,7 +24,15 @@ const TASK_TYPES: readonly ModelTaskType[] = [
   'summary',
   'analysis_step',
   'final_part',
-  'revision_part'
+  'revision_part',
+  'module_product_info',
+  'module_platform_audience',
+  'module_material_review',
+  'module_benchmark',
+  'module_selling_points',
+  'module_voc',
+  'module_ranking',
+  'module_audience_sp_scene'
 ]
 const FINAL_PART_IDS = new Set(['part-0-4', 'part-5-8', 'part-9', 'part-10-11'])
 

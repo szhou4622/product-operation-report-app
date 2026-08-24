@@ -91,6 +91,10 @@ export default function App(): JSX.Element {
   const reportMarkdown = useStore((s) => s.reportMarkdown)
   const reportStale = useStore((s) => s.reportStale)
   const steering = useStore((s) => s.steering)
+  const engineVersion = useStore((s) => s.engineVersion)
+  const readOnly = useStore((s) => s.readOnly)
+  const legacyNotice = useStore((s) => s.legacyNotice)
+  const moduleStates = useStore((s) => s.moduleStates)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const saveSettings = useStore((s) => s.saveSettings)
   const resetAnalysis = useStore((s) => s.resetAnalysis)
@@ -247,7 +251,11 @@ export default function App(): JSX.Element {
             reportMarkdown,
             reportStale,
             phase,
-            steering
+            steering,
+            engineVersion,
+            readOnly,
+            legacyNotice,
+            moduleStates
           })
         )
         .then(() => {
@@ -260,7 +268,7 @@ export default function App(): JSX.Element {
         })
     }, 900)
     return () => window.clearTimeout(handle)
-  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, taskJournal, reportMarkdown, reportStale, phase, steering])
+  }, [activationStatus?.activated, activationStatus?.licenseId, initialized, persistencePaused, settings, projectRevision, analysisSessionId, sources, messages, cleanedData, cleanDetails, artifacts, taskJournal, reportMarkdown, reportStale, phase, steering, engineVersion, readOnly, legacyNotice, moduleStates])
 
   useEffect(() => {
     if (newAnalysisState !== 'success' && newAnalysisState !== 'error') return

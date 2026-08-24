@@ -9,6 +9,7 @@ import type {
   ChatStreamEvent,
   ContactDisplayState,
   ModelTokenUsage,
+  ModuleKey,
   SavedProject,
   ReportResultCacheInput,
   ReportResultCacheSnapshot,
@@ -51,6 +52,7 @@ import {
 import { buildActivationDiagnostic } from './activationDiagnostics'
 import { ExclusiveOperationGate } from './exclusiveOperationGate'
 import { readBundledSopRules } from './sopRules'
+import { readBundledModulePrompt } from './modulePrompts'
 import { checkForUpdates, downloadUpdate, installDownloadedUpdate } from './updater'
 import {
   appendTokenUsageRecord,
@@ -578,6 +580,15 @@ function readSopRules(): string {
 ipcMain.handle('sop:rules', () => {
   ensureActivated()
   return readSopRules()
+})
+ipcMain.handle('module:prompt', (_event, key: ModuleKey) => {
+  ensureActivated()
+  const directories = [
+    join(app.getAppPath(), 'assets', 'modules'),
+    join(process.resourcesPath || '', 'app.asar.unpacked', 'assets', 'modules'),
+    join(__dirname, '../../assets/modules')
+  ]
+  return readBundledModulePrompt(key, directories)
 })
 
 // ---- IPC：导出报告 ----

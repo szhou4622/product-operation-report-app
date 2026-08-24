@@ -27,5 +27,15 @@ export function friendlyError(value: unknown): string {
   if (/fetch failed|econnreset|enotfound|terminated|network/i.test(raw)) {
     return '网络连接失败，请检查网络和模型地址后重试。'
   }
-  return raw.slice(0, 280)
+  if (/search_budget_exhausted|搜索预算/u.test(raw)) return '本报告的联网搜索次数已用完；对标模块会保留已找到的结果，其余位置标记为暂无可靠对标。'
+  if (/模型任务类型无效|任务类型被拒/u.test(raw)) return '当前分析模块暂未被服务器支持，请联系软件管理员更新服务。'
+  if (/模块.*依赖|dependency/iu.test(raw)) return '当前模块缺少上游分析结果，软件会按已有资料降级处理。'
+  let hash = 2166136261
+  for (let index = 0; index < raw.length; index++) {
+    hash ^= raw.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  const code = (hash >>> 0).toString(16).toUpperCase().padStart(8, '0')
+  console.error(`Unexpected user-facing error ${code}:`, raw)
+  return `出现未预期的问题（错误码 ${code}），可点击重试；如反复出现请联系作者。`
 }

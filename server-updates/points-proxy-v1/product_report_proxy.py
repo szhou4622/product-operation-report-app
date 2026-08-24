@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -60,6 +60,8 @@ USD_CNY_RATE = max(1.0, float(os.environ.get("POR_USD_CNY_RATE", "7.2")))
 POINTS_PER_CNY = max(1.0, float(os.environ.get("POR_POINTS_PER_CNY", "100")))
 COST_RATE = max(0.01, min(1.0, float(os.environ.get("POR_COST_RATE", "0.5"))))
 CHARGE_MULTIPLIER = 1.0 / COST_RATE
+WEB_SEARCH_USD_PER_CALL = max(0.0, float(os.environ.get("POR_WEB_SEARCH_USD_PER_CALL", "0")))
+WEB_SEARCH_REPORT_LIMIT = max(1, min(50, int(os.environ.get("POR_WEB_SEARCH_REPORT_LIMIT", "10"))))
 MAX_BODY_BYTES = 96 * 1024 * 1024
 MAX_MESSAGES = 64
 MAX_TEXT_CHARS = 2_000_000
@@ -72,13 +74,26 @@ TASK_OUTPUT_RESERVES = {
     "analysis_step": 4_000,
     "final_part": MAX_OUTPUT_TOKENS,
     "revision_part": MAX_OUTPUT_TOKENS,
+    "module_product_info": 3500,
+    "module_platform_audience": 4500,
+    "module_material_review": 4500,
+    "module_benchmark": 5000,
+    "module_selling_points": 4500,
+    "module_voc": 5500,
+    "module_ranking": 6000,
+    "module_audience_sp_scene": 6000,
 }
 STREAM_HEARTBEAT_SECONDS = 20.0
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?::fallback:[1-3])?$", re.I)
 SAFE_TEXT_RE = re.compile(r"^[\w.:-]{1,200}$", re.UNICODE)
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ALLOWED_MODELS = ("gpt-5.5", "claude-sonnet-4-6", "gemini-3-flash", "kimi-k2.6")
-ALLOWED_TASK_TYPES = ("source_clean", "summary", "analysis_step", "final_part", "revision_part")
+ALLOWED_TASK_TYPES = (
+    "source_clean", "summary", "analysis_step", "final_part", "revision_part",
+    "module_product_info", "module_platform_audience", "module_material_review",
+    "module_benchmark", "module_selling_points", "module_voc", "module_ranking",
+    "module_audience_sp_scene",
+)
 MODEL_PRICES = {
     "gpt-5.5": (1.25, 7.5, 0.125, 0.8),
     "claude-sonnet-4-6": (0.4, 2.0, 0.04, 0.2),
@@ -220,6 +235,7 @@ def ensure_schema(db: sqlite3.Connection) -> None:
           ,billing_request_id TEXT NOT NULL DEFAULT ''
           ,billing_result_status TEXT NOT NULL DEFAULT ''
           ,billing_error TEXT NOT NULL DEFAULT ''
+          ,search_calls INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_requests_wallet_status
           ON model_requests(app_name, code_id, status, started_at);
@@ -242,6 +258,8 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE model_requests ADD COLUMN billing_result_status TEXT NOT NULL DEFAULT ''")
     if "billing_error" not in request_columns:
         db.execute("ALTER TABLE model_requests ADD COLUMN billing_error TEXT NOT NULL DEFAULT ''")
+    if "search_calls" not in request_columns:
+        db.execute("ALTER TABLE model_requests ADD COLUMN search_calls INTEGER NOT NULL DEFAULT 0")
 
 
 def as_object(value: Any) -> dict[str, Any]:
@@ -587,6 +605,8 @@ def pricing(model: str = "gpt-5.5") -> dict[str, Any]:
         "cacheCreationUsdPerMillion": values[3], "usdCnyRate": USD_CNY_RATE,
         "pointsPerCny": POINTS_PER_CNY, "cnyPerCostPoint": 1 / POINTS_PER_CNY,
         "costRate": COST_RATE, "chargeMultiplier": CHARGE_MULTIPLIER,
+        "webSearchUsdPerCall": WEB_SEARCH_USD_PER_CALL,
+        "webSearchReportLimit": WEB_SEARCH_REPORT_LIMIT,
     }
 
 
@@ -606,7 +626,10 @@ def wallet_json(session: Session, db: sqlite3.Connection) -> dict[str, Any]:
         "totalTopupPoints": milli_to_points(row["total_topup_milli"]),
         "totalCostPoints": milli_to_points(row["total_cost_milli"]),
         "totalChargedPoints": milli_to_points(row["total_charged_milli"]),
-        "unbilledUsageCount": 0,
+        "unbilledUsageCount": db.execute(
+            "SELECT COUNT(*) FROM model_requests WHERE app_name=? AND code_id=? AND status='billing_pending'",
+            (APP_NAME, session.code_id),
+        ).fetchone()[0],
         "pricing": pricing(),
         "ledger": [{
             "id": item["event_id"], "createdAt": item["created_at"], "kind": item["kind"],
@@ -830,12 +853,25 @@ def reserve_request(session: Session, request_id: str, report_id: str, task_key:
     output_reserve = min(MAX_OUTPUT_TOKENS, TASK_OUTPUT_RESERVES.get(task_type, MAX_OUTPUT_TOKENS))
     reserve_candidates = [points_for_usage(candidate, input_estimate, output_reserve) for candidate in MODEL_PRICES]
     reserve, reserve_cost_cny = max(reserve_candidates, key=lambda item: item[0])
+    if task_type == "module_benchmark" and WEB_SEARCH_USD_PER_CALL > 0:
+        search_cost_cny = WEB_SEARCH_USD_PER_CALL * USD_CNY_RATE
+        reserve += math.ceil(search_cost_cny * POINTS_PER_CNY * CHARGE_MULTIPLIER * 1000)
+        reserve_cost_cny += search_cost_cny
     with database() as db:
         ensure_schema(db)
         db.execute("BEGIN IMMEDIATE")
         if db.execute("SELECT 1 FROM model_requests WHERE request_id=?", (request_id,)).fetchone():
             db.execute("ROLLBACK")
             raise ApiError(409, "检测到重复模型请求，已阻止重复扣费。")
+        if task_type == "module_benchmark":
+            search_attempts = db.execute(
+                "SELECT COUNT(*) FROM model_requests WHERE app_name=? AND code_id=? "
+                "AND report_session_id=? AND task_type='module_benchmark' AND upstream_submitted=1",
+                (APP_NAME, session.code_id, report_id),
+            ).fetchone()[0]
+            if int(search_attempts) >= WEB_SEARCH_REPORT_LIMIT:
+                db.execute("ROLLBACK")
+                raise ApiError(429, "search_budget_exhausted：本报告的联网搜索预算已用完。")
         same_task_running = db.execute(
             "SELECT 1 FROM model_requests WHERE app_name=? AND code_id=? AND task_key=? AND model=? "
             "AND status='running' LIMIT 1",
@@ -933,11 +969,22 @@ def finalize_billing_request(
                 "analysis_step": "分析步骤",
                 "final_part": "最终成稿",
                 "revision_part": "报告修订",
+                "module_product_info": "M1 产品信息",
+                "module_platform_audience": "M2 平台人群数据",
+                "module_material_review": "M3 内容素材判断",
+                "module_benchmark": "M4 对标推荐",
+                "module_selling_points": "M5 产品卖点",
+                "module_voc": "M6 用户真实需求VOC",
+                "module_ranking": "M7 总结卖点排序",
+                "module_audience_sp_scene": "M8 人群卖点场景匹配",
             }
+            description = task_descriptions.get(request_row["task_type"], "报告分析")
+            if int(request_row["search_calls"] or 0) > 0:
+                description += f"（联网搜索 {int(request_row['search_calls'])} 次）"
             db.execute(
                 "INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), APP_NAME, session.code_id, "usage",
-                 task_descriptions.get(request_row["task_type"], "报告修订"), -actual_charge,
+                 description, -actual_charge,
                  remaining_milli, request_row["report_session_id"], request_row["task_type"], request_id, now),
             )
         db.execute(
@@ -955,6 +1002,32 @@ def record_billing_error(request_id: str, message: str) -> None:
             "UPDATE model_requests SET billing_error=? WHERE request_id=? AND status='billing_pending'",
             (text(message, 300), request_id),
         )
+
+
+def fail_billing_and_release(request_id: str, message: str) -> bool:
+    """Fail closed without leaving a permanent ghost reservation."""
+    with database() as db:
+        ensure_schema(db)
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM model_requests WHERE request_id=?", (request_id,)).fetchone()
+        if not row or row["status"] != "billing_pending":
+            db.execute("ROLLBACK")
+            return False
+        wallet = db.execute(
+            "SELECT * FROM wallets WHERE app_name=? AND code_id=?", (row["app_name"], row["code_id"])
+        ).fetchone()
+        if wallet:
+            locked = max(0, int(wallet["locked_milli"]) - int(row["reserved_milli"]))
+            db.execute(
+                "UPDATE wallets SET locked_milli=?,updated_at=? WHERE app_name=? AND code_id=?",
+                (locked, utc_now(), row["app_name"], row["code_id"]),
+            )
+        db.execute(
+            "UPDATE model_requests SET status='billing_failed',charged_milli=0,billing_result_status='billing_failed',billing_error=?,ended_at=? WHERE request_id=?",
+            (text(message, 300), utc_now(), request_id),
+        )
+        db.execute("COMMIT")
+        return True
 
 
 def release_legacy_billing_conflict(request_id: str) -> bool:
@@ -1014,13 +1087,28 @@ def retry_pending_billing(session: Session) -> None:
                 f"product_operation_report:{row['task_type']}",
             )
         except ApiError as error:
-            record_billing_error(row["request_id"], error.message)
+            fail_billing_and_release(row["request_id"], error.message)
             raise
         finalize_billing_request(session, row["request_id"], remaining, unlimited)
 
 
+def release_stale_pending_billing(session: Session, maximum_age_seconds: int = 1800) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=maximum_age_seconds)).isoformat().replace("+00:00", "Z")
+    with database() as db:
+        ensure_schema(db)
+        rows = db.execute(
+            "SELECT request_id FROM model_requests WHERE app_name=? AND code_id=? "
+            "AND status='billing_pending' AND COALESCE(ended_at,started_at)<?",
+            (APP_NAME, session.code_id, cutoff),
+        ).fetchall()
+    released = 0
+    for row in rows:
+        released += 1 if fail_billing_and_release(row["request_id"], "结算等待超过30分钟，已自动释放预留积分。") else 0
+    return released
+
+
 def settle_request(session: Session, request_id: str, status: str, model: str, usage: dict[str, Any] | None,
-                   input_estimate: int, output_chars: int, sent_content: bool) -> None:
+                   input_estimate: int, output_chars: int, sent_content: bool, search_calls: int = 0) -> None:
     if usage:
         input_tokens = max(0, int(usage.get("input_tokens", 0)))
         output_tokens = max(0, int(usage.get("output_tokens", 0)))
@@ -1037,6 +1125,11 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
     charged, cost_cny = points_for_verified_usage(
         model, response_model, input_tokens, output_tokens, cached, created
     )
+    search_calls = max(0, min(WEB_SEARCH_REPORT_LIMIT, int(search_calls)))
+    if search_calls:
+        search_cost_cny = search_calls * WEB_SEARCH_USD_PER_CALL * USD_CNY_RATE
+        cost_cny += search_cost_cny
+        charged += math.ceil(search_cost_cny * POINTS_PER_CNY * CHARGE_MULTIPLIER * 1000)
     if not sent_content and not usage:
         charged = 0
         cost_cny = 0
@@ -1065,16 +1158,16 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
                 (locked, now, APP_NAME, session.code_id),
             )
             db.execute(
-                "UPDATE model_requests SET status=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=0,charged_milli=0,billing_result_status=?,billing_error='',ended_at=? WHERE request_id=?",
+                "UPDATE model_requests SET status=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=0,charged_milli=0,billing_result_status=?,billing_error='',search_calls=?,ended_at=? WHERE request_id=?",
                 (status, input_tokens, output_tokens, cached, created, usage_source, response_model,
-                 status, now, request_id),
+                 status, search_calls, now, request_id),
             )
             db.execute("COMMIT")
             return
         db.execute(
-            "UPDATE model_requests SET status='billing_pending',input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=?,charged_milli=?,billing_result_status=?,billing_error='',ended_at=? WHERE request_id=?",
+            "UPDATE model_requests SET status='billing_pending',input_tokens=?,output_tokens=?,cached_input_tokens=?,cache_creation_input_tokens=?,usage_source=?,response_model=?,cost_cny=?,charged_milli=?,billing_result_status=?,billing_error='',search_calls=?,ended_at=? WHERE request_id=?",
             (input_tokens, output_tokens, cached, created, usage_source, response_model, cost_cny,
-             charged, status, now, request_id),
+             charged, status, search_calls, now, request_id),
         )
         db.execute("COMMIT")
     try:
@@ -1088,7 +1181,7 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
             f"product_operation_report:{task_type}",
         )
     except ApiError as error:
-        record_billing_error(request_id, error.message)
+        fail_billing_and_release(request_id, error.message)
         return
     finalize_billing_request(session, request_id, remaining, unlimited)
 
@@ -1226,6 +1319,12 @@ def provider_stream_completed(saw_done: bool, finish_reason: str, usage: dict[st
     return bool(sent_content and (saw_done or finish_reason == "stop" or usage))
 
 
+def apply_server_task_options(upstream_body: dict[str, Any], task_type: str) -> None:
+    if task_type == "module_benchmark":
+        upstream_body["tools"] = [{"type": "web_search"}]
+        upstream_body["tool_choice"] = "auto"
+
+
 def mark_upstream_submitted(request_id: str) -> None:
     with database() as db:
         ensure_schema(db)
@@ -1322,9 +1421,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/wallet":
                 session = require_session(self.headers)
+                release_stale_pending_billing(session)
+                try:
+                    retry_pending_billing(session)
+                except ApiError:
+                    # The failed settlement has already released its reservation;
+                    # wallet status must remain available to the user.
+                    pass
                 with database() as db:
                     ensure_schema(db)
                     self.json_response(200, {"ok": True, "wallet": wallet_json(session, db)})
+                return
+            if path == "/pricing":
+                require_session(self.headers)
+                self.json_response(200, {"ok": True, "pricing": pricing()})
                 return
             raise ApiError(404, "unknown endpoint")
         except ApiError as error:
@@ -1407,6 +1517,8 @@ class Handler(BaseHTTPRequestHandler):
             upstream_body["temperature"] = float(temperature)
         if task_type in ("source_clean", "summary") and body.get("reasoning_effort") == "low":
             upstream_body["reasoning_effort"] = "low"
+        # The server, not the untrusted client, decides which task may search.
+        apply_server_task_options(upstream_body, task_type)
         reserve_request(
             session, request_id, report_id, task_key, task_type, model, attempt,
             input_estimate, billing_request_id,
@@ -1414,6 +1526,7 @@ class Handler(BaseHTTPRequestHandler):
         upstream_data = json.dumps(upstream_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         mark_upstream_submitted(request_id)
         usage: dict[str, int] | None = None
+        search_call_ids: set[str] = set()
         output_chars = 0
         sent_content = False
         client_open = True
@@ -1448,12 +1561,25 @@ class Handler(BaseHTTPRequestHandler):
                             try:
                                 event = as_object(json.loads(data.decode("utf-8", "replace")))
                                 usage = merge_provider_usage(usage, provider_usage(event))
+                                event_type = text(event.get("type"), 120)
+                                if task_type == "module_benchmark" and "web_search" in event_type:
+                                    search_call_ids.add(text(event.get("id"), 200) or event_type)
                                 choices = event.get("choices")
                                 if isinstance(choices, list):
                                     for choice in choices:
                                         if isinstance(choice, dict) and choice.get("finish_reason") is not None:
                                             finish_reason = text(choice.get("finish_reason"), 80)
                                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                                        tool_calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+                                        if task_type == "module_benchmark" and isinstance(tool_calls, list):
+                                            for tool_call in tool_calls:
+                                                if not isinstance(tool_call, dict):
+                                                    continue
+                                                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                                                call_type = text(tool_call.get("type"), 80)
+                                                call_name = text(function.get("name"), 120)
+                                                if "web_search" in f"{call_type} {call_name}":
+                                                    search_call_ids.add(text(tool_call.get("id"), 200) or f"tool-{len(search_call_ids) + 1}")
                                         content = delta.get("content") if isinstance(delta, dict) else None
                                         if isinstance(content, str) and content:
                                             output_chars += len(content)
@@ -1507,7 +1633,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             final_status = "partial" if sent_content else "failed"
         finally:
-            settle_request(session, request_id, final_status, model, usage, input_estimate, output_chars, sent_content)
+            search_calls = len(search_call_ids)
+            if task_type == "module_benchmark" and sent_content and search_calls == 0:
+                # Some compatible providers execute built-in search without
+                # streaming tool-call metadata. Count the benchmark attempt once.
+                search_calls = 1
+            settle_request(session, request_id, final_status, model, usage, input_estimate, output_chars, sent_content, search_calls)
 
 
 def main() -> None:

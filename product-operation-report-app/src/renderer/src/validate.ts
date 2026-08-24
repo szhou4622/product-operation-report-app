@@ -11,6 +11,23 @@ export function validateReport(md: string): string[] {
   const warnings: string[] = []
   if (!md.trim()) return warnings
 
+  if (/^##\s+M1\s+/mu.test(md)) {
+    const lines = md.split(/\r?\n/u).map((line) => line.trim())
+    if (!lines.find((line) => line.startsWith('# '))) warnings.push('报告标题前出现了多余文本。')
+    const headings = Array.from({ length: 8 }, (_, index) => `## M${index + 1} `)
+    let previous = -1
+    const missing: string[] = []
+    for (const heading of headings) {
+      const index = md.indexOf(heading)
+      if (index < 0) missing.push(heading.trim())
+      else if (index < previous) warnings.push('报告章节顺序疑似不符合标准模板：M1-M8。')
+      previous = Math.max(previous, index)
+    }
+    if (missing.length) warnings.push(`报告缺少标准章节：${missing.join('、')}。`)
+    if (!md.includes('本报告内容由 AI 生成，请谨慎参考')) warnings.push('报告末尾缺少 AI 生成谨慎参考注释。')
+    return warnings
+  }
+
   const normalized = md.replace(/\\\./g, '.')
   const lines = normalized.split('\n')
   const firstNonEmpty = lines.find((line) => line.trim())?.trim() || ''

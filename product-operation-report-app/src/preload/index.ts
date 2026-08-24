@@ -16,6 +16,8 @@ import type {
   ModelProfile,
   ModelTaskContext,
   ModelTokenUsage,
+  ModuleKey,
+  ModulePrompt,
   ParsedFile,
   PointsAccessResult,
   PointsRedeemResult,
@@ -149,6 +151,7 @@ const api = {
   cancelFileParsing: (): Promise<void> => ipcRenderer.invoke('file:cancelAll'),
 
   getSopRules: (): Promise<string> => ipcRenderer.invoke('sop:rules'),
+  getModulePrompt: (key: ModuleKey): Promise<ModulePrompt> => ipcRenderer.invoke('module:prompt', key),
 
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
 

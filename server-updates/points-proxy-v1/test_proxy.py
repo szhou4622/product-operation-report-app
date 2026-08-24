@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -72,6 +73,70 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(row["c"], 1)
         self.assertEqual(row["description"], "资料汇总")
         self.assertEqual(wallet["locked_milli"], 0)
+
+    def test_benchmark_search_is_server_priced_and_audited(self) -> None:
+        request_id = "c4f81b86-1a5b-4e39-830e-1271165bb8ee"
+        previous_price = proxy.WEB_SEARCH_USD_PER_CALL
+        proxy.WEB_SEARCH_USD_PER_CALL = 0.01
+        try:
+            proxy.reserve_request(
+                self.session, request_id, "report-search", "module:v1:benchmark-brands",
+                "module_benchmark", "gpt-5.5", 1, 1000,
+            )
+            proxy.settle_request(
+                self.session, request_id, "success", "gpt-5.5",
+                {"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 0,
+                 "cache_creation_input_tokens": 0},
+                1000, 600, True, search_calls=2,
+            )
+            with proxy.database() as db:
+                request = db.execute(
+                    "SELECT search_calls,status FROM model_requests WHERE request_id=?", (request_id,)
+                ).fetchone()
+                ledger = db.execute(
+                    "SELECT description FROM ledger WHERE request_id=?", (request_id,)
+                ).fetchone()
+            self.assertEqual(request["search_calls"], 2)
+            self.assertEqual(request["status"], "success")
+            self.assertIn("联网搜索 2 次", ledger["description"])
+            self.assertEqual(proxy.pricing()["webSearchUsdPerCall"], 0.01)
+        finally:
+            proxy.WEB_SEARCH_USD_PER_CALL = previous_price
+
+    def test_benchmark_search_budget_stops_the_eleventh_upstream_attempt(self) -> None:
+        report_id = "report-search-budget"
+        previous_limit = proxy.WEB_SEARCH_REPORT_LIMIT
+        proxy.WEB_SEARCH_REPORT_LIMIT = 10
+        try:
+            for index in range(10):
+                request_id = str(uuid.uuid4())
+                proxy.reserve_request(
+                    self.session, request_id, report_id, f"module:v1:benchmark:{index}",
+                    "module_benchmark", "gpt-5.5", index + 1, 1000,
+                )
+                proxy.mark_upstream_submitted(request_id)
+                proxy.settle_request(
+                    self.session, request_id, "failed", "gpt-5.5", None,
+                    1000, 0, False,
+                )
+            with self.assertRaises(proxy.ApiError) as caught:
+                proxy.reserve_request(
+                    self.session, str(uuid.uuid4()), report_id, "module:v1:benchmark:11",
+                    "module_benchmark", "gpt-5.5", 11, 1000,
+                )
+            self.assertEqual(caught.exception.status, 429)
+            self.assertIn("search_budget_exhausted", caught.exception.message)
+        finally:
+            proxy.WEB_SEARCH_REPORT_LIMIT = previous_limit
+
+    def test_only_benchmark_task_receives_web_search_tool(self) -> None:
+        benchmark = {"model": "gpt-5.5"}
+        normal = {"model": "gpt-5.5"}
+        proxy.apply_server_task_options(benchmark, "module_benchmark")
+        proxy.apply_server_task_options(normal, "module_product_info")
+        self.assertEqual(benchmark["tools"], [{"type": "web_search"}])
+        self.assertEqual(benchmark["tool_choice"], "auto")
+        self.assertNotIn("tools", normal)
 
     def test_same_running_task_is_not_submitted_twice(self) -> None:
         first_request_id = "d4f81b86-1a5b-4e39-830e-1271165bb8ee"
@@ -146,7 +211,7 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(wallet["balance_milli"], 201_000)
         self.assertEqual(wallet["total_topup_milli"], 500_000, "a balance refresh is not a new grant")
 
-    def test_billing_failure_stays_locked_and_retries_idempotently(self) -> None:
+    def test_billing_failure_releases_lock_instead_of_creating_ghost_balance(self) -> None:
         request_id = "a4f81b86-1a5b-4e39-830e-1271165bb8ee"
         billing_id = "report-a:source_clean:file-1:batch-1"
         proxy.reserve_request(
@@ -168,22 +233,9 @@ class ProxyLedgerTests(unittest.TestCase):
             locked = db.execute(
                 "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
             ).fetchone()["locked_milli"]
-        self.assertEqual(request["status"], "billing_pending")
+        self.assertEqual(request["status"], "billing_failed")
         self.assertEqual(request["billing_request_id"], billing_id)
         self.assertIn("temporary", request["billing_error"])
-        self.assertGreater(locked, 0)
-        self.consume_mock.side_effect = self.fake_consume
-        proxy.retry_pending_billing(self.session)
-        self.assertEqual(self.consume_mock.call_args.args[2], request_id)
-        with proxy.database() as db:
-            request = db.execute(
-                "SELECT status,billing_error FROM model_requests WHERE request_id=?", (request_id,)
-            ).fetchone()
-            locked = db.execute(
-                "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
-            ).fetchone()["locked_milli"]
-        self.assertEqual(request["status"], "success")
-        self.assertEqual(request["billing_error"], "")
         self.assertEqual(locked, 0)
 
     def test_retries_share_logical_task_but_bill_unique_upstream_attempts(self) -> None:
@@ -252,9 +304,9 @@ class ProxyLedgerTests(unittest.TestCase):
             locked_before = db.execute(
                 "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
             ).fetchone()["locked_milli"]
-        self.assertEqual(before["status"], "billing_pending")
+        self.assertEqual(before["status"], "billing_failed")
         self.assertIn("不同的消费请求", before["billing_error"])
-        self.assertEqual(locked_before, before["reserved_milli"])
+        self.assertEqual(locked_before, 0)
 
         self.consume_mock.reset_mock()
         self.consume_mock.side_effect = self.fake_consume
@@ -269,9 +321,9 @@ class ProxyLedgerTests(unittest.TestCase):
             locked_after = db.execute(
                 "SELECT locked_milli FROM wallets WHERE code_id=?", (self.session.code_id,)
             ).fetchone()["locked_milli"]
-        self.assertEqual(after["status"], "billing_conflict_released")
+        self.assertEqual(after["status"], "billing_failed")
         self.assertEqual(after["charged_milli"], 0)
-        self.assertEqual(after["billing_result_status"], "billing_conflict_released")
+        self.assertEqual(after["billing_result_status"], "billing_failed")
         self.assertIn("不同的消费请求", after["billing_error"])
         self.assertEqual(locked_after, 0)
 

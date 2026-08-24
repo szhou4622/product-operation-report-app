@@ -72,26 +72,28 @@ export async function runModelRetry(
   let result = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: 1 })
   let retry = 0
   while (
-    !result.ok && retry < retries && !result.text &&
-    /fetch failed|ECONNRESET|terminated|network|网络连接失败|服务繁忙|额度受限|429/i.test(result.error || '')
+    !result.ok && retry < retries &&
+    !/已停止|安全|内容过滤|积分不足|授权|403|401/i.test(result.error || '') &&
+    /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|terminated|network|网络连接失败|连接提前结束|服务繁忙|额度受限|429|HTTP\s*5\d\d|超时/i.test(result.error || '')
   ) {
     retry += 1
     onRetry?.(retry)
-    if (/服务繁忙|额度受限|429/i.test(result.error || '')) {
-      const wait = result.error?.match(/等待\s*(\d+)\s*秒/)
-      const delay = wait ? Math.min(60, Number(wait[1])) * 1000 : 1200 * retry
-      let stopped = false
-      await new Promise<void>((resolve) => {
-        const timer = window.setTimeout(resolve, delay)
-        setAbort(() => {
-          stopped = true
-          window.clearTimeout(timer)
-          resolve()
-        })
+    const wait = result.error?.match(/等待\s*(\d+)\s*秒/)
+    const schedule = [1_000, 3_000, 7_000]
+    const delay = wait
+      ? Math.min(60, Number(wait[1])) * 1000
+      : schedule[Math.min(retry - 1, schedule.length - 1)] + Math.floor(Math.random() * 501)
+    let stopped = false
+    await new Promise<void>((resolve) => {
+      const timer = window.setTimeout(resolve, delay)
+      setAbort(() => {
+        stopped = true
+        window.clearTimeout(timer)
+        resolve()
       })
-      setAbort(null)
-      if (stopped) return { ok: false, text: '', error: '已停止' }
-    }
+    })
+    setAbort(null)
+    if (stopped) return { ok: false, text: '', error: '已停止' }
     result = await runModel(messages, onAcc, setAbort, { ...taskContext, attempt: retry + 1 })
   }
   return result

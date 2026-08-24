@@ -205,7 +205,7 @@ function validateInput(input: SourceCleanCacheInput): SourceCleanCacheInput {
   return {
     name: safeString(input.name, 500), kind: input.kind, text, dataUrl, attachments,
     attribution: safeString(input.attribution, 100), platform: safeString(input.platform, 200),
-    purpose: safeString(input.purpose, 200), note: safeString(input.note, 4_000)
+    purpose: safeString(input.purpose, 200), kindV1: input.kindV1, note: safeString(input.note, 4_000)
   }
 }
 
@@ -221,7 +221,7 @@ export function sourceCleanCacheKey(input: SourceCleanCacheInput, model: string)
   const hash = createHash('sha256')
   for (const value of [
     SOURCE_CLEAN_PROMPT_VERSION, TABLE_DIGEST_VERSION, safeString(model, 200).trim().toLowerCase(),
-    clean.name, clean.kind, clean.attribution || '', clean.platform || '', clean.purpose || '', clean.note || '',
+    clean.name, clean.kind, clean.attribution || '', clean.platform || '', clean.purpose || '', clean.kindV1 || '', clean.note || '',
     clean.text || '', clean.dataUrl || ''
   ]) updateHash(hash, value)
   for (const attachment of clean.attachments || []) {

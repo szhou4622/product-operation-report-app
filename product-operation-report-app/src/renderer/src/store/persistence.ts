@@ -4,7 +4,9 @@ import type {
   ProjectPhase,
   ProjectSourceSnapshot,
   ProjectTaskSnapshot,
-  SavedProject
+  SavedProject,
+  ModuleKey,
+  ModuleRunState
 } from '../../../shared/types'
 import { SOP_STEPS } from '../../../shared/types'
 
@@ -23,6 +25,10 @@ export interface ProjectSnapshotState {
   reportStale: boolean
   phase: ProjectPhase
   steering: string
+  engineVersion: 'v1'
+  readOnly: boolean
+  legacyNotice: string
+  moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
 }
 
 export function buildProjectSnapshot(state: ProjectSnapshotState): SavedProject {
@@ -41,6 +47,10 @@ export function buildProjectSnapshot(state: ProjectSnapshotState): SavedProject 
     reportStale: state.reportStale,
     phase: state.phase,
     steering: state.steering,
+    engineVersion: state.engineVersion,
+    readOnly: state.readOnly,
+    legacyNotice: state.legacyNotice,
+    moduleStates: state.moduleStates,
     updatedAt: new Date().toISOString()
   }
 }

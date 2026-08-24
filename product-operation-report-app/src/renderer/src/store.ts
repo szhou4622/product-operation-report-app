@@ -12,9 +12,12 @@ import type {
   SourceCleanCacheInput,
   SourceImageAttachment,
   StepDependencyMap,
-  ProjectTaskSnapshot
+  ProjectTaskSnapshot,
+  SourceKindV1,
+  ModuleKey,
+  ModuleRunState
 } from '../../shared/types'
-import { SOP_STEPS } from '../../shared/types'
+import { REPORT_MODULES, SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
 import {
   buildExtractMessages,
@@ -43,6 +46,13 @@ import {
   type CleaningMethod,
   type CleaningPlan
 } from './cleaningPlan'
+import {
+  MODULE_TASK_TYPES,
+  assembleModuleReport,
+  buildModuleMessages,
+  evaluateSourceSufficiency,
+  validateModuleOutput
+} from './modules'
 
 export { friendlyError } from './store/errors'
 export { buildProjectSnapshot } from './store/persistence'
@@ -62,6 +72,7 @@ export interface Source {
   attribution?: string // 用户指定归属：自有数据 / 竞品数据 / ''(未定)
   platform?: string // 用户指定平台/来源：巨量云图 / 抖店罗盘 / 视频号 / 抖音 / 有米云...
   purpose?: string // 用户指定信息类型：人群画像数据 / 内容素材数据 / 交易数据 / 产品手卡...
+  kindV1?: SourceKindV1 // v1 业务资料类型，与文件格式分类正交
   note?: string // 用户对这份文件的补充信息（平台/时间/内容/文件外说明）
   topLevelId?: string // 用户主动选择的顶层文件；派生页/图片/ZIP条目共享该ID
   derivedKind?: 'archive-entry' | 'embedded-image' | 'rendered-page' | 'converted-page'
@@ -71,6 +82,10 @@ const PARSE_CONCURRENCY = 2
 export const MAX_CLEANING_CONCURRENCY = 4
 const REPORT_STEP_ID = SOP_STEPS[SOP_STEPS.length - 1]?.id ?? 9
 const CLEAN_DETAIL_MARKER = '\n\n---\n## 各来源清洗明细'
+const moduleByTitle = (key: ModuleKey): string => {
+  const module = REPORT_MODULES.find((candidate) => candidate.key === key)
+  return module ? `M${module.id} ${module.title}` : key
+}
 
 function completedSummaryGroups(
   taskJournal: Record<string, ProjectTaskSnapshot>,
@@ -253,6 +268,7 @@ function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
     attribution: source.attribution,
     platform: source.platform,
     purpose: source.purpose,
+    kindV1: source.kindV1,
     note: source.note
   }
 }
@@ -265,9 +281,13 @@ function reportResultCacheInput(sources: Source[], userRequirements: string): Re
 }
 
 function hasCompleteReportSections(markdown: string): boolean {
-  return Array.from({ length: 12 }, (_, section) =>
+  const legacy = Array.from({ length: 12 }, (_, section) =>
     new RegExp(`^##\\s+${section}(?:\\.|、|\\s)`, 'mu').test(markdown)
   ).every(Boolean)
+  const v1 = Array.from({ length: 8 }, (_, index) =>
+    new RegExp(`^##\\s+M${index + 1}\\s+`, 'mu').test(markdown)
+  ).every(Boolean) && /本报告内容由 AI 生成，请谨慎参考/u.test(markdown)
+  return legacy || v1
 }
 
 function validReportCacheSnapshot(snapshot: ReportResultCacheSnapshot | undefined): snapshot is ReportResultCacheSnapshot {
@@ -413,6 +433,16 @@ const inferPurpose = (name: string): string => {
   if (n.includes('竞品') || n.includes('竞对') || n.includes('对标')) return '竞品素材数据'
   if (n.includes('素材') || n.includes('爆款') || n.includes('脚本')) return '内容素材数据'
   return ''
+}
+
+const inferKindV1 = (name: string, purpose = inferPurpose(name)): SourceKindV1 | undefined => {
+  const text = `${name} ${purpose}`.toLowerCase()
+  if (/评价|评论|反馈|客服|咨询|voc|用户声音/u.test(text)) return 'voice-data'
+  if (/人群|画像|年龄|性别|地域|购买偏好/u.test(text)) return 'audience-data'
+  if (/素材|爆款|脚本|文案|投放|广告|3秒/u.test(text)) return 'material-data'
+  if (/订单|成交|销售|交易|gmv|退款|经营|商品列表/u.test(text)) return 'business-data'
+  if (/手卡|产品说明|详情页|招商|规格|原料|成分|材质|工艺|背书/u.test(text)) return 'product-supply'
+  return undefined
 }
 
 export interface ImageHeaderInfo {
@@ -763,6 +793,10 @@ interface StoreState {
   lastExportPath: string
   openingExport: boolean
   cleaningProgress: CleaningProgress
+  engineVersion: 'v1'
+  readOnly: boolean
+  legacyNotice: string
+  moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
 
   init: () => Promise<void>
   setSettingsOpen: (open: boolean) => void
@@ -775,11 +809,13 @@ interface StoreState {
   setUnconfirmedAttribution: (attribution: '自有数据' | '竞品数据') => void
   setSourcePlatform: (id: string, platform: string) => void
   setSourcePurpose: (id: string, purpose: string) => void
+  setSourceKindV1: (id: string, kindV1: SourceKindV1) => void
   setSourceNote: (id: string, note: string) => void
   startGeneration: () => Promise<void>
   acceptReportReuse: () => Promise<void>
   regenerateReport: () => Promise<void>
   confirmCheckpoint: () => Promise<void>
+  retryModule: (key: ModuleKey) => Promise<void>
   sendMessage: (text: string) => Promise<boolean>
   abort: () => void
   exportReport: (format: 'html' | 'md' | 'docx') => Promise<void>
@@ -797,7 +833,7 @@ interface StoreState {
 
 const invalidatedAnalysis = (): Pick<
   StoreState,
-  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress' | 'reportReuseOffer' | 'taskJournal'
+  'cleanedData' | 'phase' | 'abortFn' | 'exportStatus' | 'cleaningProgress' | 'reportReuseOffer' | 'taskJournal' | 'moduleStates'
 > => ({
   cleanedData: '',
   phase: 'idle',
@@ -805,7 +841,8 @@ const invalidatedAnalysis = (): Pick<
   exportStatus: '',
   cleaningProgress: emptyCleaningProgress(),
   reportReuseOffer: null,
-  taskJournal: {}
+  taskJournal: {},
+  moduleStates: {}
 })
 
 const preserveCommittedReport = (
@@ -844,6 +881,10 @@ export const useStore = create<StoreState>((set, get) => ({
   lastExportPath: '',
   openingExport: false,
   cleaningProgress: emptyCleaningProgress(),
+  engineVersion: 'v1',
+  readOnly: false,
+  legacyNotice: '',
+  moduleStates: {},
 
   init: async () => {
     const [settings, sopRules, lastProject, previousProject] = await Promise.all([
@@ -856,6 +897,10 @@ export const useStore = create<StoreState>((set, get) => ({
       lastProject?.phase === 'analyzing'
         ? lastProject.artifacts?.[REPORT_STEP_ID] || ''
         : lastProject?.reportMarkdown || ''
+    const legacyReadOnly = Boolean(
+      lastProject && lastProject.engineVersion !== 'v1' &&
+      (lastProject.reportMarkdown?.trim() || Object.keys(lastProject.artifacts || {}).length)
+    )
     const restoredArtifacts = { ...(lastProject?.artifacts || {}) }
     if (restoredReport && !restoredArtifacts[REPORT_STEP_ID]) {
       restoredArtifacts[REPORT_STEP_ID] = restoredReport
@@ -929,7 +974,13 @@ export const useStore = create<StoreState>((set, get) => ({
       exportStatus: '',
       lastExportPath: '',
       openingExport: false,
-      cleaningProgress: emptyCleaningProgress()
+      cleaningProgress: emptyCleaningProgress(),
+      engineVersion: 'v1',
+      readOnly: legacyReadOnly || Boolean(lastProject?.readOnly),
+      legacyNotice: legacyReadOnly
+        ? '此报告由旧版本生成，仅支持查看导出'
+        : lastProject?.legacyNotice || '',
+      moduleStates: lastProject?.moduleStates || {}
     })
   },
 
@@ -959,6 +1010,10 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: current.lastExportPath,
       openingExport: false,
       cleaningProgress: current.cleaningProgress,
+      engineVersion: current.engineVersion,
+      readOnly: current.readOnly,
+      legacyNotice: current.legacyNotice,
+      moduleStates: current.moduleStates,
       projectRevision: current.projectRevision,
       analysisSessionId: current.analysisSessionId,
       reportReuseOffer: null,
@@ -982,6 +1037,10 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: '',
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
+      engineVersion: 'v1' as const,
+      readOnly: false,
+      legacyNotice: '',
+      moduleStates: {} as Partial<Record<ModuleKey, ModuleRunState>>,
       projectRevision: nextRevision,
       analysisSessionId: crypto.randomUUID(),
       reportReuseOffer: null,
@@ -1082,6 +1141,12 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: '',
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
+      engineVersion: 'v1' as const,
+      readOnly: previous.engineVersion !== 'v1' || Boolean(previous.readOnly),
+      legacyNotice: previous.engineVersion !== 'v1'
+        ? '此报告由旧版本生成，仅支持查看导出'
+        : previous.legacyNotice || '',
+      moduleStates: previous.moduleStates || {},
       projectRevision: current.projectRevision + 1,
       analysisSessionId: previous.analysisSessionId || crypto.randomUUID(),
       reportReuseOffer: null,
@@ -1116,6 +1181,7 @@ export const useStore = create<StoreState>((set, get) => ({
       attribution: string
       platform: string
       purpose: string
+      kindV1?: SourceKindV1
     }> = []
     const rejected: Source[] = []
     const incomingFiles = Array.from(files)
@@ -1141,6 +1207,7 @@ export const useStore = create<StoreState>((set, get) => ({
         attribution: inferAttribution(name),
         platform: inferPlatform(name),
         purpose: inferPurpose(name),
+        kindV1: inferKindV1(name),
         topLevelId: ''
       }
       base.topLevelId = base.id
@@ -1176,7 +1243,8 @@ export const useStore = create<StoreState>((set, get) => ({
         kind: e === 'zip' ? ('other' as Source['kind']) : classify(file.name),
         attribution: base.attribution,
         platform: base.platform,
-        purpose: base.purpose
+        purpose: base.purpose,
+        kindV1: base.kindV1
       })
     }
 
@@ -1227,6 +1295,7 @@ export const useStore = create<StoreState>((set, get) => ({
             attribution: job.attribution,
             platform: job.platform,
             purpose: job.purpose,
+            kindV1: job.kindV1,
             topLevelId: job.id
           }))
         ]
@@ -1286,6 +1355,7 @@ export const useStore = create<StoreState>((set, get) => ({
                       attribution: job.attribution,
                       platform: job.platform,
                       purpose: job.purpose,
+                      kindV1: job.kindV1,
                       topLevelId: job.id
                     }
                   ]
@@ -1307,6 +1377,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     attribution: inferAttribution(`${job.name}/${it.name}`),
                     platform: inferPlatform(`${job.name}/${it.name}`),
                     purpose: inferPurpose(`${job.name}/${it.name}`),
+                    kindV1: inferKindV1(`${job.name}/${it.name}`),
                     note: `来自压缩包：${job.name}`,
                     topLevelId: job.id,
                     derivedKind: 'archive-entry' as const
@@ -1379,6 +1450,7 @@ export const useStore = create<StoreState>((set, get) => ({
               attribution: job.attribution,
               platform: job.platform,
               purpose: job.purpose,
+              kindV1: job.kindV1,
               topLevelId: job.id
             }
             return { sources: [...retainedSources, parent] }
@@ -1466,6 +1538,19 @@ export const useStore = create<StoreState>((set, get) => ({
           }
     ),
 
+  setSourceKindV1: (id, kindV1) =>
+    set((s) =>
+      isRunningPhase(s.phase)
+        ? s
+        : {
+            ...invalidatedAnalysis(),
+            ...preserveCommittedReport(s),
+            sources: s.sources.map((source) => (source.id === id ? { ...source, kindV1 } : source)),
+            cleanDetails: s.cleanDetails.filter((detail) => detail.id !== id),
+            moduleStates: {}
+          }
+    ),
+
   setSourceNote: (id, note) =>
     set((s) =>
       isRunningPhase(s.phase)
@@ -1479,8 +1564,12 @@ export const useStore = create<StoreState>((set, get) => ({
     ),
 
   startGeneration: async () => {
-    const { sources, phase } = get()
+    const { sources, phase, readOnly, legacyNotice } = get()
     if (phase === 'cleaning' || phase === 'analyzing') return
+    if (readOnly) {
+      get()._post('assistant', legacyNotice || '此报告由旧版本生成，仅支持查看导出。请点击“新建分析”使用新版。', 'error')
+      return
+    }
     if (sources.some((s) => s.parsing)) {
       get()._post('assistant', '还有文件正在本地解析，请等解析完成后再开始生成。', 'narration')
       return
@@ -1499,6 +1588,11 @@ export const useStore = create<StoreState>((set, get) => ({
     const unconfirmed = sources.filter((s) => sourceHasContent(s) && !s.attribution)
     if (unconfirmed.length) {
       get()._post('assistant', `还有 ${unconfirmed.length} 份资料没有确认归属。请在文件下方点“自有数据”或“竞品数据”。`, 'narration')
+      return
+    }
+    const missingKinds = sources.filter((source) => sourceHasContent(source) && !source.kindV1)
+    if (missingKinds.length) {
+      get()._post('assistant', `还有 ${missingKinds.length} 份资料没有选择业务类型。请为每份资料选择产品、经营、素材、人群或用户声音。`, 'narration')
       return
     }
     if (!sources.some(sourceHasContent)) {
@@ -1564,15 +1658,19 @@ export const useStore = create<StoreState>((set, get) => ({
       artifacts: { ...offer.snapshot.artifacts },
       reportMarkdown: offer.snapshot.reportMarkdown,
       reportStale: false,
-      phase: 'checkpoint2',
+      phase: 'done',
       abortFn: null,
-      cleaningProgress: emptyCleaningProgress()
+      cleaningProgress: emptyCleaningProgress(),
+      moduleStates: Object.fromEntries(REPORT_MODULES.map((module) => [
+        module.key,
+        { status: offer.snapshot!.artifacts[module.id]?.trim() ? 'done' : 'skipped', updatedAt: new Date().toISOString() }
+      ]))
     })
-    get()._post('assistant', '✅ 已恢复上次的完整报告。请核对后点击「确认定稿」。', 'checkpoint')
+    get()._post('assistant', '✅ 已恢复上次的完整报告（8模块），可直接检查和导出。', 'checkpoint')
     void recordOptimizationEvent(
       optimizationEvent(`report-reuse:${sessionId}:${offer.cacheKey}`, sessionId, 'report_cache_reuse', {
-        // 汇总 1 次 + 分析 8 次 + 四段成稿 4 次；文件清洗可能本来也会走本地缓存，因此不计入。
-        skippedModelRequests: 13,
+        // v1 固定8个模块；文件清洗可能本来也会走本地缓存，因此不计入。
+        skippedModelRequests: 8,
         reusedReports: 1
       })
     )
@@ -1879,9 +1977,24 @@ export const useStore = create<StoreState>((set, get) => ({
                   'narration'
                 )
                 let waits = 0
-                while (activeBatchRequests > 0 && !cancelled && isCurrentSession() && waits < 360) {
+                while (activeBatchRequests > 0 && !cancelled && isCurrentSession() && waits < 600) {
                   await new Promise<void>((resolve) => window.setTimeout(resolve, 500))
                   waits += 1
+                  if (waits % 30 === 0 && activeBatchRequests > 0) {
+                    const remainingSeconds = Math.max(0, 300 - Math.floor(waits / 2))
+                    get()._post(
+                      'assistant',
+                      `${label}仍在等待其他批次完成，最多再等待约 ${remainingSeconds} 秒；等待期间不会重复扣费。`,
+                      'narration'
+                    )
+                  }
+                }
+                if (activeBatchRequests > 0 && !cancelled && isCurrentSession()) {
+                  return {
+                    ok: false,
+                    text: '',
+                    error: '积分预留竞争超时，稍后重试即可，本次未扣费。'
+                  }
                 }
               }
               return { ok: false, text: '', error: '已停止' }
@@ -2137,6 +2250,223 @@ export const useStore = create<StoreState>((set, get) => ({
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
+    const sufficiency = evaluateSourceSufficiency(REPORT_MODULES, get().sources.map((source) => source.kindV1))
+    if (sufficiency.blocked) {
+      set({ phase: 'checkpoint1', abortFn: null })
+      get()._post('assistant', sufficiency.blocked, 'error')
+      return
+    }
+    const sourceCountV1 = topLevelSourceCount(get().sources)
+    const imageCountV1 = sourceImageCount(get().sources)
+    const detailsById = new Map(get().cleanDetails.map((detail) => [detail.id, detail.text]))
+    const updateModuleState = (key: ModuleKey, state: ModuleRunState): void => {
+      set((current) => ({ moduleStates: { ...current.moduleStates, [key]: state } }))
+    }
+    const moduleByKey = new Map(REPORT_MODULES.map((module) => [module.key, module]))
+    const runModule = async (module: typeof REPORT_MODULES[number]): Promise<void> => {
+      if (!isCurrentSession()) return
+      const skippedReason = sufficiency.skipped.get(module.key)
+      if (skippedReason) {
+        updateModuleState(module.key, { status: 'skipped', message: skippedReason, updatedAt: new Date().toISOString() })
+        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: skippedReason } }))
+        return
+      }
+      const savedTaskId = `${sessionId}:module:v1:${module.key}`
+      const saved = get().taskJournal[savedTaskId]
+      if (saved?.status === 'complete' && saved.output?.trim()) {
+        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
+        updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
+        return
+      }
+      updateModuleState(module.key, { status: 'running', updatedAt: new Date().toISOString() })
+      const prompt = await window.api.getModulePrompt(module.key)
+      const moduleSources = get().sources.flatMap((source) => {
+        if (!source.kindV1 || !module.requiredSources.includes(source.kindV1)) return []
+        const text = detailsById.get(source.id)
+        return text ? [{ name: source.name, kindV1: source.kindV1, attribution: source.attribution, platform: source.platform, text }] : []
+      })
+      const upstream = module.dependsOn.flatMap((key) => {
+        const dependency = moduleByKey.get(key)
+        const output = dependency ? get().artifacts[dependency.id] : ''
+        return dependency && output ? [{ key, title: `M${dependency.id} ${dependency.title}`, output }] : []
+      })
+      const missingDependencies = module.dependsOn.flatMap((key) => {
+        const dependency = moduleByKey.get(key)
+        return dependency && !get().artifacts[dependency.id] ? [`M${dependency.id} ${dependency.title}`] : []
+      })
+      const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements: get().steering })
+      if (module.key === 'benchmark-brands') {
+        const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']
+        const dimensionOutputs: string[] = new Array(dimensions.length)
+        let nextDimension = 0
+        let retryBudget = 3
+        const worker = async (): Promise<void> => {
+          while (nextDimension < dimensions.length && isCurrentSession()) {
+            const index = nextDimension++
+            const dimension = dimensions[index]
+            const taskId = `${savedTaskId}:search:${index + 1}`
+            const cached = get().taskJournal[taskId]
+            if (cached?.status === 'complete' && cached.output?.trim()) {
+              dimensionOutputs[index] = cached.output
+              continue
+            }
+            const focusedMessages = [
+              ...messages,
+              {
+                role: 'user' as const,
+                content: `本次只完成“${dimension}”这一维度。联网核实最多3个真实品牌；每个品牌给出推荐理由和可追溯来源。没有可靠结果时只输出“### ${dimension}\\n暂无可靠对标”。`
+              }
+            ]
+            let result = await runModelRetry(
+              focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
+              {
+                reportSessionId: sessionId,
+                taskType: 'module_benchmark',
+                taskKey: taskId,
+                billingRequestId: taskId,
+                isVision: false,
+                sourceCount: sourceCountV1,
+                imageCount: imageCountV1,
+                stepId: `${module.key}-${index + 1}`
+              }
+            )
+            const searchBudgetExhausted = /搜索(?:预算|次数)|search[_\s-]*(?:budget|limit)/iu.test(result.error || '')
+            if (!result.ok && retryBudget > 0 && !isUserStop(result.error) && !searchBudgetExhausted) {
+              retryBudget -= 1
+              result = await runModelRetry(
+                focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
+                {
+                  reportSessionId: sessionId,
+                  taskType: 'module_benchmark',
+                  taskKey: taskId,
+                  billingRequestId: taskId,
+                  isVision: false,
+                  sourceCount: sourceCountV1,
+                  imageCount: imageCountV1,
+                  stepId: `${module.key}-${index + 1}-retry`
+                }
+              )
+            }
+            const output = result.ok && result.text.trim()
+              ? result.text.trim()
+              : `### ${dimension}\n暂无可靠对标`
+            dimensionOutputs[index] = output
+            set((state) => ({
+              taskJournal: {
+                ...state.taskJournal,
+                [taskId]: { kind: 'module', status: 'complete', output, updatedAt: new Date().toISOString() }
+              }
+            }))
+            await window.api.saveLastProject(buildProjectSnapshot(get()))
+          }
+        }
+        await Promise.all(Array.from({ length: 3 }, () => worker()))
+        const benchmarkOutput = dimensionOutputs.join('\n\n')
+        set((state) => ({
+          artifacts: { ...state.artifacts, [module.id]: benchmarkOutput },
+          taskJournal: {
+            ...state.taskJournal,
+            [savedTaskId]: { kind: 'module', status: 'complete', output: benchmarkOutput, updatedAt: new Date().toISOString() }
+          }
+        }))
+        updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
+        return
+      }
+      const result = await runModelRetry(
+        messages,
+        () => {},
+        (fn) => {
+          if (isCurrentSession()) set({ abortFn: fn })
+        },
+        (attempt) => {
+          if (isCurrentSession()) get()._post('assistant', `M${module.id} ${module.title}连接中断，正在重试（第${attempt}次）…`, 'narration')
+        },
+        3,
+        {
+          reportSessionId: sessionId,
+          taskType: MODULE_TASK_TYPES[module.key],
+          taskKey: savedTaskId,
+          billingRequestId: savedTaskId,
+          isVision: false,
+          sourceCount: sourceCountV1,
+          imageCount: imageCountV1,
+          stepId: module.key
+        }
+      )
+      if (!isCurrentSession()) return
+      if (!result.ok || !result.text.trim()) {
+        const message = result.error || '模块没有返回内容'
+        updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, updatedAt: new Date().toISOString() }
+          }
+        }))
+        return
+      }
+      const validationErrors = validateModuleOutput(module.key, result.text)
+      if (validationErrors.length) {
+        const message = validationErrors.join('；')
+        updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, updatedAt: new Date().toISOString() }
+          }
+        }))
+        return
+      }
+      set((state) => ({
+        artifacts: { ...state.artifacts, [module.id]: result.text },
+        taskJournal: {
+          ...state.taskJournal,
+          [savedTaskId]: { kind: 'module', status: 'complete', output: result.text, updatedAt: new Date().toISOString() }
+        }
+      }))
+      updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
+      await window.api.saveLastProject(buildProjectSnapshot(get()))
+    }
+
+    for (const wave of [1, 2, 3, 4] as const) {
+      if (!isCurrentSession() || get().phase !== 'analyzing') return
+      const runnable = REPORT_MODULES.filter((module) => module.wave === wave)
+      get()._post('assistant', `正在执行第${wave}/4波：${runnable.map((module) => `M${module.id} ${module.title}`).join('、')}`, 'narration')
+      const results = await Promise.allSettled(runnable.map((module) => runModule(module)))
+      for (const [index, result] of results.entries()) {
+        if (result.status !== 'rejected') continue
+        const module = runnable[index]
+        const message = friendlyError(result.reason)
+        const taskId = `${sessionId}:module:v1:${module.key}`
+        updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [taskId]: { kind: 'module', status: 'failed', updatedAt: new Date().toISOString() }
+          }
+        }))
+      }
+    }
+    if (!isCurrentSession()) return
+    const outputByKey: Partial<Record<ModuleKey, string>> = {}
+    const messageByKey: Partial<Record<ModuleKey, string>> = {}
+    for (const module of REPORT_MODULES) {
+      outputByKey[module.key] = get().artifacts[module.id]
+      messageByKey[module.key] = get().moduleStates[module.key]?.message
+    }
+    const report = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
+    set((state) => ({
+      reportMarkdown: report,
+      artifacts: { ...state.artifacts, [REPORT_STEP_ID]: report },
+      reportStale: false,
+      phase: 'done',
+      abortFn: null
+    }))
+    await window.api.saveLastProject(buildProjectSnapshot(get()))
+    await storeCompleteReportResult(get()).catch(() => undefined)
+    get()._post('assistant', '✅ 8模块分析已完成。失败或缺资料的模块已在报告中明确标注，可直接检查并导出。', 'checkpoint')
+    return
+
     const { sopRules } = get()
     const sourceCount = topLevelSourceCount(get().sources)
     const imageCount = sourceImageCount(get().sources)
@@ -2159,7 +2489,7 @@ export const useStore = create<StoreState>((set, get) => ({
         const groupTaskId = `${sessionId}:summary:group-v3:${groupNumber}`
         const saved = get().taskJournal[groupTaskId]
         if (saved?.status === 'complete' && saved.output?.trim()) {
-          partialSummaries.push(saved.output)
+          partialSummaries.push(saved.output!)
           continue
         }
         const result = await runModelRetry(
@@ -2202,7 +2532,7 @@ export const useStore = create<StoreState>((set, get) => ({
       if (partialSummaries.length > 1) {
         const mergeTaskId = `${sessionId}:summary:merge-v3`
         const saved = get().taskJournal[mergeTaskId]
-        if (saved?.status === 'complete' && saved.output?.trim()) summaryText = saved.output
+        if (saved?.status === 'complete' && saved.output?.trim()) summaryText = saved.output!
         else {
           const merge = await runModelRetry(
             buildSummaryMergeMessages(partialSummaries, get().steering),
@@ -2273,7 +2603,7 @@ export const useStore = create<StoreState>((set, get) => ({
         const taskId = `${sessionId}:evidence_digest:v2:source:${index + 1}`
         const saved = get().taskJournal[taskId]
         if (saved?.status === 'complete' && saved.output?.trim()) {
-          digestOutputs.push(saved.output)
+          digestOutputs.push(saved.output!)
           continue
         }
         const digest = await runModelRetry(
@@ -2325,7 +2655,7 @@ export const useStore = create<StoreState>((set, get) => ({
           const taskId = `${sessionId}:evidence_digest:v2:${round}:${index + 1}`
           const saved = get().taskJournal[taskId]
           if (saved?.status === 'complete' && saved.output?.trim()) {
-            consolidated.push(saved.output)
+            consolidated.push(saved.output!)
             continue
           }
           const merge = await runModelRetry(
@@ -2668,6 +2998,37 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
+  retryModule: async (key) => {
+    if (get().readOnly) {
+      get()._post('assistant', get().legacyNotice || '旧报告仅支持查看导出。', 'error')
+      return
+    }
+    const affected = new Set<ModuleKey>([key])
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const module of REPORT_MODULES) {
+        if (!affected.has(module.key) && module.dependsOn.some((dependency) => affected.has(dependency))) {
+          affected.add(module.key)
+          changed = true
+        }
+      }
+    }
+    const affectedIds = new Set(REPORT_MODULES.filter((module) => affected.has(module.key)).map((module) => module.id))
+    set((state) => ({
+      artifacts: Object.fromEntries(Object.entries(state.artifacts).filter(([id]) => !affectedIds.has(Number(id)) && Number(id) !== REPORT_STEP_ID)),
+      taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId]) =>
+        ![...affected].some((moduleKey) => taskId.includes(`:module:v1:${moduleKey}`))
+      )),
+      moduleStates: Object.fromEntries(Object.entries(state.moduleStates).filter(([moduleKey]) => !affected.has(moduleKey as ModuleKey))),
+      reportMarkdown: '',
+      reportStale: false,
+      phase: 'checkpoint1'
+    }))
+    get()._post('assistant', `正在重试 ${[...affected].map((moduleKey) => moduleByTitle(moduleKey)).join('、')}。已完成且不受影响的模块会直接复用。`, 'narration')
+    await get()._runAnalysis()
+  },
+
   confirmCheckpoint: async () => {
     const phase = get().phase
     if (phase === 'checkpoint1') {
@@ -2714,26 +3075,19 @@ export const useStore = create<StoreState>((set, get) => ({
         return true
       }
       if (phase === 'checkpoint1') {
-        set((s) => {
-          const committedReport = s.artifacts[REPORT_STEP_ID] || s.reportMarkdown
-          return {
-            steering: (s.steering ? s.steering + '\n' : '') + t,
-            artifacts: committedReport ? { [REPORT_STEP_ID]: committedReport } : {},
-            reportStale: Boolean(committedReport),
-            // 用户纠偏会改变汇总及后续推理；只保留逐文件清洗批次，避免复用旧结论。
-            taskJournal: Object.fromEntries(
-              Object.entries(s.taskJournal).filter(([, task]) => task.kind === 'source_clean')
-            )
-          }
-        })
-        get()._post('assistant', '好的，按你的要求重新清洗归一……', 'narration')
-        await get()._runCleaning(true)
+        set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
+        get()._post('assistant', '已记录为8模块分析的补充要求。确认资料后会自动应用。', 'narration')
         return true
       }
       if (phase === 'checkpoint2' || phase === 'done') {
+        const match = /(?:模块\s*)?M?([1-8])/iu.exec(t)
+        const module = match ? REPORT_MODULES.find((candidate) => candidate.id === Number(match[1])) : undefined
+        if (!module) {
+          get()._post('assistant', '新版按模块生成报告。请说明要重做的模块编号，例如“重试 M6，并重点看购买顾虑”。', 'narration')
+          return true
+        }
         set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-        get()._post('assistant', '好的，按你的要求修订报告……', 'narration')
-        await get()._rerunReport(t)
+        await get().retryModule(module.key)
         return true
       }
       set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
@@ -2743,8 +3097,10 @@ export const useStore = create<StoreState>((set, get) => ({
       set({
         abortFn: null,
         phase:
-          phase === 'checkpoint2' || phase === 'done'
-            ? 'checkpoint2'
+          phase === 'done'
+            ? 'done'
+            : phase === 'checkpoint2'
+              ? 'checkpoint2'
             : phase === 'checkpoint1'
               ? 'checkpoint1'
               : get().cleanedData
