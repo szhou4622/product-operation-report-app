@@ -791,6 +791,7 @@ interface StoreState {
   legacyNotice: string
   moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
   moduleRetryInstructions: Partial<Record<ModuleKey, string>>
+  moduleRetryScope: ModuleKey[]
 
   init: () => Promise<void>
   setSettingsOpen: (open: boolean) => void
@@ -880,6 +881,7 @@ export const useStore = create<StoreState>((set, get) => ({
   legacyNotice: '',
   moduleStates: {},
   moduleRetryInstructions: {},
+  moduleRetryScope: [],
 
   init: async () => {
     const [settings, sopRules, lastProject, previousProject] = await Promise.all([
@@ -1046,7 +1048,8 @@ export const useStore = create<StoreState>((set, get) => ({
         ? '此报告由旧版本生成，仅支持查看导出'
         : lastProject?.legacyNotice || '',
       moduleStates: restoredModuleStates,
-      moduleRetryInstructions: {}
+      moduleRetryInstructions: {},
+      moduleRetryScope: []
     })
   },
 
@@ -1108,6 +1111,7 @@ export const useStore = create<StoreState>((set, get) => ({
       legacyNotice: '',
       moduleStates: {} as Partial<Record<ModuleKey, ModuleRunState>>,
       moduleRetryInstructions: {} as Partial<Record<ModuleKey, string>>,
+      moduleRetryScope: [] as ModuleKey[],
       projectRevision: nextRevision,
       analysisSessionId: crypto.randomUUID(),
       reportReuseOffer: null,
@@ -1215,6 +1219,7 @@ export const useStore = create<StoreState>((set, get) => ({
         : previous.legacyNotice || '',
       moduleStates: previous.moduleStates || {},
       moduleRetryInstructions: {},
+      moduleRetryScope: [],
       projectRevision: current.projectRevision + 1,
       analysisSessionId: previous.analysisSessionId || crypto.randomUUID(),
       reportReuseOffer: null,
@@ -2374,12 +2379,14 @@ export const useStore = create<StoreState>((set, get) => ({
       const requirements = [get().steering, get().moduleRetryInstructions[module.key]].filter(Boolean).join('\n')
       const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements })
       const inputFingerprint = fingerprintModuleMessages(messages)
-      if (saved?.inputFingerprint === inputFingerprint && saved.output?.trim() && isNoAnalysisOutput(saved.output)) {
+      const outsideTargetedRetry = get().moduleRetryScope.length > 0 && !get().moduleRetryScope.includes(module.key)
+      const reusableInput = outsideTargetedRetry || saved?.inputFingerprint === inputFingerprint
+      if (reusableInput && saved?.output?.trim() && isNoAnalysisOutput(saved.output)) {
         const output = normalizeNoAnalysisOutput(saved.output)
         updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: saved.updatedAt })
         return
       }
-      if (saved?.inputFingerprint === inputFingerprint && saved.status === 'complete' && saved.output?.trim()) {
+      if (reusableInput && saved?.status === 'complete' && saved.output?.trim()) {
         set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
         updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
         return
@@ -3161,7 +3168,8 @@ export const useStore = create<StoreState>((set, get) => ({
       reportMarkdown: '',
       reportStale: false,
       phase: 'checkpoint1',
-      moduleRetryInstructions: instruction ? { ...state.moduleRetryInstructions, [key]: instruction } : state.moduleRetryInstructions
+      moduleRetryInstructions: instruction ? { ...state.moduleRetryInstructions, [key]: instruction } : state.moduleRetryInstructions,
+      moduleRetryScope: [...affected]
     }))
     get()._post('assistant', `正在重试 ${[...affected].map((moduleKey) => moduleByTitle(moduleKey)).join('、')}。已完成且不受影响的模块会直接复用。`, 'narration')
     try {
@@ -3170,7 +3178,8 @@ export const useStore = create<StoreState>((set, get) => ({
       set((state) => ({
         moduleRetryInstructions: Object.fromEntries(
           Object.entries(state.moduleRetryInstructions).filter(([moduleKey]) => moduleKey !== key)
-        )
+        ),
+        moduleRetryScope: []
       }))
     }
   },
@@ -3221,6 +3230,12 @@ export const useStore = create<StoreState>((set, get) => ({
         return true
       }
       if (phase === 'checkpoint1') {
+        const match = /(?:模块\s*)?M?([1-8])/iu.exec(t)
+        const module = match ? REPORT_MODULES.find((candidate) => candidate.id === Number(match[1])) : undefined
+        if (/重试|重新分析|重做/u.test(t) && module && get().cleanedData.trim()) {
+          await get().retryModule(module.key, t)
+          return true
+        }
         set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
         get()._post('assistant', '已记录为8模块分析的补充要求。确认资料后会自动应用。', 'narration')
         return true
