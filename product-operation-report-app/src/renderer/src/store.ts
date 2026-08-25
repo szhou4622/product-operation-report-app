@@ -2440,10 +2440,25 @@ export const useStore = create<StoreState>((set, get) => ({
               }
             )
             const searchBudgetExhausted = /搜索(?:预算|次数)|search[_\s-]*(?:budget|limit)/iu.test(result.error || '')
-            if (!result.ok && retryBudget > 0 && !isUserStop(result.error) && !searchBudgetExhausted) {
+            const missingSearchExecution = result.ok && /未提供可用的?联网检索工具|无法联网检索|未完成联网检索|未完成检索/u.test(result.text)
+            if (
+              retryBudget > 0 &&
+              !isUserStop(result.error) &&
+              !searchBudgetExhausted &&
+              (!result.ok || missingSearchExecution)
+            ) {
               retryBudget -= 1
+              const retryMessages = missingSearchExecution
+                ? [
+                    ...focusedMessages,
+                    {
+                      role: 'user' as const,
+                      content: '上一轮没有执行联网搜索。本次必须调用可用的 web_search 工具完成实际检索；不要再次声称没有工具。若四个平台实际检索后没有可靠证据，再如实写未找到。'
+                    }
+                  ]
+                : focusedMessages
               result = await runModelRetry(
-                focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
+                retryMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
                 {
                   reportSessionId: benchmarkReportSessionId,
                   taskType: 'module_benchmark',
