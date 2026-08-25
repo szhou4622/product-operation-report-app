@@ -92,6 +92,8 @@ const moduleByTitle = (key: ModuleKey): string => {
   const module = REPORT_MODULES.find((candidate) => candidate.key === key)
   return module ? `M${module.id} ${module.title}` : key
 }
+const persistentSteering = (value: string): string =>
+  value.split(/\r?\n/u).filter((line) => !/^\s*重试\s*(?:模块\s*)?M?[1-8]\b/iu.test(line)).join('\n').trim()
 
 function completedSummaryGroups(
   taskJournal: Record<string, ProjectTaskSnapshot>,
@@ -788,6 +790,7 @@ interface StoreState {
   readOnly: boolean
   legacyNotice: string
   moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
+  moduleRetryInstructions: Partial<Record<ModuleKey, string>>
 
   init: () => Promise<void>
   setSettingsOpen: (open: boolean) => void
@@ -806,7 +809,7 @@ interface StoreState {
   acceptReportReuse: () => Promise<void>
   regenerateReport: () => Promise<void>
   confirmCheckpoint: () => Promise<void>
-  retryModule: (key: ModuleKey) => Promise<void>
+  retryModule: (key: ModuleKey, instruction?: string) => Promise<void>
   sendMessage: (text: string) => Promise<boolean>
   abort: () => void
   exportReport: (format: 'html' | 'md' | 'docx') => Promise<void>
@@ -876,6 +879,7 @@ export const useStore = create<StoreState>((set, get) => ({
   readOnly: false,
   legacyNotice: '',
   moduleStates: {},
+  moduleRetryInstructions: {},
 
   init: async () => {
     const [settings, sopRules, lastProject, previousProject] = await Promise.all([
@@ -1030,7 +1034,7 @@ export const useStore = create<StoreState>((set, get) => ({
       reportMarkdown: restoredReport,
       reportStale: Boolean(lastProject?.reportStale),
       phase: lastProject ? restorePhase(lastProject) : 'idle',
-      steering: lastProject?.steering || '',
+      steering: persistentSteering(lastProject?.steering || ''),
       abortFn: null,
       exportStatus: '',
       lastExportPath: '',
@@ -1041,7 +1045,8 @@ export const useStore = create<StoreState>((set, get) => ({
       legacyNotice: legacyReadOnly
         ? '此报告由旧版本生成，仅支持查看导出'
         : lastProject?.legacyNotice || '',
-      moduleStates: restoredModuleStates
+      moduleStates: restoredModuleStates,
+      moduleRetryInstructions: {}
     })
   },
 
@@ -1102,6 +1107,7 @@ export const useStore = create<StoreState>((set, get) => ({
       readOnly: false,
       legacyNotice: '',
       moduleStates: {} as Partial<Record<ModuleKey, ModuleRunState>>,
+      moduleRetryInstructions: {} as Partial<Record<ModuleKey, string>>,
       projectRevision: nextRevision,
       analysisSessionId: crypto.randomUUID(),
       reportReuseOffer: null,
@@ -1196,7 +1202,7 @@ export const useStore = create<StoreState>((set, get) => ({
       reportMarkdown: restoredReport,
       reportStale: Boolean(previous.reportStale),
       phase: restorePhase(previous),
-      steering: previous.steering || '',
+      steering: persistentSteering(previous.steering || ''),
       abortFn: null,
       exportStatus: '',
       lastExportPath: '',
@@ -1208,6 +1214,7 @@ export const useStore = create<StoreState>((set, get) => ({
         ? '此报告由旧版本生成，仅支持查看导出'
         : previous.legacyNotice || '',
       moduleStates: previous.moduleStates || {},
+      moduleRetryInstructions: {},
       projectRevision: current.projectRevision + 1,
       analysisSessionId: previous.analysisSessionId || crypto.randomUUID(),
       reportReuseOffer: null,
@@ -2364,7 +2371,8 @@ export const useStore = create<StoreState>((set, get) => ({
         }),
         ...(sufficiency.partial.get(module.key) ? [sufficiency.partial.get(module.key)!] : [])
       ]
-      const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements: get().steering })
+      const requirements = [get().steering, get().moduleRetryInstructions[module.key]].filter(Boolean).join('\n')
+      const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements })
       const inputFingerprint = fingerprintModuleMessages(messages)
       if (saved?.inputFingerprint === inputFingerprint && saved.output?.trim() && isNoAnalysisOutput(saved.output)) {
         const output = normalizeNoAnalysisOutput(saved.output)
@@ -3127,7 +3135,7 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
-  retryModule: async (key) => {
+  retryModule: async (key, instruction) => {
     if (get().readOnly) {
       get()._post('assistant', get().legacyNotice || '旧报告仅支持查看导出。', 'error')
       return
@@ -3152,10 +3160,19 @@ export const useStore = create<StoreState>((set, get) => ({
       moduleStates: Object.fromEntries(Object.entries(state.moduleStates).filter(([moduleKey]) => !affected.has(moduleKey as ModuleKey))),
       reportMarkdown: '',
       reportStale: false,
-      phase: 'checkpoint1'
+      phase: 'checkpoint1',
+      moduleRetryInstructions: instruction ? { ...state.moduleRetryInstructions, [key]: instruction } : state.moduleRetryInstructions
     }))
     get()._post('assistant', `正在重试 ${[...affected].map((moduleKey) => moduleByTitle(moduleKey)).join('、')}。已完成且不受影响的模块会直接复用。`, 'narration')
-    await get()._runAnalysis()
+    try {
+      await get()._runAnalysis()
+    } finally {
+      set((state) => ({
+        moduleRetryInstructions: Object.fromEntries(
+          Object.entries(state.moduleRetryInstructions).filter(([moduleKey]) => moduleKey !== key)
+        )
+      }))
+    }
   },
 
   confirmCheckpoint: async () => {
@@ -3215,8 +3232,7 @@ export const useStore = create<StoreState>((set, get) => ({
           get()._post('assistant', '新版按模块生成报告。请说明要重做的模块编号，例如“重试 M6，并重点看购买顾虑”。', 'narration')
           return true
         }
-        set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-        await get().retryModule(module.key)
+        await get().retryModule(module.key, t)
         return true
       }
       set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
