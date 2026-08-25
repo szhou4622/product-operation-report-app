@@ -4,6 +4,8 @@ import {
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
+  isNoAnalysisOutput,
+  normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
 
@@ -59,5 +61,12 @@ describe('v1 report modules', () => {
     expect(report.indexOf('## M1')).toBeLessThan(report.indexOf('## M8'))
     expect(report).toContain('本报告内容由 AI 生成，请谨慎参考')
     expect(validateModuleOutput('product-info', '1. 产品基础\n信息：A\n来源：A\n2. SKU规格\n信息：A\n来源：A\n3. 价格\n信息：A\n来源：A\n4. 优惠赠品\n信息：A\n来源：A\n5. 原料/成分/材质\n信息：A\n来源：A\n6. 工艺技术\n信息：A\n来源：A\n7. 产品属性与功能\n信息：A\n来源：A\n8. 品牌背书\n信息：A\n来源：A\n9. 产品背书\n信息：A\n来源：A')).toEqual([])
+  })
+
+  it('treats evidence-bound no-result output as 暂无分析 instead of a module failure', () => {
+    const output = '核心人群 × 卖点 × 场景 TOP5\n\n无有效组合可输出。\n\n限制说明：缺少真实场景，无法确认匹配依据。'
+    expect(isNoAnalysisOutput(output)).toBe(true)
+    expect(validateModuleOutput('audience-sp-scene', output)).toEqual([])
+    expect(normalizeNoAnalysisOutput(output)).toMatch(/^暂无分析：/u)
   })
 })

@@ -2042,6 +2042,11 @@ function testManagedModelIsolation(): void {
       'managed-model', 'claude-sonnet-4-6', 'gemini-3-flash', 'kimi-k2.6'
     ])
 
+    process.env.PRODUCT_REPORT_DEV_FORCE_PROXY = '1'
+    assert.equal(getManagedModelState().mode, 'proxy', 'isolated staging must be able to force the server proxy path')
+    assert.notEqual(getActiveProfile()?.apiKey, secret, 'forced proxy mode must never reuse a local provider key')
+    delete process.env.PRODUCT_REPORT_DEV_FORCE_PROXY
+
     const saved = saveRendererSettings({
       ...rendererSettings,
       profiles: [
@@ -2064,6 +2069,7 @@ function testManagedModelIsolation(): void {
   } finally {
     delete process.env.PRODUCT_REPORT_MANAGED_MODEL_CONFIG_JSON
     delete process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES
+    delete process.env.PRODUCT_REPORT_DEV_FORCE_PROXY
   }
 }
 

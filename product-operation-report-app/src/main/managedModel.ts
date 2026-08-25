@@ -169,7 +169,8 @@ function explicitConfigPath(): string | null {
  */
 export function getManagedModelState(): ManagedModelState {
   const allowDevelopmentOverrides = !app.isPackaged && process.env.PRODUCT_REPORT_ALLOW_DEV_OVERRIDES === '1'
-  if (app.isPackaged || !allowDevelopmentOverrides) {
+  const forceDevelopmentProxy = !app.isPackaged && process.env.PRODUCT_REPORT_DEV_FORCE_PROXY === '1'
+  if (app.isPackaged || !allowDevelopmentOverrides || forceDevelopmentProxy) {
     const state = parseConfig({
       version: 1,
       enabled: true,

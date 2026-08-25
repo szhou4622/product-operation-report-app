@@ -68,6 +68,16 @@ export const MODULE_TASK_TYPES: Record<ModuleKey, ModelTaskType> = {
   'audience-sp-scene': 'module_audience_sp_scene'
 }
 
+export function isNoAnalysisOutput(text: string): boolean {
+  const value = text.trim()
+  return /暂无分析|暂无可分析|无有效(?:组合|结果|数据)可输出|资料不足[^。\n]*(?:无法|不能)|缺少[^。\n]*(?:无法|不能)/u.test(value)
+}
+
+export function normalizeNoAnalysisOutput(text: string): string {
+  const value = text.trim()
+  return value.startsWith('暂无分析') ? value : `暂无分析：${value}`
+}
+
 export function buildModuleMessages(module: ReportModule, context: ModuleContext): ChatMessage[] {
   const sourceText = context.sources.length
     ? context.sources.map((source, index) => [
@@ -117,6 +127,7 @@ function ordered(text: string, labels: string[]): boolean {
 export function validateModuleOutput(key: ModuleKey, text: string): string[] {
   const value = text.trim()
   if (!value) return ['模块没有返回内容']
+  if (isNoAnalysisOutput(value)) return []
   const errors: string[] = []
   if (key === 'product-info') {
     const labels = ['1. 产品基础', '2. SKU规格', '3. 价格', '4. 优惠赠品', '5. 原料/成分/材质', '6. 工艺技术', '7. 产品属性与功能', '8. 品牌背书', '9. 产品背书']

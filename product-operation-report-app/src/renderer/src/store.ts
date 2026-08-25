@@ -51,6 +51,8 @@ import {
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
+  isNoAnalysisOutput,
+  normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
 
@@ -2272,6 +2274,17 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       const savedTaskId = `${sessionId}:module:v1:${module.key}`
       const saved = get().taskJournal[savedTaskId]
+      if (saved?.output?.trim() && isNoAnalysisOutput(saved.output)) {
+        const output = normalizeNoAnalysisOutput(saved.output)
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [savedTaskId]: { ...saved, status: 'complete', output, updatedAt: new Date().toISOString() }
+          }
+        }))
+        updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: saved.updatedAt })
+        return
+      }
       if (saved?.status === 'complete' && saved.output?.trim()) {
         set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
         updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
@@ -2422,6 +2435,18 @@ export const useStore = create<StoreState>((set, get) => ({
             [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, updatedAt: new Date().toISOString() }
           }
         }))
+        return
+      }
+      if (isNoAnalysisOutput(result.text)) {
+        const output = normalizeNoAnalysisOutput(result.text)
+        set((state) => ({
+          taskJournal: {
+            ...state.taskJournal,
+            [savedTaskId]: { kind: 'module', status: 'complete', output, updatedAt: new Date().toISOString() }
+          }
+        }))
+        updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: new Date().toISOString() })
+        await window.api.saveLastProject(buildProjectSnapshot(get()))
         return
       }
       set((state) => ({
@@ -3040,7 +3065,8 @@ export const useStore = create<StoreState>((set, get) => ({
     const affectedIds = new Set(REPORT_MODULES.filter((module) => affected.has(module.key)).map((module) => module.id))
     set((state) => ({
       artifacts: Object.fromEntries(Object.entries(state.artifacts).filter(([id]) => !affectedIds.has(Number(id)) && Number(id) !== REPORT_STEP_ID)),
-      taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId]) =>
+      taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId, task]) =>
+        (task.output && isNoAnalysisOutput(task.output)) ||
         ![...affected].some((moduleKey) => taskId.includes(`:module:v1:${moduleKey}`))
       )),
       moduleStates: Object.fromEntries(Object.entries(state.moduleStates).filter(([moduleKey]) => !affected.has(moduleKey as ModuleKey))),
