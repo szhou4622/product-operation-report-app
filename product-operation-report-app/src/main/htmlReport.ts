@@ -602,7 +602,10 @@ function renderSellingPointMatrix(
   section: HtmlReportSection,
   plan: HtmlReportSectionPresentation
 ): string {
-  const table = plannedTable(section, plan)
+  const table = section.tables.find((candidate) =>
+    candidate.headers.some((header) => /卖点维度/u.test(header)) &&
+    candidate.headers.some((header) => /我方产品卖点/u.test(header))
+  ) || plannedTable(section, plan)
   if (!table || table.rows.length === 0) return ''
   const keywordCloud = renderKeywordCloud(plan.keywordCloud)
   return renderFigure(
@@ -655,23 +658,36 @@ function renderOrdinalVisual(
   section: HtmlReportSection,
   plan: HtmlReportSectionPresentation
 ): string {
-  const table = plannedTable(section, plan)
+  const table = section.tables.find((candidate) =>
+    candidate.headers.some((header) => /排序/u.test(header)) &&
+    candidate.headers.some((header) => /用户视角卖点|真实卖点/u.test(header))
+  ) || plannedTable(section, plan)
   if (!table || table.rows.length === 0) return ''
   return renderFigure(
-    '用户决策顺序',
+    section.number === 'M5' && /VOC|用户真实需求/iu.test(section.title) ? '用户需求优先级' : '真实卖点表达顺序',
     `<div class="ordinal-list">${table.rows
       .slice(0, 8)
       .map(
         (row, index) => `<div class="ordinal-item">
           <span>${escapeHtml(shorten(row[0] || String(index + 1), 12))}</span>
           <div><strong>${escapeHtml(shorten(row[1] || '', 52))}</strong>
-          <p>${escapeHtml(shorten(row[4] || row[3] || '', 80))}</p></div>
+          <p>${escapeHtml(shorten(row[5] || row[4] || row[3] || '', 80))}</p></div>
         </div>`
       )
       .join('')}</div>
       <p class="visual-note">这里只表达先后顺序，不用长度或面积暗示未经数据证明的差距。</p>`,
     'ordinal-visual'
   )
+}
+
+function renderSellingStrategy(
+  section: HtmlReportSection,
+  plan: HtmlReportSectionPresentation
+): string {
+  const matrix = renderSellingPointMatrix(section, plan)
+  const ranking = renderOrdinalVisual(section, plan)
+  if (!matrix && !ranking) return ''
+  return `<div class="selling-strategy-visual">${matrix}${ranking}</div>`
 }
 
 function renderAudienceVisual(
@@ -1021,6 +1037,9 @@ function renderSectionVisual(
       break
     case 'selling-point-matrix':
       visual = renderSellingPointMatrix(section, plan)
+      break
+    case 'selling-strategy':
+      visual = renderSellingStrategy(section, plan)
       break
     case 'ordinal-path':
       visual = renderOrdinalVisual(section, plan)

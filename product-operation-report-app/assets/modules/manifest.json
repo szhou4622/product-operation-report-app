@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "modules": [
     {
       "id": "M1",
@@ -63,6 +63,38 @@
       "fileName": "M8-audience-sp-scene.md",
       "systemPromptSha256": "a25debbcad49201dde182bbb24fbd981855743a7b7f7c2c39ad66ef2dc37f941",
       "systemPromptChars": 7345,
+      "outputTemplateChars": 333
+    },
+    {
+      "id": "M2-v2",
+      "title": "成交人群分析",
+      "fileName": "M2-audience-analysis.md",
+      "systemPromptSha256": "6fd731f67212091a3fb225c972af50134a1fd6079415db7a76a52c2b9991afd2",
+      "systemPromptChars": 9292,
+      "outputTemplateChars": 285
+    },
+    {
+      "id": "M4-v2",
+      "title": "卖点提炼与排序",
+      "fileName": "M4-selling-point-strategy.md",
+      "systemPromptSha256": "0c4bcc8653859985069491e76765a6bf8eaf72bdd588bc756937e732a563ad51",
+      "systemPromptChars": 11255,
+      "outputTemplateChars": 286
+    },
+    {
+      "id": "M5-v2",
+      "title": "用户真实需求VOC",
+      "fileName": "M5-voc.md",
+      "systemPromptSha256": "a593437e96be1952dcde5ee74935489c6a4007125c8c8a7426d1c0b288af27dc",
+      "systemPromptChars": 5729,
+      "outputTemplateChars": 318
+    },
+    {
+      "id": "M6-v2",
+      "title": "人群×卖点×场景匹配",
+      "fileName": "M6-audience-sp-scene.md",
+      "systemPromptSha256": "422ac0f6e50589cf5f26986913dc1ef07ce4df78bcea57f3408c1d08a1ec8109",
+      "systemPromptChars": 7366,
       "outputTemplateChars": 333
     }
   ]

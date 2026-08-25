@@ -5,13 +5,13 @@ import type { ModuleKey, ModulePrompt } from '../shared/types'
 
 const FILES: Record<ModuleKey, string> = {
   'product-info': 'M1-product-info.md',
-  'platform-audience': 'M2-platform-audience.md',
+  'platform-audience': 'M2-audience-analysis.md',
   'material-review': 'M3-material-review.md',
   'benchmark-brands': 'M4-benchmark-brands.md',
-  'selling-points': 'M5-selling-points.md',
-  voc: 'M6-voc.md',
+  'selling-points': 'M4-selling-point-strategy.md',
+  voc: 'M5-voc.md',
   'selling-point-ranking': 'M7-selling-point-ranking.md',
-  'audience-sp-scene': 'M8-audience-sp-scene.md'
+  'audience-sp-scene': 'M6-audience-sp-scene.md'
 }
 
 interface PromptManifest {
@@ -19,7 +19,7 @@ interface PromptManifest {
   modules: Array<{ fileName: string; systemPromptSha256: string }>
 }
 
-function section(markdown: string, title: string, nextTitles: string[]): string {
+function section(markdown: string, title: string, nextTitles: string[], preserveInternalSeparators = false): string {
   const start = markdown.indexOf(`## ${title}`)
   if (start < 0) return ''
   const contentStart = markdown.indexOf('\n', start) + 1
@@ -27,7 +27,10 @@ function section(markdown: string, title: string, nextTitles: string[]): string 
     .map((next) => markdown.indexOf(`\n## ${next}`, contentStart))
     .filter((index) => index >= 0)
   const end = candidates.length ? Math.min(...candidates) : markdown.length
-  return markdown.slice(contentStart, end).replace(/^\s*---\s*$/gmu, '').trim()
+  const value = markdown.slice(contentStart, end)
+  return preserveInternalSeparators
+    ? value.replace(/\r?\n\s*---\s*$/u, '').trim()
+    : value.replace(/^\s*---\s*$/gmu, '').trim()
 }
 
 export function readBundledModulePrompt(key: ModuleKey, directories: string[]): ModulePrompt {
@@ -40,7 +43,8 @@ export function readBundledModulePrompt(key: ModuleKey, directories: string[]): 
       const markdown = readFileSync(path, 'utf8')
       if (!markdown || markdown.length > 200_000) continue
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as PromptManifest
-      const systemPrompt = section(markdown, '系统提示词', ['输出模板', '验证逻辑'])
+      const preserveInternalSeparators = fileName === 'M2-audience-analysis.md' || fileName === 'M4-selling-point-strategy.md'
+      const systemPrompt = section(markdown, '系统提示词', ['输出模板', '验证逻辑'], preserveInternalSeparators)
       const outputTemplate = section(markdown, '输出模板', ['验证逻辑'])
       const expected = manifest.modules?.find((item) => item.fileName === fileName)?.systemPromptSha256
       const actual = createHash('sha256').update(systemPrompt, 'utf8').digest('hex')

@@ -3,12 +3,14 @@ import type {
   ModelTaskType,
   ModuleKey,
   ModulePrompt,
+  ReportEngineVersion,
   ReportModule,
   SearchEvidence,
   SearchVerificationStatus,
   SourceKindV1,
   ModuleRunState
 } from '../../shared/types'
+import { REPORT_MODULES_V2 } from '../../shared/types'
 
 export interface ModuleSourceBlock {
   name: string
@@ -88,14 +90,14 @@ export function normalizeNoAnalysisOutput(text: string): string {
   return value.startsWith('暂无分析') ? value : `暂无分析：${value}`
 }
 
-export function fingerprintModuleMessages(messages: ChatMessage[]): string {
+export function fingerprintModuleMessages(messages: ChatMessage[], engineVersion: ReportEngineVersion = 'v2'): string {
   const value = JSON.stringify(messages)
   let hash = 0x811c9dc5
   for (let index = 0; index < value.length; index++) {
     hash ^= value.charCodeAt(index)
     hash = Math.imul(hash, 0x01000193)
   }
-  return `v1-${(hash >>> 0).toString(16).padStart(8, '0')}-${value.length}`
+  return `${engineVersion}-${(hash >>> 0).toString(16).padStart(8, '0')}-${value.length}`
 }
 
 const BENCHMARK_PLATFORMS = ['天猫', '抖音', '视频号', '小红书'] as const
@@ -276,11 +278,19 @@ export function buildModuleMessages(module: ReportModule, context: ModuleContext
         '## 当前软件的素材框架归纳规则',
         '若上传表已经有脚本框架类型、开头21式、中段种草维度和结尾6式，直接按原字段汇总。',
         '若这些预标字段缺失，但存在完整文案、前三秒文案、3.x分类、内容形式、视角或标签，不得整章拒绝；必须逐条读取已有内容并进行有证据的“系统归纳”。',
-        '系统归纳时仍输出自有框架TOP5、竞品框架TOP5、补充机会TOP5；框架名称必须直接写出“3.x分类｜具体框架类型｜开头结构｜中段表达｜结尾结构”，不得只写“自有框架1/竞品框架1”。',
+        '系统归纳时按证据强度输出最多5条自有框架、最多5条竞品框架和最多5条补充机会；证据不足可以少于5条，禁止用占位项补齐。框架名称必须直接写出“3.x分类｜具体框架类型｜开头结构｜中段表达｜结尾结构”，不得只写“自有框架1/竞品框架1”。',
         '每个框架必须写数据依据、主要人群和完整可复用方向；机会必须写竞品依据、自有现状和可补充方向。无法确认的单个字段写“未单独标注”，但不能因为缺少预标字段而停止归纳。',
-        '所有归纳只能来自本次素材的实际文案和标签，禁止补充素材中不存在的产品事实、功效、价格或案例。'
+        '所有归纳只能来自本次素材的实际文案和标签，禁止补充素材中不存在的产品事实、功效、价格或案例。',
+        '如果资料中完全没有足以识别任何具体框架的文案、标签或结构，只输出：暂无分析：素材缺少可识别的文案或结构。'
       ].join('\n')
-    : ''
+    : module.key === 'selling-points'
+      ? [
+          '## 当前软件的卖点真实性兜底规则',
+          '若缺少能够证明当前产品真实能力的产品事实，不得仅凭自营或竞品素材创造卖点。',
+          '完全无法确认真实卖点时，只输出：暂无分析：缺少产品事实，无法确认当前产品的真实卖点。',
+          '若只有部分证据，继续输出能够确认的真实卖点，并在自营依据、竞品依据或来源字段中明确写“无”；不得因为证据不齐而停止其他模块。'
+        ].join('\n')
+      : ''
   return [
     { role: 'system', content: context.prompt.systemPrompt },
     {
@@ -312,7 +322,21 @@ function ordered(text: string, labels: string[]): boolean {
   return true
 }
 
-export function validateModuleOutput(key: ModuleKey, text: string): string[] {
+const MATERIAL_PLACEHOLDER = /(?:自有框架|竞品框架|补充机会|机会)\s*\d+|框架\s*[A-Z甲乙丙丁]|TOP\s*\d+\s*[：:]?\s*(?:框架|待补充)/iu
+const AUDIENCE_ATTRIBUTE_TAG = /(?:都市银发|小镇中老年|精致妈妈|新锐白领|资深中产|Z世代)/u
+const FAKE_SCORE = /(?:综合|卖点|价值|机会|推荐|核心度|匹配度)(?:评分|得分|指数|权重)\s*[：:]?\s*\d/iu
+
+function extractRankedSellingPointNames(value: string): string[] {
+  return [...value.matchAll(/^#{0,6}\s*TOP\s*(\d{1,2})\s*[｜|]\s*([^\r\n{]+)$/gimu)]
+    .sort((left, right) => Number(left[1]) - Number(right[1]))
+    .map((match) => match[2].trim())
+}
+
+export function validateModuleOutput(
+  key: ModuleKey,
+  text: string,
+  engineVersion: ReportEngineVersion = 'v2'
+): string[] {
   const value = text.trim()
   if (!value) return ['模块没有返回内容']
   if (isNoAnalysisOutput(value)) return []
@@ -322,23 +346,66 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
     if (!ordered(value, labels)) errors.push('产品信息9个维度缺失或顺序错误')
     if ((value.match(/信息：/gu) || []).length < 9 || (value.match(/来源：/gu) || []).length < 9) errors.push('产品信息必须逐维提供信息和来源')
   }
-  if (key === 'platform-audience' && !/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
-  if (key === 'material-review') {
-    for (const [prefix, normalized] of [['自有框架', '自有素材TOP'], ['竞品框架', '竞品素材TOP'], ['机会', '补充机会TOP']]) {
-      for (let index = 1; index <= 5; index++) {
-        if (!value.includes(`${prefix}${index}`) && !value.includes(`${normalized}${index}`)) errors.push(`素材模块缺少${prefix}${index}`)
+  if (key === 'platform-audience') {
+    if (engineVersion === 'v1') {
+      if (!/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
+    } else {
+      const platformCount = (value.match(/^##\s*平台\s*[：:]/gmu) || []).length
+      if (platformCount < 1) errors.push('成交人群模块没有按平台输出画像')
+      for (const dimension of ['1. 性别', '2. 年龄', '3. 地域', '4. 人群属性', '5. 消费力', '6. 购买偏好']) {
+        if ((value.match(new RegExp(`^#{2,4}\\s*${dimension.replace('.', '\\.')}`, 'gmu')) || []).length < platformCount) {
+          errors.push(`成交人群模块缺少${dimension}`)
+        }
+      }
+      if ((value.match(/信息\s*[：:]/gu) || []).length < platformCount * 6) errors.push('成交人群模块必须逐平台逐维输出信息')
+      if ((value.match(/来源\s*[：:]/gu) || []).length < platformCount * 6) errors.push('成交人群模块必须逐平台逐维标注来源')
+      if (!/多平台核心人群\s*TOP5/iu.test(value)) errors.push('成交人群模块缺少多平台核心人群TOP5')
+      if (/跨平台(?:综合)?占比|综合占比|平均占比/u.test(value)) errors.push('成交人群模块不得生成跨平台综合或平均占比')
+      const audienceTagInRegion = value.split(/^##\s*平台\s*[：:]/gmu).slice(1).some((platformBlock) => {
+        const regionAt = platformBlock.search(/^#{2,4}\s*3\.\s*地域\s*$/mu)
+        if (regionAt < 0) return false
+        const tail = platformBlock.slice(regionAt)
+        const attributeAt = tail.search(/^#{2,4}\s*4\.\s*人群属性\s*$/mu)
+        return AUDIENCE_ATTRIBUTE_TAG.test(attributeAt >= 0 ? tail.slice(0, attributeAt) : tail)
+      })
+      if (audienceTagInRegion) errors.push('成交人群模块把人群属性误写成了地域')
+      if (/(?:视频号|抖音|天猫|淘宝|小红书|快手)\s*\/\s*(?:性别|年龄|地域|消费力|购买偏好)占比/iu.test(value)) {
+        errors.push('成交人群模块存在含义不清的“平台/维度占比”标签')
       }
     }
-    if ((value.match(/可复用方向\s*[：:]/gu) || []).length < 10) errors.push('素材模块缺少自有或竞品可复用方向')
-    if ((value.match(/可补充方向\s*[：:]/gu) || []).length < 5) errors.push('素材模块缺少5条补充方向')
+  }
+  if (key === 'material-review') {
+    if (engineVersion === 'v1') {
+      for (const [prefix, normalized] of [['自有框架', '自有素材TOP'], ['竞品框架', '竞品素材TOP'], ['机会', '补充机会TOP']]) {
+        for (let index = 1; index <= 5; index++) {
+          if (!value.includes(`${prefix}${index}`) && !value.includes(`${normalized}${index}`)) errors.push(`素材模块缺少${prefix}${index}`)
+        }
+      }
+    }
+    if (MATERIAL_PLACEHOLDER.test(value)) errors.push('素材模块包含“框架1”等无含义占位名称')
+    if (!/框架类型\s*[：:]|具体框架|开头结构/u.test(value)) errors.push('素材模块缺少具体框架名称或结构')
+    if (!/可复用方向\s*[：:]/u.test(value)) errors.push('素材模块缺少可复用方向')
   }
   if (key === 'benchmark-brands' && !ordered(value, ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案'])) {
     errors.push('对标模块必须完整包含7个固定维度并保持顺序')
   }
   if (key === 'benchmark-brands' && BENCHMARK_PLACEHOLDER.test(value)) errors.push('对标模块包含无明确对象的占位品牌或排名')
-  if (key === 'selling-points' && !/品质|价格|健康|情感/u.test(value)) errors.push('产品卖点缺少四大需求分类')
+  if (key === 'selling-points') {
+    if (!ordered(value, ['品质需求', '价格需求', '健康需求', '情感需求'])) errors.push('卖点模块缺少四大需求分类或顺序错误')
+    if (engineVersion === 'v2') {
+      if (!/核心卖点总排序/u.test(value)) errors.push('卖点模块缺少统一核心卖点排序')
+      const names = extractRankedSellingPointNames(value)
+      if (names.length < 1) errors.push('卖点模块没有输出带真实名称的TOP卖点')
+      if (new Set(names).size !== names.length) errors.push('卖点模块总排序存在重复卖点')
+      if (/TOP\s*\d+\s*[｜|]\s*\{?\s*(?:卖点名称|真实卖点名称)\s*\}?/iu.test(value)) errors.push('卖点模块仍包含TOP卖点占位名称')
+      if (FAKE_SCORE.test(value)) errors.push('卖点模块包含无来源的综合评分或指数')
+      for (const field of ['需求类型', '买点', '自营依据', '竞品依据', '卖点状态', '排序判断', '自营来源', '竞品来源']) {
+        if ((value.match(new RegExp(`${field}\\s*[：:]`, 'gu')) || []).length < names.length) errors.push(`卖点模块排序项缺少${field}`)
+      }
+    }
+  }
   if (key === 'voc' && (!/频次/u.test(value) || !/占比/u.test(value))) errors.push('VOC结果必须包含频次和占比')
-  if (key === 'selling-point-ranking' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')
+  if (key === 'selling-point-ranking' && engineVersion === 'v1' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')
   if (key === 'audience-sp-scene') {
     if (!ordered(value, ['TOP1', 'TOP2', 'TOP3', 'TOP4', 'TOP5'])) errors.push('人群卖点场景模块缺少TOP1-TOP5')
     for (const requirement of [
@@ -358,15 +425,91 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
 export function assembleModuleReport(
   modules: ReportModule[],
   outputs: Partial<Record<ModuleKey, string>>,
-  messages: Partial<Record<ModuleKey, string>>
+  messages: Partial<Record<ModuleKey, string>>,
+  legacyBenchmarkAppendix = ''
 ): string {
   const sections = [...modules].sort((left, right) => left.id - right.id).map((module) => [
     `## M${module.id} ${module.title}`,
-    (outputs[module.key]?.trim() || messages[module.key] || `本模块未输出。`).replace(/^##\s+/gmu, '### ')
+    (outputs[module.key]?.trim() || messages[module.key] || `本模块未输出。`).replace(/^#{1,2}\s+/gmu, '### ')
   ].join('\n\n'))
   return [
-    '# 产品经营报告',
+    '# 产品与内容经营报告',
     ...sections,
+    legacyBenchmarkAppendix.trim()
+      ? `## A1 旧版对标附录（不参与六模块分析）\n\n> 以下内容仅为旧版历史结果，不参与新版模块依赖、卖点排序或人群场景匹配。\n\n${legacyBenchmarkAppendix.trim().replace(/^#{1,2}\s+/gmu, '### ')}`
+      : '',
     '> 本报告内容由 AI 生成，请谨慎参考。'
-  ].join('\n\n')
+  ].filter(Boolean).join('\n\n')
+}
+
+export interface LegacyV1Projection {
+  artifacts: Record<number, string>
+  moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
+  reportMarkdown: string
+  benchmarkAppendix: string
+}
+
+/**
+ * Deterministically projects the old eight-module report into the six-module view.
+ * This function never calls a model and deliberately labels the combined selling-point result as legacy.
+ */
+export function projectLegacyV1ToV2(
+  artifacts: Record<number, string>,
+  states: Partial<Record<ModuleKey, ModuleRunState>>
+): LegacyV1Projection {
+  const outputByKey: Partial<Record<ModuleKey, string>> = {
+    'product-info': artifacts[1],
+    'platform-audience': artifacts[2],
+    'material-review': artifacts[3],
+    voc: artifacts[6],
+    'audience-sp-scene': artifacts[8]
+  }
+  const sellingParts = [
+    artifacts[5]?.trim() ? `# 一、四大需求卖点买点摘要\n\n## 旧版产品卖点\n\n${artifacts[5].trim()}` : '',
+    artifacts[7]?.trim() ? `# 二、核心卖点总排序\n\n## 旧版卖点排序\n\n${artifacts[7].trim()}` : ''
+  ].filter(Boolean)
+  if (sellingParts.length) {
+    outputByKey['selling-points'] = [
+      '> 旧版自动转换：以下内容由旧M5与旧M7机械合并，尚未执行新版融合提示词。',
+      ...sellingParts
+    ].join('\n\n')
+  }
+  const now = new Date().toISOString()
+  const mappedState = (legacyKey: ModuleKey, output?: string): ModuleRunState => {
+    const legacy = states[legacyKey]
+    if (output?.trim()) {
+      return {
+        status: 'done',
+        message: '旧版内容转换，可点击“按新版重新生成本模块”。',
+        updatedAt: legacy?.updatedAt || now
+      }
+    }
+    return {
+      status: 'skipped',
+      message: legacy?.message || '暂无分析：旧版项目没有此模块的有效结果。',
+      updatedAt: legacy?.updatedAt || now
+    }
+  }
+  const moduleStates: Partial<Record<ModuleKey, ModuleRunState>> = {
+    'product-info': mappedState('product-info', outputByKey['product-info']),
+    'platform-audience': mappedState('platform-audience', outputByKey['platform-audience']),
+    'material-review': mappedState('material-review', outputByKey['material-review']),
+    'selling-points': mappedState('selling-point-ranking', outputByKey['selling-points']),
+    voc: mappedState('voc', outputByKey.voc),
+    'audience-sp-scene': mappedState('audience-sp-scene', outputByKey['audience-sp-scene'])
+  }
+  const projectedArtifacts: Record<number, string> = {}
+  for (const module of REPORT_MODULES_V2) {
+    const output = outputByKey[module.key]
+    if (output?.trim()) projectedArtifacts[module.id] = output
+  }
+  const benchmarkAppendix = artifacts[4]?.trim() || ''
+  const messages = Object.fromEntries(REPORT_MODULES_V2.map((module) => [module.key, moduleStates[module.key]?.message]))
+  const reportMarkdown = assembleModuleReport(REPORT_MODULES_V2, outputByKey, messages, benchmarkAppendix)
+  return {
+    artifacts: projectedArtifacts,
+    moduleStates,
+    reportMarkdown,
+    benchmarkAppendix
+  }
 }

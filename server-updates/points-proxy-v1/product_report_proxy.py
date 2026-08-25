@@ -79,7 +79,7 @@ TASK_OUTPUT_RESERVES = {
     "module_platform_audience": 8000,
     "module_material_review": 10000,
     "module_benchmark": 5000,
-    "module_selling_points": 7000,
+    "module_selling_points": 10000,
     "module_voc": 10000,
     "module_ranking": 10000,
     "module_audience_sp_scene": 10000,

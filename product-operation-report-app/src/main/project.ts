@@ -474,7 +474,12 @@ function sanitizeProject(value: unknown): SavedProject {
     missingBlobs: Array.isArray(input.missingBlobs)
       ? input.missingBlobs.filter((item): item is string => typeof item === 'string').slice(0, 200)
       : undefined,
-    engineVersion: input.engineVersion === 'v1' ? 'v1' : undefined,
+    engineVersion: input.engineVersion === 'v1' || input.engineVersion === 'v2' ? input.engineVersion : undefined,
+    legacyEngineVersion: input.legacyEngineVersion === 'v1' ? 'v1' : undefined,
+    legacyArtifacts: sanitizeArtifactRecord(input.legacyArtifacts),
+    legacyModuleStates: sanitizeModuleStates(input.legacyModuleStates),
+    legacyReportMarkdown: optionalString(input.legacyReportMarkdown),
+    legacyBenchmarkAppendix: optionalString(input.legacyBenchmarkAppendix),
     readOnly: Boolean(input.readOnly),
     legacyNotice: optionalString(input.legacyNotice),
     moduleStates: sanitizeModuleStates(input.moduleStates)

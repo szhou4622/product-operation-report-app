@@ -10,11 +10,11 @@ const STAGE_LABELS: Record<ModelTaskType, string> = {
   module_product_info: 'M1 产品信息',
   module_platform_audience: 'M2 平台人群',
   module_material_review: 'M3 素材判断',
-  module_benchmark: 'M4 对标推荐',
-  module_selling_points: 'M5 产品卖点',
-  module_voc: 'M6 用户VOC',
-  module_ranking: 'M7 卖点排序',
-  module_audience_sp_scene: 'M8 人群卖点场景'
+  module_benchmark: '旧版 M4 对标推荐',
+  module_selling_points: 'M4 卖点提炼与排序',
+  module_voc: 'M5 用户VOC',
+  module_ranking: '旧版 M7 卖点排序',
+  module_audience_sp_scene: 'M6 人群卖点场景'
 }
 
 function formatTokens(value: number): string {

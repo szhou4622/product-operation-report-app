@@ -292,7 +292,7 @@ function splitBlocks(lines: string[], pattern: RegExp): Array<{ title: string; l
   return blocks
 }
 
-function synthesizeModuleTables(number: string, markdown: string): HtmlReportTable[] {
+function synthesizeModuleTables(number: string, title: string, markdown: string): HtmlReportTable[] {
   const lines = moduleLines(markdown)
   if (number === 'M1') {
     const labels = ['产品基础', 'SKU规格', '价格', '优惠赠品', '原料/成分/材质', '工艺技术', '产品属性与功能', '品牌背书', '产品背书']
@@ -334,14 +334,21 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
         rows.push(row)
       }
     }
-    return rows.length ? [{ context: '分平台成交画像', headers: ['平台', '维度', '类别', '数据', '来源'], rows }] : []
+    const tables: HtmlReportTable[] = rows.length
+      ? [{ context: '分平台成交画像', headers: ['平台', '维度', '类别', '数据', '来源'], rows }]
+      : []
+    const audienceTable = parseSectionDetails(markdown).tables.find((table) =>
+      table.headers.some((header) => /优先级/u.test(header)) && table.headers.some((header) => /人群标签/u.test(header))
+    )
+    if (audienceTable) tables.push({ ...audienceTable, context: '多平台核心人群TOP5' })
+    return tables
   }
   if (number === 'M3') {
-    const blocks = splitBlocks(lines, /^(?:自有框架|竞品框架|机会)\d+/u)
+    const blocks = splitBlocks(lines, /^(?:自有框架|竞品框架|机会)\d+|^(?:自有素材TOP|竞品素材TOP|补充机会TOP)\d+/u)
     const buckets = [
-      { context: '自有素材', pattern: /^自有框架/u },
-      { context: '竞品素材', pattern: /^竞品框架/u },
-      { context: '补充机会', pattern: /^机会/u }
+      { context: '自有素材', pattern: /^(?:自有框架|自有素材TOP)/u },
+      { context: '竞品素材', pattern: /^(?:竞品框架|竞品素材TOP)/u },
+      { context: '补充机会', pattern: /^(?:机会|补充机会TOP)/u }
     ]
     return buckets.flatMap((bucket) => {
       const rows = blocks.filter((block) => bucket.pattern.test(block.title)).map((block) => {
@@ -353,7 +360,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
       return rows.length ? [{ context: bucket.context, headers: ['类型', '数据依据', '可复用方向'], rows }] : []
     })
   }
-  if (number === 'M4') {
+  if (number === 'M4' && /对标/u.test(title)) {
     const blocks = splitBlocks(lines, /^(?:同产品|同类目|同人群|同卖点|同痛点|同情绪|同解决方案)$/u)
     const rows = blocks.map((block) => {
       const brands = block.lines.filter((line) => /^品牌\s*[：:]/u.test(line)).map((line) => valueAfter(line, '品牌')).join('、')
@@ -363,7 +370,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
     })
     return rows.length ? [{ context: '七维对标证据', headers: ['数据类型', '来源', '本次用途'], rows }] : []
   }
-  if (number === 'M5') {
+  if ((number === 'M4' && /卖点/u.test(title)) || (number === 'M5' && !/VOC|用户真实需求/iu.test(title))) {
     const blocks = splitBlocks(lines, /^(?:\d+[.、]\s*)?(?:品质需求|价格需求|健康需求|情感需求)$/u)
     const rows = blocks.flatMap((block) => {
       const category = block.title.replace(/^\d+[.、]\s*/u, '')
@@ -375,9 +382,33 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
         return [category, [valueAfter(selling, '卖点'), valueAfter(benefit, '买点')].filter(Boolean).join('｜'), '来源：M1产品事实与M3素材证据']
       })
     })
-    return rows.length ? [{ context: '四类消费者买点', headers: ['卖点维度', '我方产品卖点', '证据'], rows }] : []
+    const tables: HtmlReportTable[] = rows.length
+      ? [{ context: '四类消费者买点', headers: ['卖点维度', '我方产品卖点', '证据'], rows }]
+      : []
+    const rankBlocks = splitBlocks(lines, /^TOP\s*\d{1,2}\s*[｜|]\s*\S/iu)
+    const rankedRows = rankBlocks.map((block) => {
+      const titleMatch = block.title.match(/^TOP\s*(\d{1,2})\s*[｜|]\s*(.+)$/iu)
+      const read = (label: string): string => labeledValue(block.lines, [label])
+      return [
+        titleMatch ? `TOP${titleMatch[1]}` : block.title,
+        titleMatch?.[2]?.trim() || '暂无分析',
+        read('需求类型'),
+        read('买点'),
+        read('卖点状态'),
+        read('排序判断'),
+        [read('自营来源'), read('竞品来源')].filter(Boolean).join('；') || '来源未标注'
+      ]
+    })
+    if (rankedRows.length) {
+      tables.push({
+        context: '真实卖点统一排序',
+        headers: ['排序', '真实卖点', '需求类型', '消费者买点', '状态', '排序判断', '来源'],
+        rows: rankedRows
+      })
+    }
+    return tables
   }
-  if (number === 'M6') {
+  if ((number === 'M5' && /VOC|用户真实需求/iu.test(title)) || (number === 'M6' && !/人群.*卖点.*场景/u.test(title))) {
     const blocks = splitBlocks(lines, /^(?:TOP\s*\d+|\d+[.、])/iu)
     const rows = blocks.map((block, index) => [String(index + 1), block.title, '', block.lines.find((line) => /频次/u.test(line)) || '', block.lines.find((line) => /占比|来源/u.test(line)) || block.lines.join('；')])
     return rows.length ? [{ context: 'VOC需求优先级', headers: ['排序', '用户视角卖点', '分类', '频次', '依据'], rows }] : []
@@ -392,7 +423,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
     }
     return rows.length ? [{ context: '真实卖点排序', headers: ['排序', '用户视角卖点', '层级', '来源', '依据'], rows }] : []
   }
-  if (number === 'M8') {
+  if (number === 'M8' || (number === 'M6' && /人群.*卖点.*场景/u.test(title))) {
     const blocks = splitBlocks(lines, /^TOP\s*[1-5]\b/iu)
     const read = (block: { lines: string[] }, labels: string[]): string => {
       for (const label of labels) {
@@ -427,11 +458,19 @@ export function parseHtmlReportModel(markdown: string): HtmlReportModel {
       title: current.title,
       markdown: sectionMarkdown,
       ...details,
-      tables: details.tables.length ? details.tables : synthesizeModuleTables(current.number, sectionMarkdown)
+      tables: (() => {
+        const synthesized = synthesizeModuleTables(current.number, current.title, sectionMarkdown)
+        if (!details.tables.length) return synthesized
+        if (current.number === 'M2' || (current.number === 'M4' && /卖点/u.test(current.title))) {
+          const keys = new Set(synthesized.map((table) => `${table.context}\u0000${table.headers.join('\u0000')}`))
+          return [...synthesized, ...details.tables.filter((table) => !keys.has(`${table.context}\u0000${table.headers.join('\u0000')}`))]
+        }
+        return details.tables
+      })()
     })
   }
   for (const line of lines) {
-    const hit = line.match(/^##\s+(?:(\d+)\.\s+|(M[1-8])\s+)(.+?)\s*$/u)
+    const hit = line.match(/^##\s+(?:(\d+)\.\s+|((?:M[1-8]|A\d+))\s+)(.+?)\s*$/u)
     if (hit) {
       flush()
       current = { number: hit[1] || hit[2], title: plainText(hit[3]), lines: [] }

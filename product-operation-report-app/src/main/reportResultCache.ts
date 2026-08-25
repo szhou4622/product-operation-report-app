@@ -228,6 +228,7 @@ function updateHash(hash: ReturnType<typeof createHash>, value: string): void {
 export function reportResultCacheKey(input: ReportResultCacheInput, model: string): string {
   if (!input || !Array.isArray(input.sources) || !input.sources.length) throw new Error('完整报告缓存缺少资料。')
   const hash = createHash('sha256')
+  updateHash(hash, input.engineVersion || 'v1')
   for (const version of [
     MODEL_RUNTIME_RULES_VERSION, REPORT_PROMPT_VERSION, REPORT_TEMPLATE_VERSION,
     SOURCE_CLEAN_PROMPT_VERSION, TABLE_DIGEST_VERSION

@@ -4,20 +4,18 @@ import { derivedSourceCount, topLevelSourceCount, useStore } from '../store'
 const MACROS = [
   { title: '上传资料', desc: '产品手卡、自有数据、竞品数据' },
   { title: '资料校验', desc: '逐文件解析，清洗归类，确认缺口' },
-  { title: '经营分析', desc: '卖点、竞品、人群、内容主线' },
+  { title: '经营分析', desc: '产品、人群、素材、卖点与场景' },
   { title: '确认结论', desc: '核对卖点排序和报告初稿' },
   { title: '生成报告', desc: '定稿并导出 HTML / Word' }
 ]
 
 const ANALYSIS_COPY: Record<number, { title: string; desc: string }> = {
   1: { title: '产品信息', desc: '9维客观产品事实' },
-  2: { title: '平台人群数据', desc: '按平台隔离成交画像' },
+  2: { title: '成交人群分析', desc: '分平台画像与核心人群TOP5' },
   3: { title: '内容素材判断', desc: '自有与竞品框架汇总' },
-  4: { title: '对标推荐', desc: '7维公开资料对标' },
-  5: { title: '产品卖点', desc: '四大需求买点翻译' },
-  6: { title: '用户真实需求VOC', desc: '频次、占比与代表原话' },
-  7: { title: '总结卖点排序', desc: '真实卖点TOP10分档' },
-  8: { title: '人群×卖点×场景', desc: 'TOP5真实匹配组合' }
+  4: { title: '卖点提炼与排序', desc: '四大需求与真实卖点TOP10' },
+  5: { title: '用户真实需求VOC', desc: '频次、占比与代表原话' },
+  6: { title: '人群×卖点×场景', desc: 'TOP5真实匹配组合' }
 }
 
 type TaskStatus = 'done' | 'active' | 'paused' | 'idle'
@@ -57,7 +55,7 @@ export default function PhaseTracker(): JSX.Element {
     id: module.id,
     key: module.key,
     title: ANALYSIS_COPY[module.id]?.title ?? module.title,
-    desc: module.key === 'benchmark-brands' && moduleStates[module.key]?.status === 'done' && moduleStates[module.key]?.message
+    desc: moduleStates[module.key]?.status === 'done' && moduleStates[module.key]?.message
       ? moduleStates[module.key]!.message!
       : ANALYSIS_COPY[module.id]?.desc ?? ''
   }))
@@ -99,8 +97,8 @@ export default function PhaseTracker(): JSX.Element {
         <div className="analysis-flow">
           <div className="analysis-flow-head">
             <div>
-              <b>8 模块自动分析</b>
-              <span>{readOnly ? '旧报告只读' : phase === 'analyzing' ? '按四波并行处理' : '确认资料后自动完成'}</span>
+              <b>6 模块自动分析</b>
+              <span>{readOnly ? '旧报告只读' : phase === 'analyzing' ? '按三波并行处理' : '确认资料后自动完成'}</span>
             </div>
             <em>
               {doneCount}/{analysisTasks.length}
@@ -121,8 +119,10 @@ export default function PhaseTracker(): JSX.Element {
                     </div>
                     <div className="analysis-task-desc">{task.desc}</div>
                   </div>
-                  {moduleStates[task.key]?.status === 'failed' && !readOnly ? (
-                    <button className="btn xs" type="button" onClick={() => void retryModule(task.key)}>重试本模块</button>
+                  {(moduleStates[task.key]?.status === 'failed' || moduleStates[task.key]?.message?.includes('旧版内容转换')) && !readOnly ? (
+                    <button className="btn xs" type="button" onClick={() => void retryModule(task.key)}>
+                      {moduleStates[task.key]?.message?.includes('旧版内容转换') ? '按新版重新生成' : '重试本模块'}
+                    </button>
                   ) : (
                     <span className="analysis-task-status">{taskLabel(status)}</span>
                   )}

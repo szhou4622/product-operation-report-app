@@ -435,6 +435,7 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     gap: 1px;
     background: var(--line);
   }
+  .selling-strategy-visual { display: grid; gap: 28px; }
   .selling-item { min-width: 0; padding: 18px; background: var(--surface); }
   .selling-item p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
   .selling-item.is-missing { background: var(--warning-soft); }

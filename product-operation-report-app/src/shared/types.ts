@@ -434,6 +434,7 @@ export interface SourceCleanCacheStoreResult {
 export interface ReportResultCacheInput {
   sources: SourceCleanCacheInput[]
   userRequirements: string
+  engineVersion: ReportEngineVersion
 }
 
 export interface ReportResultCacheCleanDetail {
@@ -556,7 +557,13 @@ export interface SavedProject {
   updatedAt: string
   /** Missing external data chunks encountered during recovery; unaffected project content remains usable. */
   missingBlobs?: string[]
-  engineVersion?: 'v1'
+  engineVersion?: ReportEngineVersion
+  /** Immutable v1 material retained when an eight-module project is projected into v2. */
+  legacyEngineVersion?: 'v1'
+  legacyArtifacts?: Record<number, string>
+  legacyModuleStates?: Partial<Record<ModuleKey, ModuleRunState>>
+  legacyReportMarkdown?: string
+  legacyBenchmarkAppendix?: string
   readOnly?: boolean
   legacyNotice?: string
   moduleStates?: Partial<Record<ModuleKey, ModuleRunState>>
@@ -640,6 +647,8 @@ export type ModuleKey =
   | 'selling-point-ranking'
   | 'audience-sp-scene'
 
+export type ReportEngineVersion = 'v1' | 'v2'
+
 export type SourceKindV1 =
   | 'product-supply'
   | 'business-data'
@@ -676,7 +685,7 @@ export interface ModuleRunState {
   updatedAt: string
 }
 
-export const REPORT_MODULES: ReportModule[] = [
+export const REPORT_MODULES_V1: ReportModule[] = [
   { id: 1, key: 'product-info', title: '产品信息', wave: 1, dependsOn: [], requiredSources: ['product-supply'], hardRequired: true, needsWebSearch: false, promptFile: 'M1-product-info.md' },
   { id: 2, key: 'platform-audience', title: '平台人群数据', wave: 1, dependsOn: [], requiredSources: ['audience-data', 'business-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M2-platform-audience.md' },
   { id: 3, key: 'material-review', title: '内容素材判断', wave: 1, dependsOn: [], requiredSources: ['material-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M3-material-review.md' },
@@ -686,6 +695,22 @@ export const REPORT_MODULES: ReportModule[] = [
   { id: 7, key: 'selling-point-ranking', title: '总结卖点排序', wave: 3, dependsOn: ['selling-points', 'material-review'], requiredSources: [], hardRequired: false, needsWebSearch: false, promptFile: 'M7-selling-point-ranking.md' },
   { id: 8, key: 'audience-sp-scene', title: '核心人群×卖点×场景匹配', wave: 4, dependsOn: ['platform-audience', 'selling-points', 'voc', 'selling-point-ranking'], requiredSources: [], hardRequired: false, needsWebSearch: false, promptFile: 'M8-audience-sp-scene.md' }
 ]
+
+export const REPORT_MODULES_V2: ReportModule[] = [
+  { id: 1, key: 'product-info', title: '产品信息', wave: 1, dependsOn: [], requiredSources: ['product-supply'], hardRequired: false, needsWebSearch: false, promptFile: 'M1-product-info.md' },
+  { id: 2, key: 'platform-audience', title: '成交人群分析', wave: 1, dependsOn: [], requiredSources: ['audience-data', 'business-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M2-audience-analysis.md' },
+  { id: 3, key: 'material-review', title: '内容素材判断', wave: 1, dependsOn: [], requiredSources: ['material-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M3-material-review.md' },
+  { id: 5, key: 'voc', title: '用户真实需求VOC', wave: 1, dependsOn: [], requiredSources: ['voice-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M5-voc.md' },
+  { id: 4, key: 'selling-points', title: '卖点提炼与排序', wave: 2, dependsOn: ['product-info', 'material-review'], requiredSources: ['product-supply', 'material-data'], hardRequired: false, needsWebSearch: false, promptFile: 'M4-selling-point-strategy.md' },
+  { id: 6, key: 'audience-sp-scene', title: '人群×卖点×场景匹配', wave: 3, dependsOn: ['platform-audience', 'selling-points', 'voc'], requiredSources: [], hardRequired: false, needsWebSearch: false, promptFile: 'M6-audience-sp-scene.md' }
+]
+
+/** Active report engine configuration. Legacy v1 remains available for deterministic migration only. */
+export const REPORT_MODULES = REPORT_MODULES_V2
+
+export function reportModulesForEngine(engineVersion: ReportEngineVersion | undefined): ReportModule[] {
+  return engineVersion === 'v1' ? REPORT_MODULES_V1 : REPORT_MODULES_V2
+}
 
 /** Legacy 0.4.x steps are retained only for read-only project display. */
 export interface SopStep {
@@ -707,5 +732,5 @@ export const LEGACY_SOP_STEPS: SopStep[] = [
   { id: 9, key: 'report', title: '成稿', confirm: true }
 ]
 
-/** @deprecated v1 analysis uses REPORT_MODULES. Kept for legacy read-only rendering. */
+/** @deprecated The module engine uses REPORT_MODULES_V2. Kept for pre-module legacy report rendering. */
 export const SOP_STEPS = LEGACY_SOP_STEPS

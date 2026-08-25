@@ -11,6 +11,7 @@ export type HtmlReportVisualKind =
   | 'percent-facets'
   | 'material-methods'
   | 'selling-point-matrix'
+  | 'selling-strategy'
   | 'ordinal-path'
   | 'audience-map'
   | 'content-mix'
@@ -647,7 +648,7 @@ function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPr
     )
     .map(({ index }) => index)
   if (sellingPointColumns.length === 0) return null
-  if (section.number === 'M5') {
+  if (section.number === 'M5' || (section.number === 'M4' && /卖点/u.test(section.title))) {
     const columnIndex = sellingPointColumns[0]
     const ordered = new Map<string, { label: string; count: number; sources: HtmlReportSourceRef[] }>()
     table.rows.forEach((row, rowIndex) => {
@@ -842,6 +843,11 @@ function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVis
     }
     case 'selling-point-matrix':
       return matches((table) => tableMatches(table, [/卖点维度/, /我方产品卖点/])).slice(0, 1)
+    case 'selling-strategy':
+      return matches((table) =>
+        tableMatches(table, [/卖点维度/, /我方产品卖点/]) ||
+        tableMatches(table, [/排序/, /真实卖点/])
+      ).slice(0, 2)
     case 'ordinal-path':
       return matches((table) => tableMatches(table, [/排序/, /用户视角卖点/])).slice(0, 1)
     case 'audience-map':
@@ -858,6 +864,15 @@ function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVis
 }
 
 function visualKindForSection(section: HtmlReportSection): HtmlReportVisualKind {
+  if (section.number === 'M4' && /卖点/u.test(section.title)) {
+    return findVisualSourceIndexes(section, 'selling-strategy').length > 0 ? 'selling-strategy' : 'summary-only'
+  }
+  if (section.number === 'M5' && /VOC|用户真实需求/iu.test(section.title)) {
+    return findVisualSourceIndexes(section, 'ordinal-path').length > 0 ? 'ordinal-path' : 'summary-only'
+  }
+  if (section.number === 'M6' && /人群.*卖点.*场景/u.test(section.title)) {
+    return findVisualSourceIndexes(section, 'audience-map').length > 0 ? 'audience-map' : 'summary-only'
+  }
   const kindBySection: Record<string, HtmlReportVisualKind> = {
     '0': 'priority-lanes',
     '1': 'source-ledger',
@@ -895,7 +910,7 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
       : []
   const contentMix = visualKind === 'content-mix' ? buildContentMix(section) : null
   const keywordCloud =
-    visualKind === 'selling-point-matrix' ? buildKeywordCloud(section) : null
+    visualKind === 'selling-point-matrix' || visualKind === 'selling-strategy' ? buildKeywordCloud(section) : null
   const executionDistributions =
     visualKind === 'execution-matrix' ? buildExecutionDistributions(section) : []
   const plannedIndexes =
@@ -952,9 +967,12 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
   const tables = section.tables.map((table, tableIndex) => {
     const compact = table.rows.length <= 6 && table.headers.length <= 4
     const primary = tableIndex === 0 && alwaysVisibleMainTable.has(section.number)
+    const v2DecisionTable =
+      (section.number === 'M2' && /核心人群TOP5/u.test(table.context)) ||
+      (section.number === 'M4' && /真实卖点统一排序/u.test(table.context))
     return {
       tableIndex,
-      mode: primary || compact ? ('visible' as const) : ('collapsed' as const),
+      mode: primary || compact || v2DecisionTable ? ('visible' as const) : ('collapsed' as const),
       rowCount: table.rows.length,
       columnCount: table.headers.length
     }

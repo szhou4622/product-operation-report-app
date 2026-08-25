@@ -120,6 +120,7 @@ import {
   combineSourceCleanBatchOutputs,
   sourceCleanBatchInternals
 } from '../src/renderer/src/sourceCleanBatches'
+import { REPORT_MODULES_V2 } from '../src/shared/types'
 import type { ChatStreamEvent, ModelProfile, TokenUsageRecord } from '../src/shared/types'
 
 function encryptV032StoredCode(code: string, deviceId: string): string {
@@ -184,10 +185,24 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   const billingSnapshot = { ...snapshot(6, 'billing-id'), analysisSessionId: 'stable-billing-session' }
   await saveLastProject(billingSnapshot)
   assert.equal((await loadLastProject())?.analysisSessionId, 'stable-billing-session', 'crash recovery preserves stable billing ids')
+  const migratedSnapshot: SavedProject = {
+    ...snapshot(7, '# 产品与内容经营报告'),
+    engineVersion: 'v2',
+    legacyEngineVersion: 'v1',
+    legacyArtifacts: { 4: '旧版对标', 5: '旧版卖点', 7: '旧版排序' },
+    legacyReportMarkdown: '# 旧版八模块报告',
+    legacyBenchmarkAppendix: '旧版对标'
+  }
+  await saveLastProject(migratedSnapshot)
+  const restoredMigration = await loadLastProject()
+  assert.equal(restoredMigration?.engineVersion, 'v2')
+  assert.equal(restoredMigration?.legacyEngineVersion, 'v1')
+  assert.equal(restoredMigration?.legacyArtifacts?.[7], '旧版排序')
+  assert.equal(restoredMigration?.legacyBenchmarkAppendix, '旧版对标')
 
   const largeText = `中段唯一证据-${'资料'.repeat(50_000)}-最后唯一证据`
   const chunkedSnapshot: SavedProject = {
-    ...snapshot(7, ''),
+    ...snapshot(8, ''),
     sources: [{
       id: 'large-source',
       name: '大项目资料.md',
@@ -222,8 +237,8 @@ async function testProjectRevisionAndBackup(): Promise<void> {
   assert.ok(partiallyRestored, 'one missing blob must not erase the whole project')
   assert.match(partiallyRestored?.sources[0]?.text || '', /资料块丢失/u)
   assert.deepEqual(partiallyRestored?.missingBlobs, ['大项目资料.md'])
-  await saveLastProject({ ...chunkedSnapshot, revision: 8, updatedAt: new Date().toISOString() })
-  await archiveProject(snapshot(8, '上一份项目'))
+  await saveLastProject({ ...chunkedSnapshot, revision: 9, updatedAt: new Date().toISOString() })
+  await archiveProject(snapshot(9, '上一份项目'))
   const orphanBlob = join(tempUserData, 'project-data', 'blobs', `${'f'.repeat(64)}.txt`)
   writeFileSync(orphanBlob, 'orphan', 'utf8')
   const pruned = await pruneOrphanBlobs()
@@ -2190,17 +2205,13 @@ function testRepairPlanStaticContracts(): void {
   assert.doesNotMatch(store, /fetch\(item\.dataUrl\)/u, 'Office images must not be re-fetched under connect-src none')
   assert.match(store, /attachments: groupedAttachments/u, 'Office images remain grouped under the uploaded parent file')
   assert.match(store, /sourceHasContent/u)
-  assert.ok(
-    store.indexOf('const analysisEvidenceGroups = planAnalysisEvidenceGroups(evidenceSeed)') < store.indexOf('for (const step of SOP_STEPS)'),
-    'analysis evidence groups are planned once before the step loop'
-  )
-  assert.match(store, /completedSummaryGroups/u)
-  assert.match(store, /analysisEvidenceSeed/u)
-  assert.match(store, /await worker\(1\)/u, 'M4 must probe search capability before launching all dimensions')
-  assert.match(store, /dimensionSnapshots\[0\]\?\.status === 'unavailable'/u, 'M4 stops after a provider exposes no search events')
-  assert.match(store, /已停止其余维度调用/u, 'the user sees why M4 stopped before spending more points')
-  assert.match(store, /:evidence_digest:v2:/u)
-  assert.match(store, /cleanedData: analysisInput/u)
+  assert.deepEqual(REPORT_MODULES_V2.map((module) => module.id).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6])
+  assert.equal(REPORT_MODULES_V2.some((module) => module.key === 'benchmark-brands'), false)
+  assert.equal(REPORT_MODULES_V2.some((module) => module.key === 'selling-point-ranking'), false)
+  assert.match(store, /:module:v2:/u)
+  assert.doesNotMatch(store, /taskType:\s*'module_benchmark'/u, 'v2 client must not invoke the retired benchmark search task')
+  assert.doesNotMatch(store, /for \(const step of SOP_STEPS\)/u, 'retired nine-step analysis cannot run after the six-module engine')
+  assert.doesNotMatch(store, /:evidence_digest:v2:/u, 'retired evidence pipeline cannot cause duplicate analysis billing')
   assert.match(workflow, /npm run test:regression/u)
   assert.match(workflow, /npm run test:update-release/u)
   assert.match(workflow, /npm run test:html-visual/u)
@@ -2417,6 +2428,22 @@ async function testNewAndRestorePreviousAnalysis(): Promise<void> {
   assert.equal(useStore.getState().reportMarkdown, '上一份完整报告')
   assert.equal(useStore.getState().phase, 'done')
   assert.equal(useStore.getState().previousProjectAvailable, false)
+
+  previous = {
+    ...snapshot(21, '# 旧版八模块报告'),
+    engineVersion: 'v1',
+    sources: [{ id: 'legacy-source', name: '旧版资料.csv', kind: 'table', text: 'a,b' }],
+    artifacts: Object.fromEntries(Array.from({ length: 8 }, (_, index) => [index + 1, `旧M${index + 1}`])),
+    moduleStates: {}
+  }
+  await useStore.getState().restorePreviousAnalysis()
+  assert.equal(useStore.getState().engineVersion, 'v2')
+  assert.equal(useStore.getState().artifacts[4].includes('旧M5'), true)
+  assert.equal(useStore.getState().artifacts[4].includes('旧M7'), true)
+  assert.equal(useStore.getState().artifacts[5], '旧M6')
+  assert.equal(useStore.getState().artifacts[6], '旧M8')
+  assert.equal(useStore.getState().legacyArtifacts?.[4], '旧M4')
+  assert.match(useStore.getState().reportMarkdown, /旧版对标附录/u)
 }
 
 async function testIdleGoalAndLateSessionIsolation(): Promise<void> {
@@ -3394,7 +3421,8 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   await reportResultCacheInternals.resetForTests()
   const reportInput = {
     sources: [localTableSource, { ...source, name: '画像.csv' }],
-    userRequirements: '经营建议更具体'
+    userRequirements: '经营建议更具体',
+    engineVersion: 'v2' as const
   }
   const completeReport = [
     '# 测试产品经营报告',
@@ -3410,6 +3438,7 @@ async function testCostOptimizationPrimitives(): Promise<void> {
   assert.equal(reportKey.length, 64)
   assert.notEqual(reportResultCacheKey({ ...reportInput, sources: [...reportInput.sources].reverse() }, 'gpt-5.5'), reportKey)
   assert.notEqual(reportResultCacheKey({ ...reportInput, userRequirements: '换一个要求' }, 'gpt-5.5'), reportKey)
+  assert.notEqual(reportResultCacheKey({ ...reportInput, engineVersion: 'v1' }, 'gpt-5.5'), reportKey)
   assert.equal((await storeReportResultCache(reportInput, 'gpt-5.5', reportSnapshot)).stored, true)
   const reportHit = await lookupReportResultCache(reportInput, 'gpt-5.5')
   assert.equal(reportHit.hit, true)
@@ -4867,7 +4896,7 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(html, /data-source-cell-count=/)
   assert.match(html, /分口径数据对比/)
   assert.match(html, /证据如何进入经营判断/)
-  assert.match(html, /用户决策顺序/)
+  assert.match(html, /真实卖点表达顺序|用户决策顺序/)
   assert.match(html, /人群、场景与卖点匹配/)
   assert.match(html, /建议内容结构/)
   assert.match(html, /class="content-mix-dashboard"/)

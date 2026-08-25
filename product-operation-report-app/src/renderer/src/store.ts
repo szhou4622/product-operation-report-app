@@ -15,19 +15,13 @@ import type {
   ProjectTaskSnapshot,
   SourceKindV1,
   ModuleKey,
-  ModuleRunState
+  ModuleRunState,
+  ReportEngineVersion
 } from '../../shared/types'
-import { REPORT_MODULES, SOP_STEPS } from '../../shared/types'
+import { REPORT_MODULES, REPORT_MODULES_V2, SOP_STEPS } from '../../shared/types'
 import { FINAL_REPORT_PARTS } from './reportTemplate'
 import {
   buildExtractMessages,
-  buildEvidenceDigestConsolidationMessages,
-  buildEvidenceDigestMessages,
-  buildStepMessages,
-  buildSummaryGroupMessages,
-  buildSummaryMergeMessages,
-  planSummaryDetailGroups,
-  planAnalysisEvidenceGroups,
   type PriorOutput
 } from './sop'
 import { buildLocalTableCleanDetail, preprocessTableForModel } from './tablePreprocess'
@@ -48,17 +42,15 @@ import {
 } from './cleaningPlan'
 import {
   MODULE_TASK_TYPES,
-  type BenchmarkVerification,
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
   findStaleModuleKeys,
   fingerprintModuleMessages,
   isNoAnalysisOutput,
-  normalizeBenchmarkDimension,
-  normalizeBenchmarkOutput,
   normalizeMaterialReviewOutput,
   normalizeNoAnalysisOutput,
+  projectLegacyV1ToV2,
   validateModuleOutput
 } from './modules'
 import { inferSourcePlatform } from './sourceMetadata'
@@ -96,37 +88,12 @@ const moduleByTitle = (key: ModuleKey): string => {
   return module ? `M${module.id} ${module.title}` : key
 }
 const persistentSteering = (value: string): string =>
-  value.split(/\r?\n/u).filter((line) => !/^\s*重试\s*(?:模块\s*)?M?[1-8]\b/iu.test(line)).join('\n').trim()
+  value.split(/\r?\n/u).filter((line) => !/^\s*重试\s*(?:模块\s*)?M?[1-6]\b/iu.test(line)).join('\n').trim()
 
-function completedSummaryGroups(
-  taskJournal: Record<string, ProjectTaskSnapshot>,
-  sessionId: string
-): string[] {
-  const prefix = `${sessionId}:summary:group-v3:`
-  return Object.entries(taskJournal)
-    .filter(([key, task]) => key.startsWith(prefix) && task.status === 'complete' && Boolean(task.output?.trim()))
-    .sort(([left], [right]) => Number(left.slice(prefix.length)) - Number(right.slice(prefix.length)))
-    .map(([, task]) => task.output!.trim())
-}
-
-function analysisEvidenceSeed(
-  cleanedData: string,
-  summaryGroups: string[]
-): string {
-  if (!summaryGroups.length) return cleanedData
-  const markerAt = cleanedData.indexOf(CLEAN_DETAIL_MARKER)
-  const overview = (markerAt >= 0 ? cleanedData.slice(0, markerAt) : cleanedData).trim()
-  return [
-    overview ? `## 资料总览\n${overview}` : '',
-    '## 已完成的分组证据汇总',
-    summaryGroups.map((output, index) => `### 证据汇总 ${index + 1}/${summaryGroups.length}\n${output}`).join('\n\n')
-  ].filter(Boolean).join('\n\n')
-}
 const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
 const MAX_SOURCE_FILES = 50
-const BENCHMARK_EVIDENCE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 let cleaningCheckpointSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 function formatPointsValue(value: number): string {
@@ -288,7 +255,8 @@ function toSourceCleanCacheInput(source: Source): SourceCleanCacheInput {
 function reportResultCacheInput(sources: Source[], userRequirements: string): ReportResultCacheInput {
   return {
     sources: sources.filter(sourceHasContent).map(toSourceCleanCacheInput),
-    userRequirements
+    userRequirements,
+    engineVersion: 'v2'
   }
 }
 
@@ -299,18 +267,21 @@ function hasCompleteReportSections(markdown: string): boolean {
   const v1 = Array.from({ length: 8 }, (_, index) =>
     new RegExp(`^##\\s+M${index + 1}\\s+`, 'mu').test(markdown)
   ).every(Boolean) && /本报告内容由 AI 生成，请谨慎参考/u.test(markdown)
-  return legacy || v1
+  const v2 = Array.from({ length: 6 }, (_, index) =>
+    new RegExp(`^##\\s+M${index + 1}\\s+`, 'mu').test(markdown)
+  ).every(Boolean) && /本报告内容由 AI 生成，请谨慎参考/u.test(markdown)
+  return legacy || v1 || v2
 }
 
 function validReportCacheSnapshot(snapshot: ReportResultCacheSnapshot | undefined): snapshot is ReportResultCacheSnapshot {
   if (!snapshot?.cleanedData.trim() || !snapshot.reportMarkdown.trim()) return false
   if (!hasCompleteReportSections(snapshot.reportMarkdown)) return false
-  return Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => snapshot.artifacts[id]?.trim())
+  return REPORT_MODULES.every((module) => snapshot.artifacts[module.id]?.trim()) && Boolean(snapshot.artifacts[REPORT_STEP_ID]?.trim())
 }
 
 function snapshotForReportCache(state: StoreState): ReportResultCacheSnapshot | null {
   if (!hasCompleteReportSections(state.reportMarkdown)) return null
-  if (!Array.from({ length: REPORT_STEP_ID }, (_, index) => index + 1).every((id) => state.artifacts[id]?.trim())) return null
+  if (!REPORT_MODULES.every((module) => state.artifacts[module.id]?.trim()) || !state.artifacts[REPORT_STEP_ID]?.trim()) return null
   const detailsById = new Map(state.cleanDetails.map((detail) => [detail.id, detail]))
   const cleanDetails = state.sources.flatMap((source) => {
     const detail = detailsById.get(source.id)
@@ -790,7 +761,12 @@ interface StoreState {
   lastExportPath: string
   openingExport: boolean
   cleaningProgress: CleaningProgress
-  engineVersion: 'v1'
+  engineVersion: ReportEngineVersion
+  legacyEngineVersion?: 'v1'
+  legacyArtifacts?: Record<number, string>
+  legacyModuleStates?: Partial<Record<ModuleKey, ModuleRunState>>
+  legacyReportMarkdown?: string
+  legacyBenchmarkAppendix?: string
   readOnly: boolean
   legacyNotice: string
   moduleStates: Partial<Record<ModuleKey, ModuleRunState>>
@@ -880,7 +856,12 @@ export const useStore = create<StoreState>((set, get) => ({
   lastExportPath: '',
   openingExport: false,
   cleaningProgress: emptyCleaningProgress(),
-  engineVersion: 'v1',
+  engineVersion: 'v2',
+  legacyEngineVersion: undefined,
+  legacyArtifacts: undefined,
+  legacyModuleStates: undefined,
+  legacyReportMarkdown: undefined,
+  legacyBenchmarkAppendix: undefined,
   readOnly: false,
   legacyNotice: '',
   moduleStates: {},
@@ -899,30 +880,39 @@ export const useStore = create<StoreState>((set, get) => ({
         ? lastProject.artifacts?.[REPORT_STEP_ID] || ''
         : lastProject?.reportMarkdown || ''
     const legacyReadOnly = Boolean(
-      lastProject && lastProject.engineVersion !== 'v1' &&
+      lastProject && lastProject.engineVersion !== 'v1' && lastProject.engineVersion !== 'v2' &&
       (lastProject.reportMarkdown?.trim() || Object.keys(lastProject.artifacts || {}).length)
     )
-    const restoredArtifacts = { ...(lastProject?.artifacts || {}) }
+    let restoredArtifacts = { ...(lastProject?.artifacts || {}) }
     const restoredTaskJournal = { ...(lastProject?.taskJournal || {}) }
-    const restoredModuleStates = { ...(lastProject?.moduleStates || {}) }
+    let restoredModuleStates = { ...(lastProject?.moduleStates || {}) }
+    let migratedV1 = false
+    let restoredLegacyEngineVersion = lastProject?.legacyEngineVersion
+    let restoredLegacyArtifacts = lastProject?.legacyArtifacts
+    let restoredLegacyModuleStates = lastProject?.legacyModuleStates
+    let restoredLegacyReportMarkdown = lastProject?.legacyReportMarkdown
+    let restoredLegacyBenchmarkAppendix = lastProject?.legacyBenchmarkAppendix
     let recoveredNoAnalysisModule = false
     let recoveredValidatedModule = false
     let staleModules: ModuleKey[] = []
     const invalidCompletedModules: ModuleKey[] = []
     if (lastProject?.engineVersion === 'v1') {
-      for (const module of REPORT_MODULES) {
+      const projection = projectLegacyV1ToV2(restoredArtifacts, restoredModuleStates)
+      restoredLegacyEngineVersion = 'v1'
+      restoredLegacyArtifacts = { ...restoredArtifacts }
+      restoredLegacyModuleStates = { ...restoredModuleStates }
+      restoredLegacyReportMarkdown = lastProject.reportMarkdown
+      restoredLegacyBenchmarkAppendix = projection.benchmarkAppendix
+      restoredArtifacts = { ...projection.artifacts, [REPORT_STEP_ID]: projection.reportMarkdown }
+      restoredModuleStates = projection.moduleStates
+      restoredReport = projection.reportMarkdown
+      migratedV1 = true
+    } else if (lastProject?.engineVersion === 'v2') {
+      for (const module of REPORT_MODULES_V2) {
         const taskEntry = Object.entries(restoredTaskJournal).find(([taskId]) =>
-          taskId.endsWith(`:module:v1:${module.key}`)
+          taskId.endsWith(`:module:v2:${module.key}`)
         )
         const task = taskEntry?.[1]
-        if (module.key === 'benchmark-brands' && task?.output) {
-          const normalized = normalizeBenchmarkOutput(task.output)
-          if (normalized !== task.output) {
-            restoredTaskJournal[taskEntry![0]] = { ...task, output: normalized, updatedAt: new Date().toISOString() }
-            restoredArtifacts[module.id] = normalized
-            recoveredValidatedModule = true
-          }
-        }
         if (module.key === 'material-review' && task?.output) {
           const normalized = normalizeMaterialReviewOutput(task.output)
           if (normalized !== task.output) {
@@ -934,13 +924,13 @@ export const useStore = create<StoreState>((set, get) => ({
         if (
           restoredModuleStates[module.key]?.status === 'done' &&
           task?.output &&
-          validateModuleOutput(module.key, task.output).length > 0
+          validateModuleOutput(module.key, task.output, 'v2').length > 0
         ) {
           delete restoredArtifacts[module.id]
           delete restoredTaskJournal[taskEntry![0]]
           restoredModuleStates[module.key] = {
             status: 'failed',
-            message: `旧结果不完整：${validateModuleOutput(module.key, task.output).slice(0, 3).join('；')}。`,
+            message: `旧结果不完整：${validateModuleOutput(module.key, task.output, 'v2').slice(0, 3).join('；')}。`,
             updatedAt: new Date().toISOString()
           }
           invalidCompletedModules.push(module.key)
@@ -953,19 +943,19 @@ export const useStore = create<StoreState>((set, get) => ({
           restoredModuleStates[module.key] = { status: 'skipped', message: output, updatedAt: new Date().toISOString() }
           delete restoredArtifacts[module.id]
           recoveredNoAnalysisModule = true
-        } else if (validateModuleOutput(module.key, task.output).length === 0) {
+        } else if (validateModuleOutput(module.key, task.output, 'v2').length === 0) {
           restoredTaskJournal[taskEntry![0]] = { ...task, status: 'complete', updatedAt: new Date().toISOString() }
           restoredModuleStates[module.key] = { status: 'done', updatedAt: new Date().toISOString() }
           restoredArtifacts[module.id] = task.output
           recoveredValidatedModule = true
         }
       }
-      staleModules = [...findStaleModuleKeys(REPORT_MODULES, restoredModuleStates)]
+      staleModules = [...findStaleModuleKeys(REPORT_MODULES_V2, restoredModuleStates)]
       const invalidOrStale = new Set<ModuleKey>([...invalidCompletedModules, ...staleModules])
       let dependencyChanged = true
       while (dependencyChanged) {
         dependencyChanged = false
-        for (const module of REPORT_MODULES) {
+        for (const module of REPORT_MODULES_V2) {
           if (invalidOrStale.has(module.key) || !module.dependsOn.some((dependency) => invalidOrStale.has(dependency))) continue
           invalidOrStale.add(module.key)
           staleModules.push(module.key)
@@ -973,7 +963,7 @@ export const useStore = create<StoreState>((set, get) => ({
         }
       }
       for (const key of staleModules) {
-        const module = REPORT_MODULES.find((candidate) => candidate.key === key)
+        const module = REPORT_MODULES_V2.find((candidate) => candidate.key === key)
         if (!module) continue
         delete restoredArtifacts[module.id]
         restoredModuleStates[key] = {
@@ -982,13 +972,13 @@ export const useStore = create<StoreState>((set, get) => ({
           updatedAt: new Date().toISOString()
         }
         for (const taskId of Object.keys(restoredTaskJournal)) {
-          if (taskId.includes(`:module:v1:${key}`)) delete restoredTaskJournal[taskId]
+          if (taskId.includes(`:module:v2:${key}`)) delete restoredTaskJournal[taskId]
         }
       }
       if (recoveredNoAnalysisModule || recoveredValidatedModule || invalidCompletedModules.length > 0 || staleModules.length > 0) {
-        const outputByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredArtifacts[module.id]]))
-        const messageByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
-        restoredReport = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
+        const outputByKey = Object.fromEntries(REPORT_MODULES_V2.map((module) => [module.key, restoredArtifacts[module.id]]))
+        const messageByKey = Object.fromEntries(REPORT_MODULES_V2.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
+        restoredReport = assembleModuleReport(REPORT_MODULES_V2, outputByKey, messageByKey, restoredLegacyBenchmarkAppendix)
         restoredArtifacts[REPORT_STEP_ID] = restoredReport
       }
     }
@@ -1037,6 +1027,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'narration',
         text: '已恢复符合新版校验规则的完整模块结果，没有重新调用模型，也没有重复扣分。'
+      })
+    }
+    if (migratedV1) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'checkpoint',
+        text: '已将旧版8模块报告自动转换为6模块视图。转换过程没有调用模型、没有扣分；旧对标内容保存在报告附录，各模块可按新版单独重新生成。'
       })
     }
     if (staleModules.length > 0) {
@@ -1097,7 +1095,12 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: '',
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
-      engineVersion: 'v1',
+      engineVersion: 'v2',
+      legacyEngineVersion: restoredLegacyEngineVersion,
+      legacyArtifacts: restoredLegacyArtifacts,
+      legacyModuleStates: restoredLegacyModuleStates,
+      legacyReportMarkdown: restoredLegacyReportMarkdown,
+      legacyBenchmarkAppendix: restoredLegacyBenchmarkAppendix,
       readOnly: legacyReadOnly || Boolean(lastProject?.readOnly),
       legacyNotice: legacyReadOnly
         ? '此报告由旧版本生成，仅支持查看导出'
@@ -1106,6 +1109,9 @@ export const useStore = create<StoreState>((set, get) => ({
       moduleRetryInstructions: {},
       moduleRetryScope: []
     })
+    if (migratedV1) {
+      await window.api.saveLastProject(buildProjectSnapshot(get()))
+    }
   },
 
   setSettingsOpen: (open) => set({ settingsOpen: open }),
@@ -1135,6 +1141,11 @@ export const useStore = create<StoreState>((set, get) => ({
       openingExport: false,
       cleaningProgress: current.cleaningProgress,
       engineVersion: current.engineVersion,
+      legacyEngineVersion: current.legacyEngineVersion,
+      legacyArtifacts: current.legacyArtifacts,
+      legacyModuleStates: current.legacyModuleStates,
+      legacyReportMarkdown: current.legacyReportMarkdown,
+      legacyBenchmarkAppendix: current.legacyBenchmarkAppendix,
       readOnly: current.readOnly,
       legacyNotice: current.legacyNotice,
       moduleStates: current.moduleStates,
@@ -1161,7 +1172,12 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: '',
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
-      engineVersion: 'v1' as const,
+      engineVersion: 'v2' as const,
+      legacyEngineVersion: undefined,
+      legacyArtifacts: undefined,
+      legacyModuleStates: undefined,
+      legacyReportMarkdown: undefined,
+      legacyBenchmarkAppendix: undefined,
       readOnly: false,
       legacyNotice: '',
       moduleStates: {} as Partial<Record<ModuleKey, ModuleRunState>>,
@@ -1212,11 +1228,28 @@ export const useStore = create<StoreState>((set, get) => ({
       throw new Error('没有找到可恢复的上一份分析。')
     }
 
-    const restoredReport =
+    let restoredReport =
       previous.phase === 'analyzing'
         ? previous.artifacts?.[REPORT_STEP_ID] || ''
         : previous.reportMarkdown || ''
-    const restoredArtifacts = { ...(previous.artifacts || {}) }
+    let restoredArtifacts = { ...(previous.artifacts || {}) }
+    let restoredModuleStates = previous.moduleStates || {}
+    let previousLegacyEngineVersion = previous.legacyEngineVersion
+    let previousLegacyArtifacts = previous.legacyArtifacts
+    let previousLegacyModuleStates = previous.legacyModuleStates
+    let previousLegacyReportMarkdown = previous.legacyReportMarkdown
+    let previousLegacyBenchmarkAppendix = previous.legacyBenchmarkAppendix
+    if (previous.engineVersion === 'v1') {
+      const projection = projectLegacyV1ToV2(restoredArtifacts, restoredModuleStates)
+      previousLegacyEngineVersion = 'v1'
+      previousLegacyArtifacts = { ...restoredArtifacts }
+      previousLegacyModuleStates = { ...restoredModuleStates }
+      previousLegacyReportMarkdown = previous.reportMarkdown
+      previousLegacyBenchmarkAppendix = projection.benchmarkAppendix
+      restoredArtifacts = { ...projection.artifacts, [REPORT_STEP_ID]: projection.reportMarkdown }
+      restoredModuleStates = projection.moduleStates
+      restoredReport = projection.reportMarkdown
+    }
     if (restoredReport && !restoredArtifacts[REPORT_STEP_ID]) {
       restoredArtifacts[REPORT_STEP_ID] = restoredReport
     }
@@ -1267,12 +1300,17 @@ export const useStore = create<StoreState>((set, get) => ({
       lastExportPath: '',
       openingExport: false,
       cleaningProgress: emptyCleaningProgress(),
-      engineVersion: 'v1' as const,
-      readOnly: previous.engineVersion !== 'v1' || Boolean(previous.readOnly),
-      legacyNotice: previous.engineVersion !== 'v1'
+      engineVersion: 'v2' as const,
+      legacyEngineVersion: previousLegacyEngineVersion,
+      legacyArtifacts: previousLegacyArtifacts,
+      legacyModuleStates: previousLegacyModuleStates,
+      legacyReportMarkdown: previousLegacyReportMarkdown,
+      legacyBenchmarkAppendix: previousLegacyBenchmarkAppendix,
+      readOnly: (previous.engineVersion !== 'v1' && previous.engineVersion !== 'v2') || Boolean(previous.readOnly),
+      legacyNotice: previous.engineVersion !== 'v1' && previous.engineVersion !== 'v2'
         ? '此报告由旧版本生成，仅支持查看导出'
         : previous.legacyNotice || '',
-      moduleStates: previous.moduleStates || {},
+      moduleStates: restoredModuleStates,
       moduleRetryInstructions: {},
       moduleRetryScope: [],
       projectRevision: current.projectRevision + 1,
@@ -1794,11 +1832,11 @@ export const useStore = create<StoreState>((set, get) => ({
         { status: offer.snapshot!.artifacts[module.id]?.trim() ? 'done' : 'skipped', updatedAt: new Date().toISOString() }
       ]))
     })
-    get()._post('assistant', '✅ 已恢复上次的完整报告（8模块），可直接检查和导出。', 'checkpoint')
+    get()._post('assistant', '✅ 已恢复上次的完整报告（6模块），可直接检查和导出。', 'checkpoint')
     void recordOptimizationEvent(
       optimizationEvent(`report-reuse:${sessionId}:${offer.cacheKey}`, sessionId, 'report_cache_reuse', {
-        // v1 固定8个模块；文件清洗可能本来也会走本地缓存，因此不计入。
-        skippedModelRequests: 8,
+        // v2 固定6个模块；文件清洗可能本来也会走本地缓存，因此不计入。
+        skippedModelRequests: 6,
         reusedReports: 1
       })
     )
@@ -2394,12 +2432,7 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     const sourceCountV1 = topLevelSourceCount(analysisSources)
     const imageCountV1 = sourceImageCount(analysisSources)
-    const benchmarkReportSessionId = get().moduleRetryScope.includes('benchmark-brands')
-      ? crypto.randomUUID()
-      : sessionId
-    const activeReportSessionId = get().moduleRetryScope.includes('benchmark-brands')
-      ? benchmarkReportSessionId
-      : sessionId
+    const activeReportSessionId = sessionId
     const updateModuleState = (key: ModuleKey, state: ModuleRunState): void => {
       set((current) => ({ moduleStates: { ...current.moduleStates, [key]: state } }))
     }
@@ -2411,8 +2444,22 @@ export const useStore = create<StoreState>((set, get) => ({
         updateModuleState(module.key, { status: 'skipped', message: skippedReason, updatedAt: new Date().toISOString() })
         return
       }
-      const savedTaskId = `${sessionId}:module:v1:${module.key}`
+      const savedTaskId = `${sessionId}:module:v2:${module.key}`
       const saved = get().taskJournal[savedTaskId]
+      const outsideTargetedRetry = get().moduleRetryScope.length > 0 && !get().moduleRetryScope.includes(module.key)
+      if (outsideTargetedRetry) {
+        const retained = get().artifacts[module.id]
+        const retainedState = get().moduleStates[module.key]
+        if (retained?.trim()) {
+          updateModuleState(module.key, {
+            status: 'done',
+            message: retainedState?.message,
+            updatedAt: retainedState?.updatedAt || new Date().toISOString()
+          })
+          return
+        }
+        if (retainedState?.status === 'skipped') return
+      }
       const moduleSources = analysisSources.flatMap((source) => {
         if (!source.kindV1 || !module.requiredSources.includes(source.kindV1)) return []
         const text = detailsById.get(source.id)
@@ -2439,8 +2486,7 @@ export const useStore = create<StoreState>((set, get) => ({
       ]
       const requirements = [get().steering, get().moduleRetryInstructions[module.key]].filter(Boolean).join('\n')
       const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements })
-      const inputFingerprint = fingerprintModuleMessages(messages)
-      const outsideTargetedRetry = get().moduleRetryScope.length > 0 && !get().moduleRetryScope.includes(module.key)
+      const inputFingerprint = fingerprintModuleMessages(messages, 'v2')
       const reusableInput = outsideTargetedRetry || saved?.inputFingerprint === inputFingerprint
       if (reusableInput && saved?.output?.trim() && isNoAnalysisOutput(saved.output)) {
         const output = normalizeNoAnalysisOutput(saved.output)
@@ -2448,193 +2494,16 @@ export const useStore = create<StoreState>((set, get) => ({
         return
       }
       if (reusableInput && saved?.status === 'complete' && saved.output?.trim()) {
-        const output = module.key === 'benchmark-brands'
-          ? normalizeBenchmarkOutput(saved.output)
-          : module.key === 'material-review'
+        const output = module.key === 'material-review'
             ? normalizeMaterialReviewOutput(saved.output)
             : saved.output
         set((state) => ({ artifacts: { ...state.artifacts, [module.id]: output } }))
-        const benchmarkMessage = module.key === 'benchmark-brands'
-          ? saved.searchStatus === 'verified' && saved.searchEvidence?.length
-            ? `已核验公开来源 ${saved.searchEvidence.length} 条`
-            : '仅基于已上传资料'
-          : undefined
-        updateModuleState(module.key, { status: 'done', message: benchmarkMessage, updatedAt: saved.updatedAt })
+        updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
         return
       }
       if (module.key === 'benchmark-brands') {
-        const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']
-        const dimensionOutputs: string[] = new Array(dimensions.length)
-        const dimensionSnapshots: BenchmarkVerification[] = new Array(dimensions.length)
-        let nextDimension = 0
-        const worker = async (maximumJobs = Number.POSITIVE_INFINITY): Promise<void> => {
-          let completedJobs = 0
-          while (nextDimension < dimensions.length && isCurrentSession() && completedJobs < maximumJobs) {
-            const index = nextDimension++
-            completedJobs += 1
-            const dimension = dimensions[index]
-            const taskId = `${savedTaskId}:search:${index + 1}`
-            const cached = get().taskJournal[taskId]
-            const focusedMessages = [
-              ...messages,
-              {
-                role: 'user' as const,
-                content: [
-                  `本次只完成“${dimension}”这一维度，必须实际使用联网检索工具，不得仅凭模型记忆。`,
-                  '优先把当前产品名、品类、人群、卖点、痛点或场景与天猫、抖音、视频号、小红书分别组合检索，但搜索范围不得仅限这四个平台。',
-                  '社交平台或天猫无法访问、需要登录或没有可靠结果时，必须继续搜索品牌官网、京东公开商品页、其他公开电商商品页、新闻媒体、食品行业媒体及中国市场可访问的公开零售页面。不得因为上传资料没有竞品名称而停止检索。',
-                  '从全部公开结果中选择最多3个证据最可靠的真实品牌；每个品牌必须写清品牌、对标产品/系列、平台或来源类型、公开页面或账号名称、匹配点、推荐理由，并在“来源”中填写完整 http/https 链接。',
-                  '禁止输出“品牌A、某品牌、示例品牌、TOP1、自有框架1、竞品框架1”等占位名称。没有明确品牌名和来源链接的结果不得推荐。',
-                  '如果只能使用已上传资料，必须逐条写“来源：用户资料｜具体文件或上游模块”；不得把模型记忆写成用户资料或公开检索结果。',
-                  '某个平台没有可靠结果时，在“平台覆盖”中明确写“未找到可靠公开结果”；只有继续检索其他公开来源后仍无可靠品牌，才输出暂无可靠对标。',
-                  `严格以“### ${dimension}”开头，随后输出“平台覆盖：天猫…｜抖音…｜视频号…｜小红书…｜其他公开来源…”。不要输出搜索计划、思考过程或“我会/我正在”等过程文字。`
-                ].join('\n')
-              }
-            ]
-            const dimensionFingerprint = fingerprintModuleMessages(focusedMessages)
-            const cachedAt = Date.parse(cached?.updatedAt || '')
-            const cachedFresh = Number.isFinite(cachedAt) && Date.now() - cachedAt <= BENCHMARK_EVIDENCE_TTL_MS
-            if (
-              cached?.status === 'complete' && cached.inputFingerprint === dimensionFingerprint && cached.output?.trim() &&
-              cached.searchStatus && cachedFresh
-            ) {
-              const verification = {
-                status: cached.searchStatus,
-                evidence: cached.searchEvidence || []
-              }
-              dimensionSnapshots[index] = verification
-              dimensionOutputs[index] = normalizeBenchmarkDimension(dimension, cached.output, verification)
-              continue
-            }
-            let result = await runModelRetry(
-              focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
-              {
-                reportSessionId: benchmarkReportSessionId,
-                taskType: 'module_benchmark',
-                taskKey: taskId,
-                billingRequestId: taskId,
-                isVision: false,
-                sourceCount: sourceCountV1,
-                imageCount: imageCountV1,
-                stepId: `${module.key}-${index + 1}`
-              }
-            )
-            const searchBudgetExhausted = /搜索(?:预算|次数)|search[_\s-]*(?:budget|limit)/iu.test(result.error || '')
-            if (
-              !isUserStop(result.error) &&
-              !searchBudgetExhausted &&
-              (!result.ok || result.searchStatus === 'attempted')
-            ) {
-              const retryMessages = [
-                ...focusedMessages,
-                {
-                  role: 'user' as const,
-                  content: '上一轮没有取得可核验的搜索调用和来源链接。本次再尝试一次 web_search；每个推荐的“来源”必须填写完整 http/https 链接。若仍无可核验来源，只能引用明确标注“来源：用户资料”的已上传内容，其余写“暂无可靠公开资料”。'
-                }
-              ]
-              result = await runModelRetry(
-                retryMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
-                {
-                  reportSessionId: benchmarkReportSessionId,
-                  taskType: 'module_benchmark',
-                  taskKey: taskId,
-                  billingRequestId: taskId,
-                  isVision: false,
-                  sourceCount: sourceCountV1,
-                  imageCount: imageCountV1,
-                  stepId: `${module.key}-${index + 1}-retry`
-                }
-              )
-            }
-            const verification = {
-              status: result.searchStatus || 'unavailable' as const,
-              evidence: result.searchEvidence || []
-            }
-            const output = normalizeBenchmarkDimension(
-              dimension,
-              result.text.trim() ? result.text : '暂无可靠对标',
-              verification
-            )
-            dimensionSnapshots[index] = verification
-            dimensionOutputs[index] = output
-            set((state) => ({
-              taskJournal: {
-                ...state.taskJournal,
-                [taskId]: {
-                  kind: 'module',
-                  status: 'complete',
-                  output,
-                  inputFingerprint: dimensionFingerprint,
-                  searchStatus: verification.status,
-                  searchEvidence: verification.evidence,
-                  updatedAt: new Date().toISOString()
-                }
-              }
-            }))
-            await window.api.saveLastProject(buildProjectSnapshot(get()))
-          }
-        }
-        await worker(1)
-        if (dimensionSnapshots[0]?.status === 'unavailable') {
-          for (let index = 1; index < dimensions.length; index++) {
-            const dimension = dimensions[index]
-            const taskId = `${savedTaskId}:search:${index + 1}`
-            const verification = { status: 'unavailable' as const, evidence: [] }
-            const output = normalizeBenchmarkDimension(dimension, '暂无可靠对标', verification)
-            dimensionSnapshots[index] = verification
-            dimensionOutputs[index] = output
-            set((state) => ({
-              taskJournal: {
-                ...state.taskJournal,
-                [taskId]: {
-                  kind: 'module', status: 'complete', output,
-                  searchStatus: verification.status, searchEvidence: [], updatedAt: new Date().toISOString()
-                }
-              }
-            }))
-          }
-          get()._post('assistant', 'CCG没有返回可验证的联网搜索事件，已停止其余维度调用，避免继续消耗积分。', 'narration')
-        } else {
-          await Promise.all(Array.from({ length: 2 }, () => worker()))
-        }
-        const benchmarkOutput = dimensionOutputs.join('\n\n')
-        const benchmarkEvidence = dimensionSnapshots.flatMap((item) => item?.evidence || []).filter((item, index, all) =>
-          all.findIndex((candidate) => candidate.url === item.url) === index
-        )
-        const benchmarkSearchStatus = benchmarkEvidence.length
-          ? 'verified' as const
-          : dimensionSnapshots.some((item) => item?.status === 'attempted')
-            ? 'attempted' as const
-            : 'unavailable' as const
-        const benchmarkMessage = benchmarkEvidence.length
-          ? `已核验公开来源 ${benchmarkEvidence.length} 条`
-          : '仅基于已上传资料'
-        const benchmarkValidationErrors = validateModuleOutput(module.key, benchmarkOutput)
-        if (benchmarkValidationErrors.length) {
-          const message = benchmarkValidationErrors.join('；')
-          updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
-          set((state) => ({
-            taskJournal: {
-              ...state.taskJournal,
-              [savedTaskId]: {
-                kind: 'module', status: 'failed', output: benchmarkOutput, inputFingerprint,
-                searchStatus: benchmarkSearchStatus, searchEvidence: benchmarkEvidence, updatedAt: new Date().toISOString()
-              }
-            }
-          }))
-          return
-        }
-        set((state) => ({
-          artifacts: { ...state.artifacts, [module.id]: benchmarkOutput },
-          taskJournal: {
-            ...state.taskJournal,
-            [savedTaskId]: {
-              kind: 'module', status: 'complete', output: benchmarkOutput, inputFingerprint,
-              searchStatus: benchmarkSearchStatus, searchEvidence: benchmarkEvidence, updatedAt: new Date().toISOString()
-            }
-          }
-        }))
-        updateModuleState(module.key, { status: 'done', message: benchmarkMessage, updatedAt: new Date().toISOString() })
+        const message = '暂无分析：对标联网模块仅保留为旧版兼容，不参与v2六模块分析。'
+        updateModuleState(module.key, { status: 'skipped', message, updatedAt: new Date().toISOString() })
         return
       }
       const moduleTaskContext = {
@@ -2674,7 +2543,7 @@ export const useStore = create<StoreState>((set, get) => ({
       let moduleOutput = module.key === 'material-review'
         ? normalizeMaterialReviewOutput(result.text)
         : result.text
-      let validationErrors = validateModuleOutput(module.key, moduleOutput)
+      let validationErrors = validateModuleOutput(module.key, moduleOutput, 'v2')
       if (validationErrors.length && !isNoAnalysisOutput(moduleOutput) && !isUserStop(result.error)) {
         get()._post('assistant', `M${module.id} ${module.title}缺少必要内容，正在自动补全，不需要手动重试。`, 'narration')
         const corrected = await runModelRetry(
@@ -2698,7 +2567,7 @@ export const useStore = create<StoreState>((set, get) => ({
           moduleOutput = module.key === 'material-review'
             ? normalizeMaterialReviewOutput(corrected.text)
             : corrected.text
-          validationErrors = validateModuleOutput(module.key, moduleOutput)
+          validationErrors = validateModuleOutput(module.key, moduleOutput, 'v2')
         }
       }
       if (validationErrors.length) {
@@ -2735,16 +2604,16 @@ export const useStore = create<StoreState>((set, get) => ({
       await window.api.saveLastProject(buildProjectSnapshot(get()))
     }
 
-    for (const wave of [1, 2, 3, 4] as const) {
+    for (const wave of [1, 2, 3] as const) {
       if (!isCurrentSession() || get().phase !== 'analyzing') return
       const runnable = REPORT_MODULES.filter((module) => module.wave === wave)
-      get()._post('assistant', `正在执行第${wave}/4波：${runnable.map((module) => `M${module.id} ${module.title}`).join('、')}`, 'narration')
+      get()._post('assistant', `正在执行第${wave}/3波：${runnable.map((module) => `M${module.id} ${module.title}`).join('、')}`, 'narration')
       const results = await Promise.allSettled(runnable.map((module) => runModule(module)))
       for (const [index, result] of results.entries()) {
         if (result.status !== 'rejected') continue
         const module = runnable[index]
         const message = friendlyError(result.reason)
-        const taskId = `${sessionId}:module:v1:${module.key}`
+        const taskId = `${sessionId}:module:v2:${module.key}`
         updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
         set((state) => ({
           taskJournal: {
@@ -2761,7 +2630,7 @@ export const useStore = create<StoreState>((set, get) => ({
       outputByKey[module.key] = get().artifacts[module.id]
       messageByKey[module.key] = get().moduleStates[module.key]?.message
     }
-    const report = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
+    const report = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey, get().legacyBenchmarkAppendix)
     set((state) => ({
       reportMarkdown: report,
       artifacts: { ...state.artifacts, [REPORT_STEP_ID]: report },
@@ -2778,436 +2647,18 @@ export const useStore = create<StoreState>((set, get) => ({
     if (failedCount > 0) {
       get()._post(
         'assistant',
-        `⚠️ 8模块流程已结束：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个、失败 ${failedCount} 个。失败模块没有生成内容，可在左侧点击“重试本模块”；已有结果均已保留。`,
+        `⚠️ 6模块流程已结束：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个、失败 ${failedCount} 个。失败模块没有生成内容，可在左侧点击“重试本模块”；已有结果均已保留。`,
         'error'
       )
     } else {
       get()._post(
         'assistant',
-        `✅ 8模块分析已完成：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个。可直接检查并导出。`,
+        `✅ 6模块分析已完成：成功 ${doneCount} 个、暂无分析 ${skippedCount} 个。可直接检查并导出。`,
         'checkpoint'
       )
     }
     return
 
-    const { sopRules } = get()
-    const sourceCount = topLevelSourceCount(get().sources)
-    const imageCount = sourceImageCount(get().sources)
-    let cleanedData = get().cleanedData
-    let reusableSummaryGroups = completedSummaryGroups(get().taskJournal, sessionId)
-    if (!cleanedData.includes(CLEAN_DETAIL_MARKER)) {
-      const details = get().cleanDetails.map((detail) => ({ name: detail.name, text: detail.text }))
-      const summaryGroups = planSummaryDetailGroups(details)
-      get()._post(
-        'assistant',
-        summaryGroups.length > 1
-          ? `资料已确认，正在分 ${summaryGroups.length} 组建立完整资料总览……`
-          : '资料已确认，正在建立资料总览……',
-        'narration'
-      )
-      const blockId = get()._post('assistant', '', 'report-block')
-      const partialSummaries: string[] = []
-      for (let index = 0; index < summaryGroups.length; index++) {
-        const groupNumber = index + 1
-        const groupTaskId = `${sessionId}:summary:group-v3:${groupNumber}`
-        const saved = get().taskJournal[groupTaskId]
-        if (saved?.status === 'complete' && saved.output?.trim()) {
-          partialSummaries.push(saved.output!)
-          continue
-        }
-        const result = await runModelRetry(
-          buildSummaryGroupMessages(summaryGroups[index], groupNumber, summaryGroups.length, get().steering),
-          (text) => {
-            if (isCurrentSession() && summaryGroups.length === 1) get()._update(blockId, text)
-          },
-          (fn) => {
-            if (isCurrentSession()) set({ abortFn: fn })
-          },
-          undefined,
-          1,
-          {
-            reportSessionId: sessionId,
-            taskType: 'summary',
-            taskKey: groupTaskId,
-            billingRequestId: groupTaskId,
-            isVision: false,
-            sourceCount,
-            imageCount,
-            stepId: `group-${groupNumber}-of-${summaryGroups.length}`
-          }
-        )
-        if (!isCurrentSession()) return
-        if (!result.ok || !result.text.trim()) {
-          get()._update(blockId, `⚠️ 第 ${groupNumber} 组资料汇总失败：${result.error || '没有返回内容'}`)
-          set({ phase: 'checkpoint1', abortFn: null })
-          return
-        }
-        partialSummaries.push(result.text)
-        set((state) => ({
-          taskJournal: {
-            ...state.taskJournal,
-            [groupTaskId]: { kind: 'summary', status: 'complete', output: result.text, updatedAt: new Date().toISOString() }
-          }
-        }))
-        await window.api.saveLastProject(buildProjectSnapshot(get()))
-      }
-      let summaryText = partialSummaries[0] || ''
-      if (partialSummaries.length > 1) {
-        const mergeTaskId = `${sessionId}:summary:merge-v3`
-        const saved = get().taskJournal[mergeTaskId]
-        if (saved?.status === 'complete' && saved.output?.trim()) summaryText = saved.output!
-        else {
-          const merge = await runModelRetry(
-            buildSummaryMergeMessages(partialSummaries, get().steering),
-            (text) => {
-              if (isCurrentSession()) get()._update(blockId, text)
-            },
-            (fn) => {
-              if (isCurrentSession()) set({ abortFn: fn })
-            },
-            undefined,
-            1,
-            {
-              reportSessionId: sessionId,
-              taskType: 'summary',
-              taskKey: mergeTaskId,
-              billingRequestId: mergeTaskId,
-              isVision: false,
-              sourceCount,
-              imageCount,
-              stepId: 'merge-all-groups'
-            }
-          )
-          if (!isCurrentSession()) return
-          if (!merge.ok || !merge.text.trim()) {
-            get()._update(blockId, `⚠️ 最终资料汇总失败：${merge.error || '没有返回内容'}`)
-            set({ phase: 'checkpoint1', abortFn: null })
-            return
-          }
-          summaryText = merge.text
-          set((state) => ({
-            taskJournal: {
-              ...state.taskJournal,
-              [mergeTaskId]: { kind: 'summary', status: 'complete', output: merge.text, updatedAt: new Date().toISOString() }
-            }
-          }))
-          await window.api.saveLastProject(buildProjectSnapshot(get()))
-        }
-      }
-      const detailFull = get().cleanDetails.map((detail) => `### ${detail.name}\n${detail.text}`).join('\n\n')
-      cleanedData = `${summaryText}${CLEAN_DETAIL_MARKER}\n\n${detailFull}`
-      reusableSummaryGroups = partialSummaries
-      set({ cleanedData, abortFn: null })
-      get()._update(blockId, summaryText)
-      await window.api.saveLastProject(buildProjectSnapshot(get()))
-    }
-    if (!reusableSummaryGroups.length) {
-      reusableSummaryGroups = completedSummaryGroups(get().taskJournal, sessionId)
-    }
-    const evidenceSeed = analysisEvidenceSeed(cleanedData, reusableSummaryGroups)
-    const analysisEvidenceGroups = planAnalysisEvidenceGroups(evidenceSeed)
-    let analysisInput = evidenceSeed
-    if (reusableSummaryGroups.length) {
-      get()._post(
-        'assistant',
-        `已复用 ${reusableSummaryGroups.length} 组完整汇总证据，不再把全部清洗明细重复发送一次。`,
-        'narration'
-      )
-    }
-    if (analysisEvidenceGroups.length > 1) {
-      get()._post(
-        'assistant',
-        `资料较多，正在一次性建立 ${analysisEvidenceGroups.length} 组通用证据台账，后续8个分析步骤将直接复用。`,
-        'narration'
-      )
-      const digestOutputs: string[] = []
-      let digestFailure = ''
-      for (let index = 0; index < analysisEvidenceGroups.length; index++) {
-        const taskId = `${sessionId}:evidence_digest:v2:source:${index + 1}`
-        const saved = get().taskJournal[taskId]
-        if (saved?.status === 'complete' && saved.output?.trim()) {
-          digestOutputs.push(saved.output!)
-          continue
-        }
-        const digest = await runModelRetry(
-          buildEvidenceDigestMessages({
-            evidenceGroup: analysisEvidenceGroups[index],
-            groupIndex: index + 1,
-            groupCount: analysisEvidenceGroups.length
-          }),
-          () => {},
-          (fn) => set({ abortFn: fn }),
-          (n) => get()._post('assistant', `证据台账第 ${index + 1} 组连接中断，重试第 ${n} 次…`, 'narration'),
-          1,
-          {
-            reportSessionId: sessionId,
-            taskType: 'summary',
-            taskKey: taskId,
-            billingRequestId: taskId,
-            isVision: false,
-            sourceCount: topLevelSourceCount(get().sources),
-            imageCount: sourceImageCount(get().sources),
-            stepId: `evidence-digest-${index + 1}`
-          }
-        )
-        if (!digest.ok || !digest.text.trim()) {
-          digestFailure = digest.error || `证据台账第 ${index + 1} 组没有返回内容`
-          break
-        }
-        digestOutputs.push(digest.text)
-        set((state) => ({
-          taskJournal: {
-            ...state.taskJournal,
-            [taskId]: {
-              kind: 'analysis_step',
-              status: 'complete',
-              output: digest.text,
-              updatedAt: new Date().toISOString()
-            }
-          }
-        }))
-        await window.api.saveLastProject(buildProjectSnapshot(get()))
-      }
-      let evidenceDigest = digestOutputs.map((output, index) => `### 证据分组 ${index + 1}\n${output}`).join('\n\n')
-      let round = 0
-      while (!digestFailure && planAnalysisEvidenceGroups(evidenceDigest).length > 1 && round < 4) {
-        round += 1
-        const groups = planAnalysisEvidenceGroups(evidenceDigest)
-        const consolidated: string[] = []
-        for (let index = 0; index < groups.length; index++) {
-          const taskId = `${sessionId}:evidence_digest:v2:${round}:${index + 1}`
-          const saved = get().taskJournal[taskId]
-          if (saved?.status === 'complete' && saved.output?.trim()) {
-            consolidated.push(saved.output!)
-            continue
-          }
-          const merge = await runModelRetry(
-            buildEvidenceDigestConsolidationMessages({
-              evidenceLedger: groups[index],
-              groupIndex: index + 1,
-              groupCount: groups.length
-            }),
-            () => {},
-            (fn) => set({ abortFn: fn }),
-            undefined,
-            1,
-            {
-              reportSessionId: sessionId,
-              taskType: 'summary',
-              taskKey: taskId,
-              billingRequestId: taskId,
-              isVision: false,
-              sourceCount: topLevelSourceCount(get().sources),
-              imageCount: sourceImageCount(get().sources),
-              stepId: `evidence-digest-merge-${round}-${index + 1}`
-            }
-          )
-          if (!merge.ok || !merge.text.trim()) {
-            digestFailure = merge.error || '通用证据台账合并失败'
-            break
-          }
-          consolidated.push(merge.text)
-          set((state) => ({
-            taskJournal: {
-              ...state.taskJournal,
-              [taskId]: {
-                kind: 'analysis_step',
-                status: 'complete',
-                output: merge.text,
-                updatedAt: new Date().toISOString()
-              }
-            }
-          }))
-          await window.api.saveLastProject(buildProjectSnapshot(get()))
-        }
-        if (!digestFailure) evidenceDigest = consolidated.join('\n\n')
-      }
-      if (digestFailure || planAnalysisEvidenceGroups(evidenceDigest).length > 1) {
-        get()._post('assistant', `⚠️ 通用证据台账生成失败：${digestFailure || '合并后仍超过安全长度'}。请修好后继续分析。`, 'error')
-        set({ phase: 'checkpoint1', abortFn: null })
-        return
-      }
-      analysisInput = evidenceDigest
-    }
-    for (const step of SOP_STEPS) {
-      if (get().phase !== 'analyzing') return
-      const isReportStep = step.id === REPORT_STEP_ID
-      // 已完成的非成稿步骤直接跳过（支持中断后续跑）
-      if (!isReportStep && get().artifacts[step.id]) continue
-
-      const priorOutputs = isReportStep
-        ? SOP_STEPS.filter((s) => s.id < step.id && get().artifacts[s.id]).map((s) => ({
-            id: s.id,
-            title: `第${s.id}步 ${s.title}`,
-            output: compactForFinalReport(get().artifacts[s.id])
-          }))
-        : priorOutputsForStep(step.id, get().artifacts)
-      if (isReportStep) {
-        const previousReport = get().reportMarkdown
-        const reportFeedback = get().steering
-        const finalTaskPrefix = `${sessionId}:final_part`
-        const completedFinalParts = Object.fromEntries(
-          Object.entries(get().taskJournal)
-            .filter(([taskId, task]) => taskId.startsWith(`${finalTaskPrefix}:`) && task.kind === 'final_part' && task.status === 'complete' && task.output)
-            .map(([taskId, task]) => [taskId, task.output || ''])
-        )
-        get()._post('assistant', '⏳ 正在整合成稿…', 'narration')
-        const res = await runFinalReportInParts({
-          cleanedData: cleanedSummaryOnly(cleanedData),
-          priorOutputs,
-          feedback: reportFeedback,
-          setAbort: (fn) => {
-            if (isCurrentSession()) set({ abortFn: fn })
-          },
-          onProgress: (text) => {
-            if (isCurrentSession()) set({ reportMarkdown: text })
-          },
-          onRetry: (partLabel, n) => {
-            if (isCurrentSession()) get()._post('assistant', `成稿「${partLabel}」连接中断，重试第 ${n} 次…`, 'narration')
-          },
-          taskContext: {
-            reportSessionId: sessionId,
-            taskType: 'final_part',
-            taskKeyPrefix: finalTaskPrefix,
-            sourceCount: topLevelSourceCount(get().sources),
-            imageCount: sourceImageCount(get().sources)
-          },
-          completedParts: completedFinalParts,
-          onPartComplete: async (taskId, output) => {
-            if (!isCurrentSession()) return
-            set((state) => ({
-              taskJournal: {
-                ...state.taskJournal,
-                [taskId]: {
-                  kind: 'final_part',
-                  status: 'complete',
-                  output,
-                  updatedAt: new Date().toISOString()
-                }
-              }
-            }))
-            await window.api.saveLastProject(buildProjectSnapshot(get()))
-          }
-        })
-        if (!isCurrentSession()) return
-        if (!res.ok) {
-          get()._post(
-            'assistant',
-            isUserStop(res.error)
-              ? '已停止生成，上一份完整报告仍然保留。需要时可继续分析。'
-              : `⚠️ 成稿中断：${res.error}。修好后点「确认，继续分析」可继续。`,
-            isUserStop(res.error) ? 'narration' : 'error'
-          )
-          set({ phase: 'checkpoint1', reportMarkdown: previousReport })
-          return
-        }
-        if (get().steering !== reportFeedback) {
-          set({ reportMarkdown: previousReport })
-          get()._post('assistant', '检测到你在成稿期间补充了新要求，正在自动按新要求再修订一次。', 'narration')
-          await get()._rerunReport()
-          return
-        }
-        const structureErrors = validateReportStructure(res.text)
-        if (structureErrors.length) {
-          set({ phase: 'checkpoint1', reportMarkdown: previousReport, abortFn: null })
-          get()._post(
-            'assistant',
-            `成稿结构检查未通过，软件已保留上一份完整报告并停止定稿：\n${structureErrors.slice(0, 4).map((item) => `- ${item}`).join('\n')}\n请点「确认，继续分析」补做本次成稿。`,
-            'error'
-          )
-          return
-        }
-        const evidenceAudit = validateReportEvidenceLinks(res.text, cleanedData)
-        if (evidenceAudit.errors.length) {
-          set({ phase: 'checkpoint1', reportMarkdown: previousReport, abortFn: null })
-          get()._post('assistant', evidenceAudit.errors.join('\n'), 'error')
-          return
-        }
-        set((s) => ({
-          artifacts: { ...s.artifacts, [REPORT_STEP_ID]: res.text },
-          reportMarkdown: res.text,
-          reportStale: false
-        }))
-      } else {
-        get()._post('assistant', `⏳ 正在：${step.title}…`, 'narration')
-        const res = await runModelRetry(
-          buildStepMessages({
-            stepId: step.id,
-            stepTitle: step.title,
-            sopRules,
-            cleanedData: analysisInput,
-            priorOutputs,
-            feedback: get().steering
-          }),
-          () => {},
-          (fn) => set({ abortFn: fn }),
-          (n) => get()._post('assistant', `${step.title}连接中断，重试第 ${n} 次…`, 'narration'),
-          1,
-          {
-            reportSessionId: sessionId,
-            taskType: 'analysis_step',
-            taskKey: `${sessionId}:analysis_step:${step.id}`,
-            billingRequestId: `${sessionId}:analysis_step:${step.id}`,
-            isVision: false,
-            sourceCount: topLevelSourceCount(get().sources),
-            imageCount: sourceImageCount(get().sources),
-            stepId: String(step.id)
-          }
-        )
-        if (!isCurrentSession()) return
-        if (!res.ok) {
-          get()._post(
-            'assistant',
-            isUserStop(res.error)
-              ? `已停止「${step.title}」，已完成的内容已经保留。需要时可继续分析。`
-              : `⚠️ ${step.title}中断：${res.error}。修好后点「确认，继续分析」可继续（已完成的步骤会跳过）。`,
-            isUserStop(res.error) ? 'narration' : 'error'
-          )
-          set({ phase: 'checkpoint1' })
-          return
-        }
-        set((s) => ({ artifacts: { ...s.artifacts, [step.id]: res.text } }))
-        const analysisTaskId = `${sessionId}:analysis_step:${step.id}`
-        set((state) => ({
-          taskJournal: {
-            ...state.taskJournal,
-            [analysisTaskId]: {
-              kind: 'analysis_step',
-              status: 'complete',
-              output: res.text,
-              updatedAt: new Date().toISOString()
-            }
-          }
-        }))
-        await window.api.saveLastProject(buildProjectSnapshot(get()))
-        get()._post('assistant', `✅ ${step.title} 完成`, 'narration')
-      }
-    }
-    if (!isCurrentSession()) return
-    set({ phase: 'checkpoint2' })
-    try {
-      await storeCompleteReportResult(get())
-    } catch {
-      // 完整报告已生成；缓存失败不能影响本次结果和积分结算。
-    }
-    try {
-      const charge = await window.api.getReportPointsCharge(sessionId)
-      const wallet = await window.api.getPointsWallet()
-      if (!isCurrentSession()) return
-      get()._post(
-        'assistant',
-        `报告已完成，本次消耗 ${formatPointsValue(charge.chargedPoints)} 积分，剩余 ${formatPointsValue(wallet.balancePoints)} 积分。`,
-        'narration'
-      )
-    } catch {
-      if (!isCurrentSession()) return
-      get()._post('assistant', '报告已完成，剩余积分可在页面顶部查看。', 'narration')
-    }
-    get()._post(
-      'assistant',
-      '✅ 报告初稿已生成（右侧）。需要改哪里直接说（如：经营建议再具体、第 9 步选题加几条），或点「确认定稿」。',
-      'checkpoint'
-    )
   },
 
   _rerunReport: async (latestFeedback) => {
@@ -3341,7 +2792,7 @@ export const useStore = create<StoreState>((set, get) => ({
     set((state) => ({
       artifacts: Object.fromEntries(Object.entries(state.artifacts).filter(([id]) => !affectedIds.has(Number(id)) && Number(id) !== REPORT_STEP_ID)),
       taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId]) =>
-        ![...affected].some((moduleKey) => taskId.includes(`:module:v1:${moduleKey}`))
+        ![...affected].some((moduleKey) => taskId.includes(`:module:v2:${moduleKey}`))
       )),
       moduleStates: Object.fromEntries(Object.entries(state.moduleStates).filter(([moduleKey]) => !affected.has(moduleKey as ModuleKey))),
       reportMarkdown: '',
@@ -3409,18 +2860,18 @@ export const useStore = create<StoreState>((set, get) => ({
         return true
       }
       if (phase === 'checkpoint1') {
-        const match = /(?:模块\s*)?M?([1-8])/iu.exec(t)
+        const match = /(?:模块\s*)?M?([1-6])/iu.exec(t)
         const module = match ? REPORT_MODULES.find((candidate) => candidate.id === Number(match[1])) : undefined
         if (/重试|重新分析|重做/u.test(t) && module && get().cleanDetails.length > 0) {
           await get().retryModule(module.key, t)
           return true
         }
         set((s) => ({ steering: (s.steering ? s.steering + '\n' : '') + t }))
-        get()._post('assistant', '已记录为8模块分析的补充要求。确认资料后会自动应用。', 'narration')
+        get()._post('assistant', '已记录为6模块分析的补充要求。确认资料后会自动应用。', 'narration')
         return true
       }
       if (phase === 'checkpoint2' || phase === 'done') {
-        const match = /(?:模块\s*)?M?([1-8])/iu.exec(t)
+        const match = /(?:模块\s*)?M?([1-6])/iu.exec(t)
         const module = match ? REPORT_MODULES.find((candidate) => candidate.id === Number(match[1])) : undefined
         if (!module) {
           get()._post('assistant', '新版按模块生成报告。请说明要重做的模块编号，例如“重试 M6，并重点看购买顾虑”。', 'narration')

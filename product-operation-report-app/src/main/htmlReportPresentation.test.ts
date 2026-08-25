@@ -137,3 +137,58 @@ describe('v1 M1-M8 visual planning', () => {
     expect(presentation.mainMetric?.sourceLabel).toBe('视频号 / 性别')
   })
 })
+
+describe('v2 M1-M6 visual planning', () => {
+  it('renders platform facets, the fused selling-point matrix and ranking, VOC, and the audience route', () => {
+    const markdown = [
+      '# 产品经营报告',
+      '## M1 产品信息',
+      '1. 产品基础\n信息：益生菌发酵酸菜\n来源：产品手卡',
+      '## M2 成交人群分析',
+      '## 平台：视频号',
+      '成交画像周期：2026/06/01-2026/06/30',
+      '商品销售周期：2026/06/01-2026/06/30',
+      '### 1. 性别\n信息：女性64.64%，男性35.36%\n来源：视频号画像｜性别',
+      '### 2. 年龄\n信息：60岁以上44.57%，50-59岁24.90%\n来源：视频号画像｜年龄',
+      '### 3. 地域\n信息：浙江省13.33%，广东省12.22%\n来源：视频号画像｜地域',
+      '### 4. 人群属性\n信息：都市银发48.90%，新锐妈妈10.33%\n来源：视频号画像｜属性',
+      '### 5. 消费力\n信息：100-200元43.2%，200-300元26.1%\n来源：销售数据｜价格带',
+      '### 6. 购买偏好\n信息：家庭装41.2%，便携装28.6%\n来源：销售数据｜SKU',
+      '# 多平台核心人群TOP5',
+      '| 优先级 | 人群标签 | 占比/特征 | 决策动机 | 内容语言 |',
+      '| --- | --- | --- | --- | --- |',
+      '| 第一主力 | 50+女性｜都市银发 | 视频号女性64.64% | 家庭采购 | 安心、稳定 |',
+      '### 第一主力来源\n来源：视频号成交画像',
+      '## M3 内容素材判断',
+      '### 自有素材TOP1｜3.1｜厨房制作型｜痛点开头｜制作展示｜推荐',
+      '框架类型：厨房制作型',
+      '数据依据：20条｜占自有素材40%',
+      '可复用方向：痛点切入→制作→成品→邀请尝试',
+      '## M4 卖点提炼与排序',
+      '# 一、四大需求卖点买点摘要',
+      '### 1. 品质需求\nTOP1\n卖点：九天益生菌发酵\n买点：酸香更稳定',
+      '### 2. 价格需求\n无',
+      '### 3. 健康需求\nTOP1\n卖点：配料清晰\n买点：家庭吃得更放心',
+      '### 4. 情感需求\n无',
+      '# 二、核心卖点总排序',
+      '## 核心主卖点 TOP1-3',
+      '### TOP1｜九天益生菌发酵',
+      '需求类型：品质需求\n买点：酸香更稳定\n自营依据：成交素材\n竞品依据：无\n卖点状态：核心验证卖点\n排序判断：产品事实与成交共同支持\n自营来源：产品手卡\n竞品来源：无',
+      '## M5 用户真实需求VOC',
+      'TOP1\n用户视角卖点：开袋方便\n频次：12\n占比：35%\n来源：用户评价',
+      '## M6 人群×卖点×场景匹配',
+      'TOP1\n核心人群：50+家庭女性\n核心卖点：九天益生菌发酵\n真实场景：晚餐给家人做酸菜鱼\n人群依据：视频号画像\n卖点依据：卖点排序TOP1\n场景依据：自有素材'
+    ].join('\n')
+    const model = parseHtmlReportModel(markdown)
+    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M3', 'M4', 'M5', 'M6'])
+    const m4Tables = model.sections.find((section) => section.number === 'M4')?.tables || []
+    expect(m4Tables.some((table) => table.context === '四类消费者买点')).toBe(true)
+    expect(m4Tables.some((table) => table.context === '真实卖点统一排序')).toBe(true)
+    const presentation = buildHtmlReportPresentation(model)
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M2')?.visualKind).toBe('percent-facets')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M3')?.visualKind).toBe('material-methods')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M4')?.visualKind).toBe('selling-strategy')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('ordinal-path')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M6')?.visualKind).toBe('audience-map')
+  })
+})

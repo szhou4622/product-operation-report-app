@@ -14,13 +14,14 @@ export function validateReport(md: string): string[] {
   if (/^##\s+M1\s+/mu.test(md)) {
     const lines = md.split(/\r?\n/u).map((line) => line.trim())
     if (!lines.find((line) => line.startsWith('# '))) warnings.push('报告标题前出现了多余文本。')
-    const headings = Array.from({ length: 8 }, (_, index) => `## M${index + 1} `)
+    const moduleCount = /^##\s+M(?:7|8)\s+/mu.test(md) ? 8 : 6
+    const headings = Array.from({ length: moduleCount }, (_, index) => `## M${index + 1} `)
     let previous = -1
     const missing: string[] = []
     for (const heading of headings) {
       const index = md.indexOf(heading)
       if (index < 0) missing.push(heading.trim())
-      else if (index < previous) warnings.push('报告章节顺序疑似不符合标准模板：M1-M8。')
+      else if (index < previous) warnings.push(`报告章节顺序疑似不符合标准模板：M1-M${moduleCount}。`)
       previous = Math.max(previous, index)
     }
     if (missing.length) warnings.push(`报告缺少标准章节：${missing.join('、')}。`)
