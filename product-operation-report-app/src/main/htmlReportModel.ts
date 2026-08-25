@@ -258,7 +258,7 @@ function parseSectionDetails(
 function moduleLines(markdown: string): string[] {
   return markdown
     .split(/\r?\n/u)
-    .map((line) => plainText(line).trim())
+    .map((line) => plainText(line).replace(/^#{1,6}\s+/u, '').trim())
     .filter(Boolean)
 }
 
@@ -293,7 +293,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
     return rows.length ? [{ context: '产品九维事实', headers: ['模块', '当前判断', '来源'], rows }] : []
   }
   if (number === 'M2') {
-    const dimensions = /^(?:性别|年龄|地域|地区|人群属性|消费力|购买偏好|婚育|城市线级)$/u
+    const dimensions = /^(?:\d+[.、]\s*)?(?:性别|年龄|地域|地区|人群属性|消费力|购买偏好|婚育|城市线级)$/u
     let platform = '平台待确认'
     const rows: string[][] = []
     for (let index = 0; index < lines.length; index++) {
@@ -302,7 +302,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
         continue
       }
       if (!dimensions.test(lines[index])) continue
-      const dimension = lines[index]
+      const dimension = lines[index].replace(/^\d+[.、]\s*/u, '')
       const info = lines.slice(index + 1, index + 5).find((line) => /^信息\s*[：:]/u.test(line)) || ''
       const source = lines.slice(index + 1, index + 6).find((line) => /^来源\s*[：:]/u.test(line)) || ''
       const value = valueAfter(info, '信息')
@@ -335,8 +335,17 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
     return rows.length ? [{ context: '七维对标证据', headers: ['数据类型', '来源', '本次用途'], rows }] : []
   }
   if (number === 'M5') {
-    const blocks = splitBlocks(lines, /^(?:品质需求|价格需求|健康需求|情感需求)$/u)
-    const rows = blocks.map((block) => [block.title, block.lines[0] || '暂无分析', block.lines.slice(1).join('；') || '依据见模块原文'])
+    const blocks = splitBlocks(lines, /^(?:\d+[.、]\s*)?(?:品质需求|价格需求|健康需求|情感需求)$/u)
+    const rows = blocks.flatMap((block) => {
+      const category = block.title.replace(/^\d+[.、]\s*/u, '')
+      const topBlocks = splitBlocks(block.lines, /^TOP\s*\d+/iu)
+      if (!topBlocks.length) return [[category, block.lines[0] || '暂无分析', block.lines.slice(1).join('；') || '依据见模块原文']]
+      return topBlocks.map((item) => {
+        const selling = item.lines.find((line) => /^卖点\s*[：:]/u.test(line)) || ''
+        const benefit = item.lines.find((line) => /^买点\s*[：:]/u.test(line)) || ''
+        return [category, [item.title, valueAfter(selling, '卖点'), valueAfter(benefit, '买点')].filter(Boolean).join('｜'), '来源：M1产品事实与M3素材证据']
+      })
+    })
     return rows.length ? [{ context: '四类消费者买点', headers: ['卖点维度', '我方产品卖点', '证据'], rows }] : []
   }
   if (number === 'M6') {

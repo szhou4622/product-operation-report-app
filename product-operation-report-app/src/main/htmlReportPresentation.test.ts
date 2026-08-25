@@ -54,6 +54,14 @@ describe('v1 M1-M8 visual planning', () => {
       '年龄',
       '信息：60岁以上44.57%，50—59岁24.90%',
       '来源：成交画像截图',
+      '## M4 对标推荐',
+      '### 同产品',
+      '暂无可靠对标',
+      '### 同类目',
+      '推荐1',
+      '品牌：示例品牌',
+      '推荐理由：同属酸菜消费类目',
+      '来源：品牌官方店',
       '## M5 产品卖点',
       '品质需求',
       '鲜脆免洗｜来源：产品手卡',
@@ -69,12 +77,13 @@ describe('v1 M1-M8 visual planning', () => {
       '场景来源：用户评论'
     ].join('\n')
     const model = parseHtmlReportModel(markdown)
-    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M5', 'M8'])
+    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M4', 'M5', 'M8'])
     expect(model.sections.find((section) => section.number === 'M1')?.tables[0]?.rows).toHaveLength(2)
     expect(model.sections.find((section) => section.number === 'M2')?.tables[0]?.rows).toHaveLength(4)
     const presentation = buildHtmlReportPresentation(model)
     expect(presentation.sections.find((section) => section.sectionNumber === 'M1')?.visualKind).toBe('product-facts')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M2')?.visualKind).toBe('percent-facets')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M4')?.visualKind).toBe('source-ledger')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('selling-point-matrix')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M8')?.visualKind).toBe('audience-map')
   })
