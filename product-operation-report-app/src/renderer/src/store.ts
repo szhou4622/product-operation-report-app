@@ -3232,7 +3232,7 @@ export const useStore = create<StoreState>((set, get) => ({
       if (phase === 'checkpoint1') {
         const match = /(?:模块\s*)?M?([1-8])/iu.exec(t)
         const module = match ? REPORT_MODULES.find((candidate) => candidate.id === Number(match[1])) : undefined
-        if (/重试|重新分析|重做/u.test(t) && module && get().cleanedData.trim()) {
+        if (/重试|重新分析|重做/u.test(t) && module && get().cleanDetails.length > 0) {
           await get().retryModule(module.key, t)
           return true
         }
