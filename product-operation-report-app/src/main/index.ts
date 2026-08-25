@@ -858,7 +858,7 @@ ipcMain.on(
           hasVisibleOutput,
           aborted: controller.signal.aborted
         }
-      })
+      }, context.taskType)
       if (!event.sender.isDestroyed()) event.sender.send(channel, sequence.outcome.terminal)
     } finally {
       chatRequests.release(id, event.sender.id, controller)

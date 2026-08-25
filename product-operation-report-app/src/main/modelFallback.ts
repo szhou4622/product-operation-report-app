@@ -25,6 +25,7 @@ export interface ModelFallbackDecisionInput {
   outputChars: number
   aborted: boolean
   hasNext: boolean
+  taskType?: ModelTaskType
 }
 
 /**
@@ -32,12 +33,14 @@ export interface ModelFallbackDecisionInput {
  * 这条边界用于防止不同模型的半截内容拼接，也避免绕过授权或安全限制。
  */
 export function shouldTryModelFallback(input: ModelFallbackDecisionInput): boolean {
+  const taskSpecificProviderRecovery =
+    input.taskType === 'module_platform_audience' && input.failureKind === 'provider_error'
   return Boolean(
     input.hasNext &&
     !input.aborted &&
     input.outputChars === 0 &&
     input.failureKind &&
-    RECOVERABLE_FAILURES.has(input.failureKind)
+    (RECOVERABLE_FAILURES.has(input.failureKind) || taskSpecificProviderRecovery)
   )
 }
 
@@ -58,7 +61,8 @@ export interface ModelFallbackSequenceResult {
 /** 依次执行模型；attempt 负责每次尝试的 Token 记录与积分结算。 */
 export async function runModelFallbackSequence(
   profiles: ModelProfile[],
-  attempt: (profile: ModelProfile, profileIndex: number) => Promise<ModelFallbackAttemptOutcome>
+  attempt: (profile: ModelProfile, profileIndex: number) => Promise<ModelFallbackAttemptOutcome>,
+  taskType?: ModelTaskType
 ): Promise<ModelFallbackSequenceResult> {
   if (!profiles.length) throw new Error('没有可用的模型配置。')
   for (let profileIndex = 0; profileIndex < profiles.length; profileIndex += 1) {
@@ -68,7 +72,8 @@ export async function runModelFallbackSequence(
       failureKind: outcome.failureKind,
       outputChars: outcome.hasVisibleOutput ? outcome.outputChars : 0,
       aborted: outcome.aborted,
-      hasNext: profileIndex + 1 < profiles.length
+      hasNext: profileIndex + 1 < profiles.length,
+      taskType
     })
     if (shouldFallback) continue
     return { profile, profileIndex, outcome }
