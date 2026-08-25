@@ -223,11 +223,13 @@ export function normalizeMaterialReviewOutput(raw: string): string {
     value.replace(pattern, (full, hashes: string, rank: string, body: string) => {
       const match = body.match(new RegExp(`${field}\\s*[：:]\\s*(?:\\r?\\n\\s*)?([^\\r\\n]+)`, 'u'))
       const framework = match?.[1]?.trim()
-      return framework ? `${hashes}${label}TOP${rank}｜${framework}${body}` : full
+      const heading = hashes || '### '
+      return framework ? `${heading}${label}TOP${rank}｜${framework}${body}` : full
     })
-  let value = replaceGroup(raw, /^(#{1,6}\s*)自有框架([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '自有素材', '框架类型')
-  value = replaceGroup(value, /^(#{1,6}\s*)竞品框架([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '竞品素材', '框架类型')
-  return replaceGroup(value, /^(#{1,6}\s*)机会([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '补充机会', '机会框架')
+  const boundary = '(?=^(?:#{1,6}\\s*)?(?:自有框架|竞品框架|机会)[1-5]\\s*$|(?![\\s\\S]))'
+  let value = replaceGroup(raw, new RegExp(`^((?:#{1,6}\\s*)?)自有框架([1-5])([\\s\\S]*?)${boundary}`, 'gmu'), '自有素材', '框架类型')
+  value = replaceGroup(value, new RegExp(`^((?:#{1,6}\\s*)?)竞品框架([1-5])([\\s\\S]*?)${boundary}`, 'gmu'), '竞品素材', '框架类型')
+  return replaceGroup(value, new RegExp(`^((?:#{1,6}\\s*)?)机会([1-5])([\\s\\S]*?)${boundary}`, 'gmu'), '补充机会', '机会框架')
 }
 
 export function findStaleModuleKeys(
@@ -255,6 +257,28 @@ export function findStaleModuleKeys(
     }
   }
   return stale
+}
+
+export function retryScopeForModules(
+  modules: ReportModule[],
+  states: Partial<Record<ModuleKey, ModuleRunState>>,
+  requestedKey: ModuleKey
+): Set<ModuleKey> {
+  const affected = new Set<ModuleKey>([requestedKey])
+  for (const module of modules) {
+    if (states[module.key]?.status === 'failed') affected.add(module.key)
+  }
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const module of modules) {
+      if (!affected.has(module.key) && module.dependsOn.some((dependency) => affected.has(dependency))) {
+        affected.add(module.key)
+        changed = true
+      }
+    }
+  }
+  return affected
 }
 
 export function buildModuleMessages(module: ReportModule, context: ModuleContext): ChatMessage[] {
@@ -350,10 +374,10 @@ export function validateModuleOutput(
     if (engineVersion === 'v1') {
       if (!/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
     } else {
-      const platformCount = (value.match(/^##\s*平台\s*[：:]/gmu) || []).length
+      const platformCount = (value.match(/^(?:#{1,4}\s*)?平台\s*[：:]/gmu) || []).length
       if (platformCount < 1) errors.push('成交人群模块没有按平台输出画像')
       for (const dimension of ['1. 性别', '2. 年龄', '3. 地域', '4. 人群属性', '5. 消费力', '6. 购买偏好']) {
-        if ((value.match(new RegExp(`^#{2,4}\\s*${dimension.replace('.', '\\.')}`, 'gmu')) || []).length < platformCount) {
+        if ((value.match(new RegExp(`^(?:#{1,4}\\s*)?${dimension.replace('.', '\\.')}`, 'gmu')) || []).length < platformCount) {
           errors.push(`成交人群模块缺少${dimension}`)
         }
       }
@@ -361,11 +385,11 @@ export function validateModuleOutput(
       if ((value.match(/来源\s*[：:]/gu) || []).length < platformCount * 6) errors.push('成交人群模块必须逐平台逐维标注来源')
       if (!/多平台核心人群\s*TOP5/iu.test(value)) errors.push('成交人群模块缺少多平台核心人群TOP5')
       if (/跨平台(?:综合)?占比|综合占比|平均占比/u.test(value)) errors.push('成交人群模块不得生成跨平台综合或平均占比')
-      const audienceTagInRegion = value.split(/^##\s*平台\s*[：:]/gmu).slice(1).some((platformBlock) => {
-        const regionAt = platformBlock.search(/^#{2,4}\s*3\.\s*地域\s*$/mu)
+      const audienceTagInRegion = value.split(/^(?:#{1,4}\s*)?平台\s*[：:]/gmu).slice(1).some((platformBlock) => {
+        const regionAt = platformBlock.search(/^(?:#{1,4}\s*)?3\.\s*地域\s*$/mu)
         if (regionAt < 0) return false
         const tail = platformBlock.slice(regionAt)
-        const attributeAt = tail.search(/^#{2,4}\s*4\.\s*人群属性\s*$/mu)
+        const attributeAt = tail.search(/^(?:#{1,4}\s*)?4\.\s*人群属性\s*$/mu)
         return AUDIENCE_ATTRIBUTE_TAG.test(attributeAt >= 0 ? tail.slice(0, attributeAt) : tail)
       })
       if (audienceTagInRegion) errors.push('成交人群模块把人群属性误写成了地域')
@@ -420,6 +444,29 @@ export function validateModuleOutput(
     }
   }
   return errors
+}
+
+export function moduleValidationRetryInstruction(
+  module: ReportModule,
+  errors: string[],
+  pass: number
+): string {
+  const requiredFirstLine: Partial<Record<ModuleKey, string>> = {
+    'product-info': '1. 产品基础',
+    'platform-audience': '## 平台：实际平台名称',
+    'material-review': '1. 素材总览',
+    'selling-points': '# 一、四大需求卖点买点摘要',
+    voc: '1. 隐形需求 TOP10',
+    'audience-sp-scene': '核心人群 × 卖点 × 场景 TOP5'
+  }
+  return [
+    `这是第${pass}次结构纠正。上一轮输出未通过校验：${errors.slice(0, 8).join('；')}。`,
+    `请完全替换上一轮输出，从头输出M${module.id} ${module.title}的最终结果。`,
+    requiredFirstLine[module.key] ? `第一行必须直接是：${requiredFirstLine[module.key]}` : '',
+    '禁止输出“我在整理、我会分析、正在对齐、接下来”等过程说明，禁止只返回计划或解释。',
+    '严格遵守系统提示词和固定模板；资料缺失写“无”或“暂无分析”，不得省略固定字段。',
+    '只输出最终结果。'
+  ].filter(Boolean).join('\n')
 }
 
 export function assembleModuleReport(

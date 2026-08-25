@@ -48,9 +48,11 @@ import {
   findStaleModuleKeys,
   fingerprintModuleMessages,
   isNoAnalysisOutput,
+  moduleValidationRetryInstruction,
   normalizeMaterialReviewOutput,
   normalizeNoAnalysisOutput,
   projectLegacyV1ToV2,
+  retryScopeForModules,
   validateModuleOutput
 } from './modules'
 import { inferSourcePlatform } from './sourceMetadata'
@@ -912,11 +914,12 @@ export const useStore = create<StoreState>((set, get) => ({
         const taskEntry = Object.entries(restoredTaskJournal).find(([taskId]) =>
           taskId.endsWith(`:module:v2:${module.key}`)
         )
-        const task = taskEntry?.[1]
+        let task = taskEntry?.[1]
         if (module.key === 'material-review' && task?.output) {
           const normalized = normalizeMaterialReviewOutput(task.output)
           if (normalized !== task.output) {
-            restoredTaskJournal[taskEntry![0]] = { ...task, output: normalized, updatedAt: new Date().toISOString() }
+            task = { ...task, output: normalized, updatedAt: new Date().toISOString() }
+            restoredTaskJournal[taskEntry![0]] = task
             restoredArtifacts[module.id] = normalized
             recoveredValidatedModule = true
           }
@@ -2546,28 +2549,33 @@ export const useStore = create<StoreState>((set, get) => ({
       let validationErrors = validateModuleOutput(module.key, moduleOutput, 'v2')
       if (validationErrors.length && !isNoAnalysisOutput(moduleOutput) && !isUserStop(result.error)) {
         get()._post('assistant', `M${module.id} ${module.title}缺少必要内容，正在自动补全，不需要手动重试。`, 'narration')
-        const corrected = await runModelRetry(
-          [
-            ...messages,
-            {
-              role: 'user' as const,
-              content: `上一轮输出未通过完整性校验：${validationErrors.slice(0, 8).join('；')}。请从头重新完整输出本模块，严格遵守固定模板，不能省略、截断或只返回说明。`
-            }
-          ],
-          () => {},
-          (fn) => {
-            if (isCurrentSession()) set({ abortFn: fn })
-          },
-          undefined,
-          1,
-          { ...moduleTaskContext, stepId: `${module.key}-validation-retry` }
-        )
-        if (corrected.ok && corrected.text.trim()) {
+        for (let validationPass = 1; validationPass <= 2 && validationErrors.length > 0; validationPass++) {
+          const corrected = await runModelRetry(
+            [
+              ...messages,
+              { role: 'assistant' as const, content: moduleOutput.slice(0, 16_000) },
+              {
+                role: 'user' as const,
+                content: moduleValidationRetryInstruction(module, validationErrors, validationPass)
+              }
+            ],
+            () => {},
+            (fn) => {
+              if (isCurrentSession()) set({ abortFn: fn })
+            },
+            undefined,
+            1,
+            { ...moduleTaskContext, stepId: `${module.key}-validation-retry-${validationPass}` }
+          )
+          if (!corrected.ok || !corrected.text.trim()) break
           result = corrected
           moduleOutput = module.key === 'material-review'
             ? normalizeMaterialReviewOutput(corrected.text)
             : corrected.text
           validationErrors = validateModuleOutput(module.key, moduleOutput, 'v2')
+          if (validationErrors.length > 0 && validationPass < 2) {
+            get()._post('assistant', `M${module.id} ${module.title}仍是过程说明或缺项，正在做最后一次结构纠正。`, 'narration')
+          }
         }
       }
       if (validationErrors.length) {
@@ -2777,17 +2785,7 @@ export const useStore = create<StoreState>((set, get) => ({
       get()._post('assistant', get().legacyNotice || '旧报告仅支持查看导出。', 'error')
       return
     }
-    const affected = new Set<ModuleKey>([key])
-    let changed = true
-    while (changed) {
-      changed = false
-      for (const module of REPORT_MODULES) {
-        if (!affected.has(module.key) && module.dependsOn.some((dependency) => affected.has(dependency))) {
-          affected.add(module.key)
-          changed = true
-        }
-      }
-    }
+    const affected = retryScopeForModules(REPORT_MODULES, get().moduleStates, key)
     const affectedIds = new Set(REPORT_MODULES.filter((module) => affected.has(module.key)).map((module) => module.id))
     set((state) => ({
       artifacts: Object.fromEntries(Object.entries(state.artifacts).filter(([id]) => !affectedIds.has(Number(id)) && Number(id) !== REPORT_STEP_ID)),

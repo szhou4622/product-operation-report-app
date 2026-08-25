@@ -7,10 +7,12 @@ import {
   findStaleModuleKeys,
   fingerprintModuleMessages,
   isNoAnalysisOutput,
+  moduleValidationRetryInstruction,
   normalizeBenchmarkDimension,
   normalizeMaterialReviewOutput,
   normalizeNoAnalysisOutput,
   projectLegacyV1ToV2,
+  retryScopeForModules,
   validateModuleOutput
 } from './modules'
 import { inferSourcePlatform } from './sourceMetadata'
@@ -80,6 +82,24 @@ describe('v2 six-module report engine', () => {
     const normalized = normalizeMaterialReviewOutput('### 自有框架1\n框架类型：\n3.1｜厨房制作型｜痛点开头｜烹饪展示｜推荐\n可复用方向：继续更换菜品')
     expect(normalized).toContain('### 自有素材TOP1｜3.1｜厨房制作型｜痛点开头｜烹饪展示｜推荐')
     expect(validateModuleOutput('material-review', normalized, 'v2')).toEqual([])
+    const plain = normalizeMaterialReviewOutput([
+      '自有框架1',
+      '框架类型：厨房教程型',
+      '数据依据：20条',
+      '可复用方向：继续更换菜品',
+      '竞品框架1',
+      '框架类型：素人种草型',
+      '数据依据：7条',
+      '可复用方向：借鉴结构',
+      '机会1',
+      '机会框架：工厂透明型',
+      '竞品依据：2条',
+      '可补充方向：展示真实流程'
+    ].join('\n'))
+    expect(plain).toContain('### 自有素材TOP1｜厨房教程型')
+    expect(plain).toContain('### 竞品素材TOP1｜素人种草型')
+    expect(plain).toContain('### 补充机会TOP1｜工厂透明型')
+    expect(validateModuleOutput('material-review', plain, 'v2')).toEqual([])
   })
 
   it('validates platform isolation, explicit dimensions and human tags outside the region field', () => {
@@ -172,6 +192,14 @@ describe('v2 six-module report engine', () => {
     expect(fingerprintModuleMessages(messages, 'v2')).not.toBe(fingerprintModuleMessages(messages, 'v1'))
   })
 
+  it('forces validation retries to start with the final template instead of process narration', () => {
+    const audience = REPORT_MODULES_V2.find((module) => module.key === 'platform-audience')!
+    const instruction = moduleValidationRetryInstruction(audience, ['缺少平台画像'], 2)
+    expect(instruction).toContain('第一行必须直接是：## 平台：实际平台名称')
+    expect(instruction).toContain('禁止输出“我在整理、我会分析、正在对齐、接下来”')
+    expect(instruction).toContain('第2次结构纠正')
+  })
+
   it('invalidates only the v2 downstream modules when an upstream result is newer', () => {
     const states = {
       'product-info': { status: 'done' as const, updatedAt: '2026-08-25T02:00:00Z' },
@@ -185,6 +213,18 @@ describe('v2 six-module report engine', () => {
     expect(stale.has('selling-points')).toBe(true)
     expect(stale.has('audience-sp-scene')).toBe(true)
     expect(stale.has('selling-point-ranking')).toBe(false)
+  })
+
+  it('retries every failed branch and its downstream from one user click', () => {
+    const scope = retryScopeForModules(REPORT_MODULES_V2, {
+      'product-info': { status: 'done', updatedAt: '2026-08-25T01:00:00Z' },
+      'platform-audience': { status: 'failed', updatedAt: '2026-08-25T01:00:00Z' },
+      'material-review': { status: 'done', updatedAt: '2026-08-25T01:00:00Z' },
+      'selling-points': { status: 'failed', updatedAt: '2026-08-25T01:00:00Z' },
+      voc: { status: 'done', updatedAt: '2026-08-25T01:00:00Z' },
+      'audience-sp-scene': { status: 'failed', updatedAt: '2026-08-25T01:00:00Z' }
+    }, 'platform-audience')
+    expect([...scope].sort()).toEqual(['audience-sp-scene', 'platform-audience', 'selling-points'])
   })
 })
 
