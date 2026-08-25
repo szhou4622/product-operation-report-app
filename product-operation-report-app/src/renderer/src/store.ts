@@ -2339,6 +2339,9 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     const sourceCountV1 = topLevelSourceCount(analysisSources)
     const imageCountV1 = sourceImageCount(analysisSources)
+    const benchmarkReportSessionId = get().moduleRetryScope.includes('benchmark-brands')
+      ? crypto.randomUUID()
+      : sessionId
     const updateModuleState = (key: ModuleKey, state: ModuleRunState): void => {
       set((current) => ({ moduleStates: { ...current.moduleStates, [key]: state } }))
     }
@@ -2423,7 +2426,7 @@ export const useStore = create<StoreState>((set, get) => ({
             let result = await runModelRetry(
               focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
               {
-                reportSessionId: sessionId,
+                reportSessionId: benchmarkReportSessionId,
                 taskType: 'module_benchmark',
                 taskKey: taskId,
                 billingRequestId: taskId,
@@ -2439,7 +2442,7 @@ export const useStore = create<StoreState>((set, get) => ({
               result = await runModelRetry(
                 focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
                 {
-                  reportSessionId: sessionId,
+                  reportSessionId: benchmarkReportSessionId,
                   taskType: 'module_benchmark',
                   taskKey: taskId,
                   billingRequestId: taskId,
