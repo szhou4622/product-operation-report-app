@@ -35,3 +35,47 @@ describe('selling-point keyword cloud', () => {
   })
 })
 
+describe('v1 M1-M8 visual planning', () => {
+  it('parses module headings and synthesizes source-bound visual tables', () => {
+    const markdown = [
+      '# 产品经营报告',
+      '## M1 产品信息',
+      '1. 产品基础',
+      '信息：益生菌发酵酸菜',
+      '来源：产品手卡第1页',
+      '2. SKU规格',
+      '信息：150g×4袋',
+      '来源：产品手卡第1页',
+      '## M2 平台人群数据',
+      '平台：抖音电商罗盘',
+      '性别',
+      '信息：女性64.64%，男性35.36%',
+      '来源：成交画像截图',
+      '年龄',
+      '信息：60岁以上44.57%，50—59岁24.90%',
+      '来源：成交画像截图',
+      '## M5 产品卖点',
+      '品质需求',
+      '鲜脆免洗｜来源：产品手卡',
+      '价格需求',
+      '四袋装降低单次购买门槛｜来源：价格表',
+      '## M8 核心人群×卖点×场景匹配',
+      'TOP1',
+      '核心人群：银发家庭用户',
+      '核心卖点：免洗即食',
+      '真实场景：家庭下饭',
+      '人群来源：成交画像',
+      '卖点来源：产品手卡',
+      '场景来源：用户评论'
+    ].join('\n')
+    const model = parseHtmlReportModel(markdown)
+    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M5', 'M8'])
+    expect(model.sections.find((section) => section.number === 'M1')?.tables[0]?.rows).toHaveLength(2)
+    expect(model.sections.find((section) => section.number === 'M2')?.tables[0]?.rows).toHaveLength(4)
+    const presentation = buildHtmlReportPresentation(model)
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M1')?.visualKind).toBe('product-facts')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M2')?.visualKind).toBe('percent-facets')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('selling-point-matrix')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M8')?.visualKind).toBe('audience-map')
+  })
+})

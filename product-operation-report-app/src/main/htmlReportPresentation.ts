@@ -832,7 +832,15 @@ function visualKindForSection(section: HtmlReportSection): HtmlReportVisualKind 
     '8': 'content-mix',
     '9': 'execution-matrix',
     '10': 'action-roadmap',
-    '11': 'limitations'
+    '11': 'limitations',
+    M1: 'product-facts',
+    M2: 'percent-facets',
+    M3: 'material-methods',
+    M4: 'source-ledger',
+    M5: 'selling-point-matrix',
+    M6: 'ordinal-path',
+    M7: 'ordinal-path',
+    M8: 'audience-map'
   }
   const preferred = kindBySection[section.number] || 'summary-only'
   if (preferred === 'action-roadmap' || preferred === 'limitations') {
@@ -902,7 +910,7 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
       }))
     )
   }
-  const alwaysVisibleMainTable = new Set(['0', '2', '6', '7', '10'])
+  const alwaysVisibleMainTable = new Set(['0', '2', '6', '7', '10', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8'])
   const tables = section.tables.map((table, tableIndex) => {
     const compact = table.rows.length <= 6 && table.headers.length <= 4
     const primary = tableIndex === 0 && alwaysVisibleMainTable.has(section.number)
@@ -927,7 +935,7 @@ function buildSectionPresentation(section: HtmlReportSection): HtmlReportSection
 }
 
 function metricCandidates(model: HtmlReportModel): MetricCandidate[] {
-  const sectionPriority: Record<string, number> = { '3': 60, '0': 52, '2': 42, '4': 34 }
+  const sectionPriority: Record<string, number> = { '3': 60, '0': 52, '2': 42, '4': 34, M2: 62, M1: 38, M3: 32 }
   const candidates: MetricCandidate[] = []
   const seen = new Set<string>()
 
@@ -1032,8 +1040,10 @@ function buildPriorities(model: HtmlReportModel): HtmlReportPriorityPresentation
 
 export function buildHtmlReportPresentation(model: HtmlReportModel): HtmlReportPresentation {
   const conclusion = model.sections.find((section) => section.number === '0')
+  const productModule = model.sections.find((section) => section.number === 'M1')
   const thesis =
     conclusion?.paragraphs.find((paragraph) => !/^生成日期\s*[：:]/.test(paragraph)) ||
+    productModule?.paragraphs.find((paragraph) => !/^来源\s*[：:]/u.test(paragraph)) ||
     '报告结论与关键证据见下方各章节。'
   const metrics = metricCandidates(model).filter((metric) => metric.score >= 55)
   return {

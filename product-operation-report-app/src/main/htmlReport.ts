@@ -1189,7 +1189,9 @@ function wrapSections(
 ): string {
   const sectionEntries = model.sections
     .map((section) => {
-      const text = `${section.number}. ${section.title}`
+      const text = section.number.startsWith('M')
+        ? `${section.number} ${section.title}`
+        : `${section.number}. ${section.title}`
       const heading = headings.find((candidate) => candidate.level === 2 && candidate.text === text)
       return heading ? { section, id: heading.id } : null
     })

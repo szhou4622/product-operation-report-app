@@ -415,6 +415,7 @@ function sanitizeTaskJournal(value: unknown): Record<string, ProjectTaskSnapshot
       status: raw.status as ProjectTaskSnapshot['status'],
       output: optionalString(raw.output),
       coverage: sanitizeCleaningCoverage(raw.coverage),
+      inputFingerprint: optionalString(raw.inputFingerprint),
       updatedAt: optionalString(raw.updatedAt) || new Date().toISOString()
     }
   }

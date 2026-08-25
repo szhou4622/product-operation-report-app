@@ -520,6 +520,8 @@ export interface ProjectTaskSnapshot {
   status: 'complete' | 'failed' | 'interrupted'
   output?: string
   coverage?: CleaningCoverage
+  /** Hash of the exact source/upstream/prompt context used to create this result. */
+  inputFingerprint?: string
   updatedAt: string
 }
 

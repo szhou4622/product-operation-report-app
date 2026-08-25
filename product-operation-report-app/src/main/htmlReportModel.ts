@@ -255,6 +255,123 @@ function parseSectionDetails(
   return { paragraphs, listItems, tables }
 }
 
+function moduleLines(markdown: string): string[] {
+  return markdown
+    .split(/\r?\n/u)
+    .map((line) => plainText(line).trim())
+    .filter(Boolean)
+}
+
+function valueAfter(line: string, label: string): string {
+  return line.replace(new RegExp(`^${label}\\s*[：:]\\s*`, 'u'), '').trim()
+}
+
+function splitBlocks(lines: string[], pattern: RegExp): Array<{ title: string; lines: string[] }> {
+  const blocks: Array<{ title: string; lines: string[] }> = []
+  let current: { title: string; lines: string[] } | null = null
+  for (const line of lines) {
+    if (pattern.test(line)) {
+      if (current) blocks.push(current)
+      current = { title: line, lines: [] }
+    } else if (current) current.lines.push(line)
+  }
+  if (current) blocks.push(current)
+  return blocks
+}
+
+function synthesizeModuleTables(number: string, markdown: string): HtmlReportTable[] {
+  const lines = moduleLines(markdown)
+  if (number === 'M1') {
+    const labels = ['产品基础', 'SKU规格', '价格', '优惠赠品', '原料/成分/材质', '工艺技术', '产品属性与功能', '品牌背书', '产品背书']
+    const blocks = splitBlocks(lines, new RegExp(`^(?:\\d+[.、]\\s*)?(?:${labels.join('|')})$`, 'u'))
+    const rows = blocks.map((block) => {
+      const label = block.title.replace(/^\d+[.、]\s*/u, '')
+      const info = block.lines.find((line) => /^信息\s*[：:]/u.test(line)) || ''
+      const source = block.lines.find((line) => /^来源\s*[：:]/u.test(line)) || ''
+      return [label, valueAfter(info, '信息') || '暂无分析', valueAfter(source, '来源') || '来源未标注']
+    })
+    return rows.length ? [{ context: '产品九维事实', headers: ['模块', '当前判断', '来源'], rows }] : []
+  }
+  if (number === 'M2') {
+    const dimensions = /^(?:性别|年龄|地域|地区|人群属性|消费力|购买偏好|婚育|城市线级)$/u
+    let platform = '平台待确认'
+    const rows: string[][] = []
+    for (let index = 0; index < lines.length; index++) {
+      if (/^平台\s*[：:]/u.test(lines[index])) {
+        platform = valueAfter(lines[index], '平台') || platform
+        continue
+      }
+      if (!dimensions.test(lines[index])) continue
+      const dimension = lines[index]
+      const info = lines.slice(index + 1, index + 5).find((line) => /^信息\s*[：:]/u.test(line)) || ''
+      const source = lines.slice(index + 1, index + 6).find((line) => /^来源\s*[：:]/u.test(line)) || ''
+      const value = valueAfter(info, '信息')
+      const items = value.split(/[，,；;]/u).map((item) => item.trim()).filter(Boolean)
+      for (const item of items.length ? items : [value || '暂无分析']) {
+        const metric = item.match(/^(.*?)([+-]?\d+(?:\.\d+)?\s*%)$/u)
+        rows.push([platform, dimension, metric?.[1]?.trim() || dimension, metric?.[2] || item, valueAfter(source, '来源') || '来源未标注'])
+      }
+    }
+    return rows.length ? [{ context: '分平台成交画像', headers: ['平台', '维度', '类别', '数据', '来源'], rows }] : []
+  }
+  if (number === 'M3') {
+    const blocks = splitBlocks(lines, /^(?:自有框架|竞品框架|机会)\d+/u)
+    const rows = blocks.map((block) => {
+      const type = block.lines.find((line) => /^框架类型\s*[：:]/u.test(line)) || ''
+      const basis = block.lines.find((line) => /^数据依据\s*[：:]/u.test(line)) || ''
+      const reuse = block.lines.find((line) => /^可复用方向\s*[：:]/u.test(line)) || ''
+      return [block.title, [valueAfter(type, '框架类型'), valueAfter(basis, '数据依据')].filter(Boolean).join('｜'), valueAfter(reuse, '可复用方向') || '暂无分析']
+    })
+    return rows.length ? [{ context: '素材框架与迁移方向', headers: ['类型', '原始 3 秒开头', '可复用方向'], rows }] : []
+  }
+  if (number === 'M4') {
+    const blocks = splitBlocks(lines, /^(?:同产品|同类目|同人群|同卖点|同痛点|同情绪|同解决方案)$/u)
+    const rows = blocks.map((block) => {
+      const brands = block.lines.filter((line) => /^品牌\s*[：:]/u.test(line)).map((line) => valueAfter(line, '品牌')).join('、')
+      const sources = block.lines.filter((line) => /^来源\s*[：:]/u.test(line)).map((line) => valueAfter(line, '来源')).join('；')
+      const reasons = block.lines.filter((line) => /^(?:推荐理由|理由)\s*[：:]/u.test(line)).map((line) => line.replace(/^(?:推荐理由|理由)\s*[：:]\s*/u, '')).join('；')
+      return [block.title, [brands || '暂无可靠对标', sources].filter(Boolean).join('｜'), reasons || block.lines.find((line) => /暂无可靠对标/u.test(line)) || '来源约束下暂无可靠结论']
+    })
+    return rows.length ? [{ context: '七维对标证据', headers: ['数据类型', '来源', '本次用途'], rows }] : []
+  }
+  if (number === 'M5') {
+    const blocks = splitBlocks(lines, /^(?:品质需求|价格需求|健康需求|情感需求)$/u)
+    const rows = blocks.map((block) => [block.title, block.lines[0] || '暂无分析', block.lines.slice(1).join('；') || '依据见模块原文'])
+    return rows.length ? [{ context: '四类消费者买点', headers: ['卖点维度', '我方产品卖点', '证据'], rows }] : []
+  }
+  if (number === 'M6') {
+    const blocks = splitBlocks(lines, /^(?:TOP\s*\d+|\d+[.、])/iu)
+    const rows = blocks.map((block, index) => [String(index + 1), block.title, '', block.lines.find((line) => /频次/u.test(line)) || '', block.lines.find((line) => /占比|来源/u.test(line)) || block.lines.join('；')])
+    return rows.length ? [{ context: 'VOC需求优先级', headers: ['排序', '用户视角卖点', '分类', '频次', '依据'], rows }] : []
+  }
+  if (number === 'M7') {
+    const rows: string[][] = []
+    let tier = ''
+    for (const line of lines) {
+      if (/核心主卖点|重要辅助卖点|补充测试卖点/u.test(line)) tier = line
+      const match = line.match(/^(TOP\s*\d+|\d+[.、])\s*(.*)$/iu)
+      if (match) rows.push([match[1].replace(/\s+/g, ''), match[2] || '暂无分析', tier, '', '依据见模块原文'])
+    }
+    return rows.length ? [{ context: '真实卖点排序', headers: ['排序', '用户视角卖点', '层级', '来源', '依据'], rows }] : []
+  }
+  if (number === 'M8') {
+    const blocks = splitBlocks(lines, /^TOP\s*[1-5]\b/iu)
+    const read = (block: { lines: string[] }, label: string): string => {
+      const line = block.lines.find((item) => new RegExp(`^${label}\\s*[：:]`, 'u').test(item)) || ''
+      return valueAfter(line, label)
+    }
+    const rows = blocks.map((block) => [
+      block.title.replace(/\s+/g, ''),
+      read(block, '核心人群'),
+      read(block, '核心卖点'),
+      read(block, '真实场景'),
+      [read(block, '人群来源'), read(block, '卖点来源'), read(block, '场景来源')].filter(Boolean).join('；')
+    ])
+    return rows.length ? [{ context: '人群卖点场景匹配', headers: ['排序', '成交人群', '核心卖点', '核心场景', '数据依据'], rows }] : []
+  }
+  return []
+}
+
 export function parseHtmlReportModel(markdown: string): HtmlReportModel {
   const clean = stripProductVisualBrief(markdown)
   const lines = clean.split(/\r?\n/)
@@ -263,18 +380,20 @@ export function parseHtmlReportModel(markdown: string): HtmlReportModel {
   const flush = (): void => {
     if (!current) return
     const sectionMarkdown = current.lines.join('\n').trim()
+    const details = parseSectionDetails(sectionMarkdown)
     sections.push({
       number: current.number,
       title: current.title,
       markdown: sectionMarkdown,
-      ...parseSectionDetails(sectionMarkdown)
+      ...details,
+      tables: details.tables.length ? details.tables : synthesizeModuleTables(current.number, sectionMarkdown)
     })
   }
   for (const line of lines) {
-    const hit = line.match(/^##\s+(\d+)\.\s+(.+?)\s*$/)
+    const hit = line.match(/^##\s+(?:(\d+)\.\s+|(M[1-8])\s+)(.+?)\s*$/u)
     if (hit) {
       flush()
-      current = { number: hit[1], title: plainText(hit[2]), lines: [] }
+      current = { number: hit[1] || hit[2], title: plainText(hit[3]), lines: [] }
     } else if (current) {
       current.lines.push(line)
     }

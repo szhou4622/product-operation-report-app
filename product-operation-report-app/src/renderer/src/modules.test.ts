@@ -4,10 +4,14 @@ import {
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
+  findStaleModuleKeys,
+  fingerprintModuleMessages,
   isNoAnalysisOutput,
+  normalizeBenchmarkDimension,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
+import { inferSourcePlatform } from './sourceMetadata'
 
 describe('v1 report modules', () => {
   it('uses the fixed four-wave DAG and report order', () => {
@@ -68,5 +72,34 @@ describe('v1 report modules', () => {
     expect(isNoAnalysisOutput(output)).toBe(true)
     expect(validateModuleOutput('audience-sp-scene', output)).toEqual([])
     expect(normalizeNoAnalysisOutput(output)).toMatch(/^暂无分析：/u)
+  })
+
+  it('fingerprints exact module inputs and normalizes every benchmark dimension', () => {
+    const base = [{ role: 'user' as const, content: 'A' }]
+    expect(fingerprintModuleMessages(base)).toBe(fingerprintModuleMessages(base))
+    expect(fingerprintModuleMessages(base)).not.toBe(fingerprintModuleMessages([{ role: 'user', content: 'B' }]))
+    expect(normalizeBenchmarkDimension('同人群', '我会先核验。### 同人群\n推荐1\n品牌：A')).toBe('### 同人群\n推荐1\n品牌：A')
+    expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toBe('### 同情绪\n暂无可靠对标')
+  })
+
+  it('infers a platform from filenames and parsed evidence without guessing ambiguous files', () => {
+    expect(inferSourcePlatform('成交画像.xlsx', '来源：抖音电商罗盘')).toBe('抖音电商罗盘')
+    expect(inferSourcePlatform('小店罗盘导出.csv')).toBe('微信小店')
+    expect(inferSourcePlatform('混合资料.zip', '抖音数据\n视频号数据')).toBe('多平台（抖音、视频号）')
+    expect(inferSourcePlatform('购买画像.csv', '性别,年龄,占比')).toBe('')
+  })
+
+  it('invalidates downstream modules when an upstream result is newer', () => {
+    const states = {
+      'product-info': { status: 'done' as const, updatedAt: '2026-08-25T02:00:00Z' },
+      'material-review': { status: 'done' as const, updatedAt: '2026-08-25T01:00:00Z' },
+      'selling-points': { status: 'done' as const, updatedAt: '2026-08-25T01:10:00Z' },
+      'selling-point-ranking': { status: 'done' as const, updatedAt: '2026-08-25T01:20:00Z' },
+      'audience-sp-scene': { status: 'done' as const, updatedAt: '2026-08-25T01:30:00Z' }
+    }
+    const stale = findStaleModuleKeys(REPORT_MODULES, states)
+    expect(stale.has('selling-points')).toBe(true)
+    expect(stale.has('selling-point-ranking')).toBe(true)
+    expect(stale.has('audience-sp-scene')).toBe(true)
   })
 })

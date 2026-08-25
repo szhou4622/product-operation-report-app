@@ -51,10 +51,14 @@ import {
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
+  findStaleModuleKeys,
+  fingerprintModuleMessages,
   isNoAnalysisOutput,
+  normalizeBenchmarkDimension,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
+import { inferSourcePlatform } from './sourceMetadata'
 
 export { friendlyError } from './store/errors'
 export { buildProjectSnapshot } from './store/persistence'
@@ -404,21 +408,6 @@ const inferAttribution = (name: string): string => {
   if (n.includes('自有') || n.includes('本品') || n.includes('本店') || n.includes('我方')) {
     return '自有数据'
   }
-  return ''
-}
-
-const inferPlatform = (name: string): string => {
-  const n = name.toLowerCase()
-  if (n.includes('视频号') || n.includes('wechat') || n.includes('weixin')) return '视频号'
-  if (n.includes('抖音') || n.includes('douyin')) return '抖音'
-  if (n.includes('云图')) return '巨量云图'
-  if (n.includes('罗盘')) return '抖店罗盘'
-  if (n.includes('有米')) return '有米云'
-  if (n.includes('蝉妈妈') || n.includes('查妈妈')) return '蝉妈妈'
-  if (n.includes('淘宝')) return '淘宝'
-  if (n.includes('天猫')) return '天猫'
-  if (n.includes('小红书') || n.includes('xiaohongshu')) return '小红书'
-  if (n.includes('飞书') || n.includes('base')) return '飞书Base'
   return ''
 }
 
@@ -907,6 +896,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const restoredTaskJournal = { ...(lastProject?.taskJournal || {}) }
     const restoredModuleStates = { ...(lastProject?.moduleStates || {}) }
     let recoveredNoAnalysisModule = false
+    let staleModules: ModuleKey[] = []
     if (lastProject?.engineVersion === 'v1') {
       for (const module of REPORT_MODULES) {
         const taskEntry = Object.entries(restoredTaskJournal).find(([taskId]) =>
@@ -920,7 +910,21 @@ export const useStore = create<StoreState>((set, get) => ({
         delete restoredArtifacts[module.id]
         recoveredNoAnalysisModule = true
       }
-      if (recoveredNoAnalysisModule) {
+      staleModules = [...findStaleModuleKeys(REPORT_MODULES, restoredModuleStates)]
+      for (const key of staleModules) {
+        const module = REPORT_MODULES.find((candidate) => candidate.key === key)
+        if (!module) continue
+        delete restoredArtifacts[module.id]
+        restoredModuleStates[key] = {
+          status: 'failed',
+          message: '上游模块已经更新，本模块需要重新分析，旧结果已停止复用。',
+          updatedAt: new Date().toISOString()
+        }
+        for (const taskId of Object.keys(restoredTaskJournal)) {
+          if (taskId.includes(`:module:v1:${key}`)) delete restoredTaskJournal[taskId]
+        }
+      }
+      if (recoveredNoAnalysisModule || staleModules.length > 0) {
         const outputByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredArtifacts[module.id]]))
         const messageByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
         restoredReport = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
@@ -964,6 +968,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'narration',
         text: '已将证据不足、明确无有效结果的模块恢复为“暂无分析”，现有有效模块和报告内容均已保留。'
+      })
+    }
+    if (staleModules.length > 0) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `检测到上游模块晚于下游完成，已停止复用 ${staleModules.map(moduleByTitle).join('、')} 的旧结果。请从最前面的待重试模块开始，软件会自动重做它的下游。`
       })
     }
     const restoredSourceState = groupLegacyOfficeDerivedSources(
@@ -1238,7 +1250,7 @@ export const useStore = create<StoreState>((set, get) => ({
         size: file.size,
         parsing: false,
         attribution: inferAttribution(name),
-        platform: inferPlatform(name),
+        platform: inferSourcePlatform(name),
         purpose: inferPurpose(name),
         kindV1: inferKindV1(name),
         topLevelId: ''
@@ -1408,7 +1420,7 @@ export const useStore = create<StoreState>((set, get) => ({
                     error: it.ok ? undefined : it.error,
                     warning: it.ok ? it.warning : undefined,
                     attribution: inferAttribution(`${job.name}/${it.name}`),
-                    platform: inferPlatform(`${job.name}/${it.name}`),
+                    platform: inferSourcePlatform(`${job.name}/${it.name}`, it.text || ''),
                     purpose: inferPurpose(`${job.name}/${it.name}`),
                     kindV1: inferKindV1(`${job.name}/${it.name}`),
                     note: `来自压缩包：${job.name}`,
@@ -1481,7 +1493,7 @@ export const useStore = create<StoreState>((set, get) => ({
                   : undefined,
               warning: [parsed.warning, attachmentWarning].filter(Boolean).join(' ') || undefined,
               attribution: job.attribution,
-              platform: job.platform,
+              platform: job.platform || inferSourcePlatform(job.name, parsed.text || ''),
               purpose: job.purpose,
               kindV1: job.kindV1,
               topLevelId: job.id
@@ -2283,15 +2295,22 @@ export const useStore = create<StoreState>((set, get) => ({
     const sessionId = get().analysisSessionId
     const isCurrentSession = (): boolean => get().analysisSessionId === sessionId
     set({ phase: 'analyzing' })
-    const sufficiency = evaluateSourceSufficiency(REPORT_MODULES, get().sources.map((source) => source.kindV1))
+    const detailsById = new Map(get().cleanDetails.map((detail) => [detail.id, detail.text]))
+    const analysisSources = get().sources.map((source) => ({
+      ...source,
+      platform: source.platform || inferSourcePlatform(source.name, detailsById.get(source.id) || source.text || '')
+    }))
+    if (analysisSources.some((source, index) => source.platform !== get().sources[index]?.platform)) {
+      set({ sources: analysisSources })
+    }
+    const sufficiency = evaluateSourceSufficiency(REPORT_MODULES, analysisSources.map((source) => source.kindV1))
     if (sufficiency.blocked) {
       set({ phase: 'checkpoint1', abortFn: null })
       get()._post('assistant', sufficiency.blocked, 'error')
       return
     }
-    const sourceCountV1 = topLevelSourceCount(get().sources)
-    const imageCountV1 = sourceImageCount(get().sources)
-    const detailsById = new Map(get().cleanDetails.map((detail) => [detail.id, detail.text]))
+    const sourceCountV1 = topLevelSourceCount(analysisSources)
+    const imageCountV1 = sourceImageCount(analysisSources)
     const updateModuleState = (key: ModuleKey, state: ModuleRunState): void => {
       set((current) => ({ moduleStates: { ...current.moduleStates, [key]: state } }))
     }
@@ -2305,23 +2324,7 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       const savedTaskId = `${sessionId}:module:v1:${module.key}`
       const saved = get().taskJournal[savedTaskId]
-      if (saved?.output?.trim() && isNoAnalysisOutput(saved.output)) {
-        const output = normalizeNoAnalysisOutput(saved.output)
-        set((state) => ({
-          taskJournal: {
-            ...state.taskJournal,
-            [savedTaskId]: { ...saved, status: 'complete', output, updatedAt: new Date().toISOString() }
-          }
-        }))
-        updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: saved.updatedAt })
-        return
-      }
-      if (saved?.status === 'complete' && saved.output?.trim()) {
-        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
-        updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
-        return
-      }
-      const moduleSources = get().sources.flatMap((source) => {
+      const moduleSources = analysisSources.flatMap((source) => {
         if (!source.kindV1 || !module.requiredSources.includes(source.kindV1)) return []
         const text = detailsById.get(source.id)
         return text ? [{ name: source.name, kindV1: source.kindV1, attribution: source.attribution, platform: source.platform, text }] : []
@@ -2346,6 +2349,17 @@ export const useStore = create<StoreState>((set, get) => ({
         ...(sufficiency.partial.get(module.key) ? [sufficiency.partial.get(module.key)!] : [])
       ]
       const messages = buildModuleMessages(module, { prompt, sources: moduleSources, upstream, missingDependencies, requirements: get().steering })
+      const inputFingerprint = fingerprintModuleMessages(messages)
+      if (saved?.inputFingerprint === inputFingerprint && saved.output?.trim() && isNoAnalysisOutput(saved.output)) {
+        const output = normalizeNoAnalysisOutput(saved.output)
+        updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: saved.updatedAt })
+        return
+      }
+      if (saved?.inputFingerprint === inputFingerprint && saved.status === 'complete' && saved.output?.trim()) {
+        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
+        updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
+        return
+      }
       if (module.key === 'benchmark-brands') {
         const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']
         const dimensionOutputs: string[] = new Array(dimensions.length)
@@ -2357,10 +2371,6 @@ export const useStore = create<StoreState>((set, get) => ({
             const dimension = dimensions[index]
             const taskId = `${savedTaskId}:search:${index + 1}`
             const cached = get().taskJournal[taskId]
-            if (cached?.status === 'complete' && cached.output?.trim()) {
-              dimensionOutputs[index] = cached.output
-              continue
-            }
             const focusedMessages = [
               ...messages,
               {
@@ -2368,6 +2378,11 @@ export const useStore = create<StoreState>((set, get) => ({
                 content: `本次只完成“${dimension}”这一维度。联网核实最多3个真实品牌；每个品牌给出推荐理由和可追溯来源。没有可靠结果时只输出“### ${dimension}\\n暂无可靠对标”。`
               }
             ]
+            const dimensionFingerprint = fingerprintModuleMessages(focusedMessages)
+            if (cached?.status === 'complete' && cached.inputFingerprint === dimensionFingerprint && cached.output?.trim()) {
+              dimensionOutputs[index] = normalizeBenchmarkDimension(dimension, cached.output)
+              continue
+            }
             let result = await runModelRetry(
               focusedMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
               {
@@ -2398,14 +2413,15 @@ export const useStore = create<StoreState>((set, get) => ({
                 }
               )
             }
-            const output = result.ok && result.text.trim()
-              ? result.text.trim()
-              : `### ${dimension}\n暂无可靠对标`
+            const output = normalizeBenchmarkDimension(
+              dimension,
+              result.ok && result.text.trim() ? result.text : '暂无可靠对标'
+            )
             dimensionOutputs[index] = output
             set((state) => ({
               taskJournal: {
                 ...state.taskJournal,
-                [taskId]: { kind: 'module', status: 'complete', output, updatedAt: new Date().toISOString() }
+                [taskId]: { kind: 'module', status: 'complete', output, inputFingerprint: dimensionFingerprint, updatedAt: new Date().toISOString() }
               }
             }))
             await window.api.saveLastProject(buildProjectSnapshot(get()))
@@ -2413,11 +2429,23 @@ export const useStore = create<StoreState>((set, get) => ({
         }
         await Promise.all(Array.from({ length: 3 }, () => worker()))
         const benchmarkOutput = dimensionOutputs.join('\n\n')
+        const benchmarkValidationErrors = validateModuleOutput(module.key, benchmarkOutput)
+        if (benchmarkValidationErrors.length) {
+          const message = benchmarkValidationErrors.join('；')
+          updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
+          set((state) => ({
+            taskJournal: {
+              ...state.taskJournal,
+              [savedTaskId]: { kind: 'module', status: 'failed', output: benchmarkOutput, inputFingerprint, updatedAt: new Date().toISOString() }
+            }
+          }))
+          return
+        }
         set((state) => ({
           artifacts: { ...state.artifacts, [module.id]: benchmarkOutput },
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'complete', output: benchmarkOutput, updatedAt: new Date().toISOString() }
+            [savedTaskId]: { kind: 'module', status: 'complete', output: benchmarkOutput, inputFingerprint, updatedAt: new Date().toISOString() }
           }
         }))
         updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
@@ -2451,7 +2479,7 @@ export const useStore = create<StoreState>((set, get) => ({
         set((state) => ({
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, updatedAt: new Date().toISOString() }
+            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, inputFingerprint, updatedAt: new Date().toISOString() }
           }
         }))
         return
@@ -2463,7 +2491,7 @@ export const useStore = create<StoreState>((set, get) => ({
         set((state) => ({
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, updatedAt: new Date().toISOString() }
+            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, inputFingerprint, updatedAt: new Date().toISOString() }
           }
         }))
         return
@@ -2473,7 +2501,7 @@ export const useStore = create<StoreState>((set, get) => ({
         set((state) => ({
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'complete', output, updatedAt: new Date().toISOString() }
+            [savedTaskId]: { kind: 'module', status: 'complete', output, inputFingerprint, updatedAt: new Date().toISOString() }
           }
         }))
         updateModuleState(module.key, { status: 'skipped', message: output, updatedAt: new Date().toISOString() })
@@ -2484,7 +2512,7 @@ export const useStore = create<StoreState>((set, get) => ({
         artifacts: { ...state.artifacts, [module.id]: result.text },
         taskJournal: {
           ...state.taskJournal,
-          [savedTaskId]: { kind: 'module', status: 'complete', output: result.text, updatedAt: new Date().toISOString() }
+          [savedTaskId]: { kind: 'module', status: 'complete', output: result.text, inputFingerprint, updatedAt: new Date().toISOString() }
         }
       }))
       updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
@@ -3096,8 +3124,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const affectedIds = new Set(REPORT_MODULES.filter((module) => affected.has(module.key)).map((module) => module.id))
     set((state) => ({
       artifacts: Object.fromEntries(Object.entries(state.artifacts).filter(([id]) => !affectedIds.has(Number(id)) && Number(id) !== REPORT_STEP_ID)),
-      taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId, task]) =>
-        (task.output && isNoAnalysisOutput(task.output)) ||
+      taskJournal: Object.fromEntries(Object.entries(state.taskJournal).filter(([taskId]) =>
         ![...affected].some((moduleKey) => taskId.includes(`:module:v1:${moduleKey}`))
       )),
       moduleStates: Object.fromEntries(Object.entries(state.moduleStates).filter(([moduleKey]) => !affected.has(moduleKey as ModuleKey))),

@@ -4,7 +4,8 @@ import type {
   ModuleKey,
   ModulePrompt,
   ReportModule,
-  SourceKindV1
+  SourceKindV1,
+  ModuleRunState
 } from '../../shared/types'
 
 export interface ModuleSourceBlock {
@@ -70,12 +71,62 @@ export const MODULE_TASK_TYPES: Record<ModuleKey, ModelTaskType> = {
 
 export function isNoAnalysisOutput(text: string): boolean {
   const value = text.trim()
-  return /暂无分析|暂无可分析|无有效(?:组合|结果|数据)可输出|资料不足[^。\n]*(?:无法|不能)|缺少[^。\n]*(?:无法|不能)/u.test(value)
+  return /暂无分析|暂无可分析|暂无可确认的真实(?:产品)?卖点|无有效(?:组合|结果|数据)可输出|无[（(][^）)]*缺失|资料不足[^。\n]*(?:无法|不能)|缺少[^。\n]*(?:无法|不能)/u.test(value)
 }
 
 export function normalizeNoAnalysisOutput(text: string): string {
   const value = text.trim()
   return value.startsWith('暂无分析') ? value : `暂无分析：${value}`
+}
+
+export function fingerprintModuleMessages(messages: ChatMessage[]): string {
+  const value = JSON.stringify(messages)
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return `v1-${(hash >>> 0).toString(16).padStart(8, '0')}-${value.length}`
+}
+
+export function normalizeBenchmarkDimension(dimension: string, raw: string): string {
+  const value = raw.trim()
+  if (!value || /暂无可靠对标/u.test(value) && value.length < 120) return `### ${dimension}\n暂无可靠对标`
+  const heading = new RegExp(`#{1,6}\\s*${dimension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'u')
+  const match = heading.exec(value)
+  const body = (match ? value.slice((match.index || 0) + match[0].length) : value)
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*(?:我会|我正在|接下来|下面将|本次将)/u.test(line))
+    .join('\n')
+    .trim()
+  return `### ${dimension}\n${body || '暂无可靠对标'}`
+}
+
+export function findStaleModuleKeys(
+  modules: ReportModule[],
+  states: Partial<Record<ModuleKey, ModuleRunState>>
+): Set<ModuleKey> {
+  const stale = new Set<ModuleKey>()
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const module of modules) {
+      if (stale.has(module.key) || module.dependsOn.length === 0) continue
+      const state = states[module.key]
+      if (!state || (state.status !== 'done' && state.status !== 'skipped')) continue
+      const currentTime = Date.parse(state.updatedAt)
+      const hasNewerOrStaleDependency = module.dependsOn.some((dependency) => {
+        if (stale.has(dependency)) return true
+        const dependencyState = states[dependency]
+        return Boolean(dependencyState && Date.parse(dependencyState.updatedAt) > currentTime)
+      })
+      if (hasNewerOrStaleDependency) {
+        stale.add(module.key)
+        changed = true
+      }
+    }
+  }
+  return stale
 }
 
 export function buildModuleMessages(module: ReportModule, context: ModuleContext): ChatMessage[] {
@@ -136,7 +187,9 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
   }
   if (key === 'platform-audience' && !/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
   if (key === 'material-review' && !/TOP\s*5|Top\s*5|自有|竞品/iu.test(value)) errors.push('素材模块缺少自有/竞品Top5结果')
-  if (key === 'benchmark-brands' && !/同产品|同类目|同人群|暂无可靠对标/u.test(value)) errors.push('对标模块缺少固定维度')
+  if (key === 'benchmark-brands' && !ordered(value, ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案'])) {
+    errors.push('对标模块必须完整包含7个固定维度并保持顺序')
+  }
   if (key === 'selling-points' && !/品质|价格|健康|情感/u.test(value)) errors.push('产品卖点缺少四大需求分类')
   if (key === 'voc' && (!/频次/u.test(value) || !/占比/u.test(value))) errors.push('VOC结果必须包含频次和占比')
   if (key === 'selling-point-ranking' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')
