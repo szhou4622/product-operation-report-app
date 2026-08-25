@@ -135,7 +135,7 @@ class ProxyLedgerTests(unittest.TestCase):
         proxy.apply_server_task_options(benchmark, "module_benchmark")
         proxy.apply_server_task_options(normal, "module_product_info")
         self.assertEqual(benchmark["tools"], [{"type": "web_search"}])
-        self.assertEqual(benchmark["tool_choice"], "required")
+        self.assertEqual(benchmark["tool_choice"], "auto")
         self.assertNotIn("tools", normal)
 
     def test_same_running_task_is_not_submitted_twice(self) -> None:

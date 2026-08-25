@@ -1322,7 +1322,7 @@ def provider_stream_completed(saw_done: bool, finish_reason: str, usage: dict[st
 def apply_server_task_options(upstream_body: dict[str, Any], task_type: str) -> None:
     if task_type == "module_benchmark":
         upstream_body["tools"] = [{"type": "web_search"}]
-        upstream_body["tool_choice"] = "required"
+        upstream_body["tool_choice"] = "auto"
 
 
 def mark_upstream_submitted(request_id: str) -> None:

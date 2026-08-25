@@ -2342,6 +2342,9 @@ export const useStore = create<StoreState>((set, get) => ({
     const benchmarkReportSessionId = get().moduleRetryScope.includes('benchmark-brands')
       ? crypto.randomUUID()
       : sessionId
+    const activeReportSessionId = get().moduleRetryScope.includes('benchmark-brands')
+      ? benchmarkReportSessionId
+      : sessionId
     const updateModuleState = (key: ModuleKey, state: ModuleRunState): void => {
       set((current) => ({ moduleStates: { ...current.moduleStates, [key]: state } }))
     }
@@ -2502,7 +2505,7 @@ export const useStore = create<StoreState>((set, get) => ({
         },
         3,
         {
-          reportSessionId: sessionId,
+          reportSessionId: activeReportSessionId,
           taskType: MODULE_TASK_TYPES[module.key],
           taskKey: savedTaskId,
           billingRequestId: savedTaskId,
