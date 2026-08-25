@@ -55,6 +55,7 @@ import {
   fingerprintModuleMessages,
   isNoAnalysisOutput,
   normalizeBenchmarkDimension,
+  normalizeBenchmarkOutput,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
@@ -904,12 +905,36 @@ export const useStore = create<StoreState>((set, get) => ({
     let recoveredNoAnalysisModule = false
     let recoveredValidatedModule = false
     let staleModules: ModuleKey[] = []
+    const invalidCompletedModules: ModuleKey[] = []
     if (lastProject?.engineVersion === 'v1') {
       for (const module of REPORT_MODULES) {
         const taskEntry = Object.entries(restoredTaskJournal).find(([taskId]) =>
           taskId.endsWith(`:module:v1:${module.key}`)
         )
         const task = taskEntry?.[1]
+        if (module.key === 'benchmark-brands' && task?.output) {
+          const normalized = normalizeBenchmarkOutput(task.output)
+          if (normalized !== task.output) {
+            restoredTaskJournal[taskEntry![0]] = { ...task, output: normalized, updatedAt: new Date().toISOString() }
+            restoredArtifacts[module.id] = normalized
+            recoveredValidatedModule = true
+          }
+        }
+        if (
+          restoredModuleStates[module.key]?.status === 'done' &&
+          task?.output &&
+          validateModuleOutput(module.key, task.output).length > 0
+        ) {
+          delete restoredArtifacts[module.id]
+          delete restoredTaskJournal[taskEntry![0]]
+          restoredModuleStates[module.key] = {
+            status: 'failed',
+            message: `旧结果不完整：${validateModuleOutput(module.key, task.output).slice(0, 3).join('；')}。`,
+            updatedAt: new Date().toISOString()
+          }
+          invalidCompletedModules.push(module.key)
+          continue
+        }
         if (restoredModuleStates[module.key]?.status !== 'failed' || !task?.output) continue
         if (isNoAnalysisOutput(task.output)) {
           const output = normalizeNoAnalysisOutput(task.output)
@@ -925,6 +950,17 @@ export const useStore = create<StoreState>((set, get) => ({
         }
       }
       staleModules = [...findStaleModuleKeys(REPORT_MODULES, restoredModuleStates)]
+      const invalidOrStale = new Set<ModuleKey>([...invalidCompletedModules, ...staleModules])
+      let dependencyChanged = true
+      while (dependencyChanged) {
+        dependencyChanged = false
+        for (const module of REPORT_MODULES) {
+          if (invalidOrStale.has(module.key) || !module.dependsOn.some((dependency) => invalidOrStale.has(dependency))) continue
+          invalidOrStale.add(module.key)
+          staleModules.push(module.key)
+          dependencyChanged = true
+        }
+      }
       for (const key of staleModules) {
         const module = REPORT_MODULES.find((candidate) => candidate.key === key)
         if (!module) continue
@@ -938,7 +974,7 @@ export const useStore = create<StoreState>((set, get) => ({
           if (taskId.includes(`:module:v1:${key}`)) delete restoredTaskJournal[taskId]
         }
       }
-      if (recoveredNoAnalysisModule || recoveredValidatedModule || staleModules.length > 0) {
+      if (recoveredNoAnalysisModule || recoveredValidatedModule || invalidCompletedModules.length > 0 || staleModules.length > 0) {
         const outputByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredArtifacts[module.id]]))
         const messageByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
         restoredReport = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
@@ -998,6 +1034,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'error',
         text: `检测到上游模块晚于下游完成，已停止复用 ${staleModules.map(moduleByTitle).join('、')} 的旧结果。请从最前面的待重试模块开始，软件会自动重做它的下游。`
+      })
+    }
+    if (invalidCompletedModules.length > 0) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'error',
+        text: `检测到 ${invalidCompletedModules.map(moduleByTitle).join('、')} 的旧结果被截断或缺项，已阻止继续导出该结果，请重试对应模块。`
       })
     }
     const restoredSourceState = groupLegacyOfficeDerivedSources(
@@ -2393,7 +2437,8 @@ export const useStore = create<StoreState>((set, get) => ({
         return
       }
       if (reusableInput && saved?.status === 'complete' && saved.output?.trim()) {
-        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: saved.output! } }))
+        const output = module.key === 'benchmark-brands' ? normalizeBenchmarkOutput(saved.output) : saved.output
+        set((state) => ({ artifacts: { ...state.artifacts, [module.id]: output } }))
         updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
         return
       }

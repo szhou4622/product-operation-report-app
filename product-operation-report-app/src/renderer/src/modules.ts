@@ -99,7 +99,25 @@ export function normalizeBenchmarkDimension(dimension: string, raw: string): str
     .filter((line) => !/^\s*(?:我会|我正在|接下来|下面将|本次将)/u.test(line))
     .join('\n')
     .trim()
+  if (
+    !/品牌\s*[：:]/u.test(body) &&
+    /联网检索工具|无法联网检索|未完成联网检索|未完成检索|未执行.*联网检索/u.test(body)
+  ) {
+    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+  }
   return `### ${dimension}\n${body || '暂无可靠对标'}`
+}
+
+export function normalizeBenchmarkOutput(raw: string): string {
+  const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']
+  return dimensions.map((dimension, index) => {
+    const start = raw.search(new RegExp(`#{1,6}\\s*${dimension}`, 'u'))
+    if (start < 0) return normalizeBenchmarkDimension(dimension, '暂无可靠对标')
+    const nextDimension = dimensions[index + 1]
+    const tail = raw.slice(start)
+    const next = nextDimension ? tail.search(new RegExp(`\\n#{1,6}\\s*${nextDimension}`, 'u')) : -1
+    return normalizeBenchmarkDimension(dimension, next >= 0 ? tail.slice(0, next) : tail)
+  }).join('\n\n')
 }
 
 export function findStaleModuleKeys(
@@ -186,7 +204,15 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
     if ((value.match(/信息：/gu) || []).length < 9 || (value.match(/来源：/gu) || []).length < 9) errors.push('产品信息必须逐维提供信息和来源')
   }
   if (key === 'platform-audience' && !/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
-  if (key === 'material-review' && !/TOP\s*5|Top\s*5|自有|竞品/iu.test(value)) errors.push('素材模块缺少自有/竞品Top5结果')
+  if (key === 'material-review') {
+    for (const prefix of ['自有框架', '竞品框架', '机会']) {
+      for (let index = 1; index <= 5; index++) {
+        if (!value.includes(`${prefix}${index}`)) errors.push(`素材模块缺少${prefix}${index}`)
+      }
+    }
+    if ((value.match(/可复用方向\s*[：:]/gu) || []).length < 10) errors.push('素材模块缺少自有或竞品可复用方向')
+    if ((value.match(/可补充方向\s*[：:]/gu) || []).length < 5) errors.push('素材模块缺少5条补充方向')
+  }
   if (key === 'benchmark-brands' && !ordered(value, ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案'])) {
     errors.push('对标模块必须完整包含7个固定维度并保持顺序')
   }

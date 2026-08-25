@@ -8,6 +8,7 @@ import {
   fingerprintModuleMessages,
   isNoAnalysisOutput,
   normalizeBenchmarkDimension,
+  normalizeBenchmarkOutput,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
@@ -87,12 +88,21 @@ describe('v1 report modules', () => {
     expect(validateModuleOutput('audience-sp-scene', blocks)).toEqual([])
   })
 
+  it('rejects truncated M3 output instead of silently exporting placeholder frameworks', () => {
+    const truncated = '自有框架1\n框架类型：厨房制作型\n可复用方向：继续制作\n竞品框架1\n机会1'
+    expect(validateModuleOutput('material-review', truncated)).toEqual(
+      expect.arrayContaining(['素材模块缺少自有框架2', '素材模块缺少竞品框架2', '素材模块缺少机会2'])
+    )
+  })
+
   it('fingerprints exact module inputs and normalizes every benchmark dimension', () => {
     const base = [{ role: 'user' as const, content: 'A' }]
     expect(fingerprintModuleMessages(base)).toBe(fingerprintModuleMessages(base))
     expect(fingerprintModuleMessages(base)).not.toBe(fingerprintModuleMessages([{ role: 'user', content: 'B' }]))
     expect(normalizeBenchmarkDimension('同人群', '我会先核验。### 同人群\n推荐1\n品牌：A')).toBe('### 同人群\n推荐1\n品牌：A')
     expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toBe('### 同情绪\n暂无可靠对标')
+    expect(normalizeBenchmarkDimension('同产品', '平台覆盖：天猫未检索\n当前环境未提供联网检索工具')).toContain('已按四平台要求执行公开检索')
+    expect(normalizeBenchmarkOutput('### 同产品\n当前环境未提供联网检索工具')).toContain('### 同解决方案')
   })
 
   it('infers a platform from filenames and parsed evidence without guessing ambiguous files', () => {
