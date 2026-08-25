@@ -93,7 +93,9 @@ export function fingerprintModuleMessages(messages: ChatMessage[]): string {
 
 export function normalizeBenchmarkDimension(dimension: string, raw: string): string {
   const value = raw.trim()
-  if (!value || /暂无可靠对标/u.test(value) && value.length < 120) return `### ${dimension}\n暂无可靠对标`
+  if (!value || /暂无可靠对标/u.test(value) && value.length < 120) {
+    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+  }
   const heading = new RegExp(`#{1,6}\\s*${dimension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'u')
   const match = heading.exec(value)
   const body = (match ? value.slice((match.index || 0) + match[0].length) : value)

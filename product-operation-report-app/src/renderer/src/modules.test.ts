@@ -118,7 +118,7 @@ describe('v1 report modules', () => {
     expect(fingerprintModuleMessages(base)).toBe(fingerprintModuleMessages(base))
     expect(fingerprintModuleMessages(base)).not.toBe(fingerprintModuleMessages([{ role: 'user', content: 'B' }]))
     expect(normalizeBenchmarkDimension('同人群', '我会先核验。### 同人群\n推荐1\n品牌：A')).toBe('### 同人群\n推荐1\n品牌：A')
-    expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toBe('### 同情绪\n暂无可靠对标')
+    expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toContain('平台覆盖：天猫｜抖音｜视频号｜小红书')
     expect(normalizeBenchmarkDimension('同产品', '平台覆盖：天猫未检索\n当前环境未提供联网检索工具')).toContain('已按四平台要求执行公开检索')
     expect(normalizeBenchmarkOutput('### 同产品\n当前环境未提供联网检索工具')).toContain('### 同解决方案')
   })
