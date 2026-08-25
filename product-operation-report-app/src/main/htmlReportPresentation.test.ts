@@ -54,6 +54,14 @@ describe('v1 M1-M8 visual planning', () => {
       '年龄',
       '信息：60岁以上44.57%，50—59岁24.90%',
       '来源：成交画像截图',
+      '## M3 内容素材判断',
+      '自有框架1',
+      '框架类型：',
+      '3.1｜厨房制作型｜食欲切入｜制作展示｜推荐',
+      '数据依据：',
+      '20条｜占自有素材40.0%',
+      '可复用方向：',
+      '没胃口切入→厨房制作→成品展示→邀请尝试',
       '## M4 对标推荐',
       '### 同产品',
       '暂无可靠对标',
@@ -77,12 +85,19 @@ describe('v1 M1-M8 visual planning', () => {
       '场景来源：用户评论'
     ].join('\n')
     const model = parseHtmlReportModel(markdown)
-    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M4', 'M5', 'M8'])
+    expect(model.sections.map((section) => section.number)).toEqual(['M1', 'M2', 'M3', 'M4', 'M5', 'M8'])
     expect(model.sections.find((section) => section.number === 'M1')?.tables[0]?.rows).toHaveLength(2)
     expect(model.sections.find((section) => section.number === 'M2')?.tables[0]?.rows).toHaveLength(4)
+    expect(model.sections.find((section) => section.number === 'M3')?.tables[0]?.rows[0]).toEqual([
+      '3.1｜厨房制作型｜食欲切入｜制作展示｜推荐',
+      '20条｜占自有素材40.0%',
+      '没胃口切入→厨房制作→成品展示→邀请尝试'
+    ])
+    expect(model.sections.find((section) => section.number === 'M5')?.tables[0]?.rows[0]?.[1]).not.toContain('TOP1')
     const presentation = buildHtmlReportPresentation(model)
     expect(presentation.sections.find((section) => section.sectionNumber === 'M1')?.visualKind).toBe('product-facts')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M2')?.visualKind).toBe('percent-facets')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M3')?.visualKind).toBe('material-methods')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M4')?.visualKind).toBe('source-ledger')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('selling-point-matrix')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M8')?.visualKind).toBe('audience-map')

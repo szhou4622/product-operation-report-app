@@ -266,6 +266,19 @@ function valueAfter(line: string, label: string): string {
   return line.replace(new RegExp(`^${label}\\s*[：:]\\s*`, 'u'), '').trim()
 }
 
+function labeledValue(lines: string[], labels: string[]): string {
+  for (let index = 0; index < lines.length; index++) {
+    for (const label of labels) {
+      if (!new RegExp(`^${label}\\s*[：:]`, 'u').test(lines[index])) continue
+      const inline = valueAfter(lines[index], label)
+      if (inline) return inline
+      const next = lines[index + 1] || ''
+      if (next && !/^[\p{Script=Han}A-Za-z0-9 /×*_-]{1,20}\s*[：:]/u.test(next)) return next
+    }
+  }
+  return ''
+}
+
 function splitBlocks(lines: string[], pattern: RegExp): Array<{ title: string; lines: string[] }> {
   const blocks: Array<{ title: string; lines: string[] }> = []
   let current: { title: string; lines: string[] } | null = null
@@ -316,13 +329,20 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
   }
   if (number === 'M3') {
     const blocks = splitBlocks(lines, /^(?:自有框架|竞品框架|机会)\d+/u)
-    const rows = blocks.map((block) => {
-      const type = block.lines.find((line) => /^框架类型\s*[：:]/u.test(line)) || ''
-      const basis = block.lines.find((line) => /^数据依据\s*[：:]/u.test(line)) || ''
-      const reuse = block.lines.find((line) => /^可复用方向\s*[：:]/u.test(line)) || ''
-      return [block.title, [valueAfter(type, '框架类型'), valueAfter(basis, '数据依据')].filter(Boolean).join('｜'), valueAfter(reuse, '可复用方向') || '暂无分析']
+    const buckets = [
+      { context: '自有素材', pattern: /^自有框架/u },
+      { context: '竞品素材', pattern: /^竞品框架/u },
+      { context: '补充机会', pattern: /^机会/u }
+    ]
+    return buckets.flatMap((bucket) => {
+      const rows = blocks.filter((block) => bucket.pattern.test(block.title)).map((block) => {
+        const framework = labeledValue(block.lines, ['框架类型', '机会框架'])
+        const basis = labeledValue(block.lines, ['数据依据', '竞品依据'])
+        const reuse = labeledValue(block.lines, ['可复用方向', '可补充方向'])
+        return [framework || block.title, basis || '数量依据见模块原文', reuse || '暂无分析']
+      })
+      return rows.length ? [{ context: bucket.context, headers: ['类型', '数据依据', '可复用方向'], rows }] : []
     })
-    return rows.length ? [{ context: '素材框架与迁移方向', headers: ['类型', '原始 3 秒开头', '可复用方向'], rows }] : []
   }
   if (number === 'M4') {
     const blocks = splitBlocks(lines, /^(?:同产品|同类目|同人群|同卖点|同痛点|同情绪|同解决方案)$/u)
@@ -343,7 +363,7 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
       return topBlocks.map((item) => {
         const selling = item.lines.find((line) => /^卖点\s*[：:]/u.test(line)) || ''
         const benefit = item.lines.find((line) => /^买点\s*[：:]/u.test(line)) || ''
-        return [category, [item.title, valueAfter(selling, '卖点'), valueAfter(benefit, '买点')].filter(Boolean).join('｜'), '来源：M1产品事实与M3素材证据']
+        return [category, [valueAfter(selling, '卖点'), valueAfter(benefit, '买点')].filter(Boolean).join('｜'), '来源：M1产品事实与M3素材证据']
       })
     })
     return rows.length ? [{ context: '四类消费者买点', headers: ['卖点维度', '我方产品卖点', '证据'], rows }] : []

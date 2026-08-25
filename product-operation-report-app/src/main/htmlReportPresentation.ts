@@ -230,7 +230,17 @@ const KEYWORD_STOP_WORDS = new Set(
     'txt',
     'markdown',
     'html',
-    'zip'
+    'zip',
+    'top1',
+    'top2',
+    'top3',
+    'top4',
+    'top5',
+    'top6',
+    'top7',
+    'top8',
+    'top9',
+    'top10'
   ].map((item) => item.toLocaleLowerCase('zh-CN'))
 )
 
@@ -422,11 +432,14 @@ function buildStrictPercentFacets(section: HtmlReportSection): HtmlReportPercent
               return null
             }
           }
+          const conciseV1 = section.number === 'M2'
           return {
-            context: [table.context, platform, dimension, text(table.headers[valueIndex] || '')]
-              .filter(Boolean)
-              .join(' · '),
-            group: [table.context, platform].filter(Boolean).join(' · '),
+            context: conciseV1
+              ? dimension || table.context || text(table.headers[valueIndex] || '数据')
+              : [table.context, platform, dimension, text(table.headers[valueIndex] || '')].filter(Boolean).join(' · '),
+            group: conciseV1
+              ? platform || table.context || '分平台数据'
+              : [table.context, platform].filter(Boolean).join(' · '),
             mode: 'bars' as const,
             items: completeItems
           }
@@ -799,8 +812,8 @@ function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVis
       return matches(
         (table) =>
           tableMatches(table, [/竞品开头/, /打法本质/]) ||
-          tableMatches(table, [/类型/, /原始\s*3\s*秒开头/, /可复用方向/])
-      ).slice(0, 2)
+          tableMatches(table, [/类型/, /(?:原始\s*3\s*秒开头|数据依据)/, /可复用方向/])
+      ).slice(0, 3)
     }
     case 'selling-point-matrix':
       return matches((table) => tableMatches(table, [/卖点维度/, /我方产品卖点/])).slice(0, 1)

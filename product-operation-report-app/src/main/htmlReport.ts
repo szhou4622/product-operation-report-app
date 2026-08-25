@@ -564,8 +564,14 @@ function renderMaterialVisual(
     `<div class="method-playbooks">${tables
       .map(
         (table, tableIndex) => `<section class="method-playbook">
-          <header><span>${tableIndex === 0 ? '自有素材' : '竞品借鉴'}</span><strong>${escapeHtml(
-            shorten(table.context || table.headers.join(' → '), 58)
+          <header><span>${escapeHtml(
+            tableIndex === 0
+              ? table.context || '自有素材'
+              : table.context === '补充机会'
+                ? '补充机会'
+                : `竞品借鉴${table.context ? ` · ${table.context}` : ''}`
+          )}</span><strong>${escapeHtml(
+            shorten(table.headers.join(' → '), 58)
           )}</strong></header>
           <div class="method-flow-list">${table.rows
             .slice(0, 6)
