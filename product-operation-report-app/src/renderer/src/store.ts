@@ -895,7 +895,7 @@ export const useStore = create<StoreState>((set, get) => ({
       window.api.loadLastProject(),
       window.api.loadPreviousProject()
     ])
-    const restoredReport =
+    let restoredReport =
       lastProject?.phase === 'analyzing'
         ? lastProject.artifacts?.[REPORT_STEP_ID] || ''
         : lastProject?.reportMarkdown || ''
@@ -904,6 +904,29 @@ export const useStore = create<StoreState>((set, get) => ({
       (lastProject.reportMarkdown?.trim() || Object.keys(lastProject.artifacts || {}).length)
     )
     const restoredArtifacts = { ...(lastProject?.artifacts || {}) }
+    const restoredTaskJournal = { ...(lastProject?.taskJournal || {}) }
+    const restoredModuleStates = { ...(lastProject?.moduleStates || {}) }
+    let recoveredNoAnalysisModule = false
+    if (lastProject?.engineVersion === 'v1') {
+      for (const module of REPORT_MODULES) {
+        const taskEntry = Object.entries(restoredTaskJournal).find(([taskId]) =>
+          taskId.endsWith(`:module:v1:${module.key}`)
+        )
+        const task = taskEntry?.[1]
+        if (restoredModuleStates[module.key]?.status !== 'failed' || !task?.output || !isNoAnalysisOutput(task.output)) continue
+        const output = normalizeNoAnalysisOutput(task.output)
+        restoredTaskJournal[taskEntry![0]] = { ...task, status: 'complete', output, updatedAt: new Date().toISOString() }
+        restoredModuleStates[module.key] = { status: 'skipped', message: output, updatedAt: new Date().toISOString() }
+        delete restoredArtifacts[module.id]
+        recoveredNoAnalysisModule = true
+      }
+      if (recoveredNoAnalysisModule) {
+        const outputByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredArtifacts[module.id]]))
+        const messageByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
+        restoredReport = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
+        restoredArtifacts[REPORT_STEP_ID] = restoredReport
+      }
+    }
     if (restoredReport && !restoredArtifacts[REPORT_STEP_ID]) {
       restoredArtifacts[REPORT_STEP_ID] = restoredReport
     }
@@ -933,6 +956,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'error',
         text: `恢复项目时发现 ${lastProject.missingBlobs.length} 个资料块丢失。其他内容已正常恢复，请重新上传：${lastProject.missingBlobs.join('、')}`
+      })
+    }
+    if (recoveredNoAnalysisModule) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'narration',
+        text: '已将证据不足、明确无有效结果的模块恢复为“暂无分析”，现有有效模块和报告内容均已保留。'
       })
     }
     const restoredSourceState = groupLegacyOfficeDerivedSources(
@@ -967,7 +998,7 @@ export const useStore = create<StoreState>((set, get) => ({
       cleanedData: lastProject?.cleanedData || '',
       cleanDetails: restoredCleanDetails,
       artifacts: restoredArtifacts,
-      taskJournal: lastProject?.taskJournal || {},
+      taskJournal: restoredTaskJournal,
       reportMarkdown: restoredReport,
       reportStale: Boolean(lastProject?.reportStale),
       phase: lastProject ? restorePhase(lastProject) : 'idle',
@@ -982,7 +1013,7 @@ export const useStore = create<StoreState>((set, get) => ({
       legacyNotice: legacyReadOnly
         ? '此报告由旧版本生成，仅支持查看导出'
         : lastProject?.legacyNotice || '',
-      moduleStates: lastProject?.moduleStates || {}
+      moduleStates: restoredModuleStates
     })
   },
 
