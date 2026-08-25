@@ -60,6 +60,18 @@ describe('v1 report modules', () => {
     expect(messages[1].content).toContain('不要编造')
   })
 
+  it('allows evidence-bound framework inference when M3 source tables lack pre-labeled F fields', () => {
+    const module = REPORT_MODULES.find((item) => item.key === 'material-review')!
+    const messages = buildModuleMessages(module, {
+      prompt: { key: module.key, systemPrompt: 'M3 SYSTEM', outputTemplate: 'M3 TEMPLATE', validation: '', inputDescription: '', purpose: '' },
+      sources: [{ name: '素材表.csv', kindV1: 'material-data', text: '完整文案：没胃口就做酸菜鱼' }],
+      upstream: [],
+      missingDependencies: []
+    })
+    expect(messages[1].content).toContain('系统归纳')
+    expect(messages[1].content).toContain('不得整章拒绝')
+  })
+
   it('assembles M1-M8 and validates the strict module anchors', () => {
     const outputs = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, `结果${module.id}`]))
     const report = assembleModuleReport(REPORT_MODULES, outputs, {})

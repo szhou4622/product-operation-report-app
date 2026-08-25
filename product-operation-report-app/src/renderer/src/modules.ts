@@ -71,7 +71,9 @@ export const MODULE_TASK_TYPES: Record<ModuleKey, ModelTaskType> = {
 
 export function isNoAnalysisOutput(text: string): boolean {
   const value = text.trim()
-  return /暂无分析|暂无可分析|暂无可确认的真实(?:产品)?卖点|无有效(?:组合|结果|数据)可输出|无[（(][^）)]*缺失|资料不足[^。\n]*(?:无法|不能)|缺少[^。\n]*(?:无法|不能)/u.test(value)
+  if (/^暂无分析/u.test(value)) return true
+  if (value.length > 1_500) return false
+  return /暂无可分析|暂无可确认的真实(?:产品)?卖点|无有效(?:组合|结果|数据)可输出|无[（(][^）)]*缺失|资料不足[^。\n]*(?:无法|不能)|缺少[^。\n]*(?:无法|不能)/u.test(value)
 }
 
 export function normalizeNoAnalysisOutput(text: string): string {
@@ -163,6 +165,16 @@ export function buildModuleMessages(module: ReportModule, context: ModuleContext
   const missing = context.missingDependencies.length
     ? `\n\n## 缺失依赖\n${context.missingDependencies.map((item) => `- ${item}`).join('\n')}\n必须在结果中明确注明这些限制。`
     : ''
+  const runtimeOverride = module.key === 'material-review'
+    ? [
+        '## 当前软件的素材框架归纳规则',
+        '若上传表已经有脚本框架类型、开头21式、中段种草维度和结尾6式，直接按原字段汇总。',
+        '若这些预标字段缺失，但存在完整文案、前三秒文案、3.x分类、内容形式、视角或标签，不得整章拒绝；必须逐条读取已有内容并进行有证据的“系统归纳”。',
+        '系统归纳时仍输出自有框架TOP5、竞品框架TOP5、补充机会TOP5；框架名称必须直接写出“3.x分类｜具体框架类型｜开头结构｜中段表达｜结尾结构”，不得只写“自有框架1/竞品框架1”。',
+        '每个框架必须写数据依据、主要人群和完整可复用方向；机会必须写竞品依据、自有现状和可补充方向。无法确认的单个字段写“未单独标注”，但不能因为缺少预标字段而停止归纳。',
+        '所有归纳只能来自本次素材的实际文案和标签，禁止补充素材中不存在的产品事实、功效、价格或案例。'
+      ].join('\n')
+    : ''
   return [
     { role: 'system', content: context.prompt.systemPrompt },
     {
@@ -175,6 +187,7 @@ export function buildModuleMessages(module: ReportModule, context: ModuleContext
         upstream,
         missing,
         context.requirements ? `## 用户补充要求\n${context.requirements}` : '',
+        runtimeOverride,
         '## 固定输出模板',
         context.prompt.outputTemplate,
         '只输出最终结果，不输出思考过程。所有事实、数字、频次、比例和品牌必须带真实来源。'
