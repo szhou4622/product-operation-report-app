@@ -74,7 +74,7 @@ export async function runModelRetry(
   while (
     !result.ok && retry < retries &&
     !/已停止|安全|内容过滤|积分不足|授权|403|401/i.test(result.error || '') &&
-    /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|terminated|network|网络连接失败|连接提前结束|服务繁忙|额度受限|429|HTTP\s*5\d\d|超时/i.test(result.error || '')
+    /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|terminated|network|网络连接失败|连接提前结束|服务繁忙|额度受限|429|HTTP\s*5\d\d|超时|没有返回内容|未生成内容|空响应|empty[_ -]?output|response stream was interrupted/i.test(result.error || '')
   ) {
     retry += 1
     onRetry?.(retry)

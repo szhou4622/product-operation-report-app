@@ -2567,7 +2567,17 @@ export const useStore = create<StoreState>((set, get) => ({
         updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
         return
       }
-      const result = await runModelRetry(
+      const moduleTaskContext = {
+        reportSessionId: activeReportSessionId,
+        taskType: MODULE_TASK_TYPES[module.key],
+        taskKey: savedTaskId,
+        billingRequestId: savedTaskId,
+        isVision: false,
+        sourceCount: sourceCountV1,
+        imageCount: imageCountV1,
+        stepId: module.key
+      } as const
+      let result = await runModelRetry(
         messages,
         () => {},
         (fn) => {
@@ -2577,16 +2587,7 @@ export const useStore = create<StoreState>((set, get) => ({
           if (isCurrentSession()) get()._post('assistant', `M${module.id} ${module.title}连接中断，正在重试（第${attempt}次）…`, 'narration')
         },
         3,
-        {
-          reportSessionId: activeReportSessionId,
-          taskType: MODULE_TASK_TYPES[module.key],
-          taskKey: savedTaskId,
-          billingRequestId: savedTaskId,
-          isVision: false,
-          sourceCount: sourceCountV1,
-          imageCount: imageCountV1,
-          stepId: module.key
-        }
+        moduleTaskContext
       )
       if (!isCurrentSession()) return
       if (!result.ok || !result.text.trim()) {
@@ -2600,10 +2601,36 @@ export const useStore = create<StoreState>((set, get) => ({
         }))
         return
       }
-      const moduleOutput = module.key === 'material-review'
+      let moduleOutput = module.key === 'material-review'
         ? normalizeMaterialReviewOutput(result.text)
         : result.text
-      const validationErrors = validateModuleOutput(module.key, moduleOutput)
+      let validationErrors = validateModuleOutput(module.key, moduleOutput)
+      if (validationErrors.length && !isNoAnalysisOutput(moduleOutput) && !isUserStop(result.error)) {
+        get()._post('assistant', `M${module.id} ${module.title}缺少必要内容，正在自动补全，不需要手动重试。`, 'narration')
+        const corrected = await runModelRetry(
+          [
+            ...messages,
+            {
+              role: 'user' as const,
+              content: `上一轮输出未通过完整性校验：${validationErrors.slice(0, 8).join('；')}。请从头重新完整输出本模块，严格遵守固定模板，不能省略、截断或只返回说明。`
+            }
+          ],
+          () => {},
+          (fn) => {
+            if (isCurrentSession()) set({ abortFn: fn })
+          },
+          undefined,
+          1,
+          { ...moduleTaskContext, stepId: `${module.key}-validation-retry` }
+        )
+        if (corrected.ok && corrected.text.trim()) {
+          result = corrected
+          moduleOutput = module.key === 'material-review'
+            ? normalizeMaterialReviewOutput(corrected.text)
+            : corrected.text
+          validationErrors = validateModuleOutput(module.key, moduleOutput)
+        }
+      }
       if (validationErrors.length) {
         const message = validationErrors.join('；')
         updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })

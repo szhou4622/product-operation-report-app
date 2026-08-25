@@ -67,21 +67,21 @@ MAX_MESSAGES = 64
 MAX_TEXT_CHARS = 2_000_000
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_ACTIVE_PER_LICENSE = 4
-MAX_OUTPUT_TOKENS = max(1024, min(32768, int(os.environ.get("POR_MAX_OUTPUT_TOKENS", "6000"))))
+MAX_OUTPUT_TOKENS = max(1024, min(32768, int(os.environ.get("POR_MAX_OUTPUT_TOKENS", "12000"))))
 TASK_OUTPUT_RESERVES = {
     "source_clean": 2_500,
     "summary": 3_500,
     "analysis_step": 4_000,
     "final_part": MAX_OUTPUT_TOKENS,
     "revision_part": MAX_OUTPUT_TOKENS,
-    "module_product_info": 3500,
-    "module_platform_audience": 4500,
-    "module_material_review": 4500,
+    "module_product_info": 5000,
+    "module_platform_audience": 8000,
+    "module_material_review": 10000,
     "module_benchmark": 5000,
-    "module_selling_points": 4500,
-    "module_voc": 5500,
-    "module_ranking": 6000,
-    "module_audience_sp_scene": 6000,
+    "module_selling_points": 7000,
+    "module_voc": 10000,
+    "module_ranking": 10000,
+    "module_audience_sp_scene": 10000,
 }
 STREAM_HEARTBEAT_SECONDS = 20.0
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?::fallback:[1-3])?$", re.I)
@@ -1130,7 +1130,7 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
         search_cost_cny = search_calls * WEB_SEARCH_USD_PER_CALL * USD_CNY_RATE
         cost_cny += search_cost_cny
         charged += math.ceil(search_cost_cny * POINTS_PER_CNY * CHARGE_MULTIPLIER * 1000)
-    if not sent_content and not usage:
+    if not sent_content:
         charged = 0
         cost_cny = 0
     task_type = "model"

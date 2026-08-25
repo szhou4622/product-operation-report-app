@@ -138,6 +138,12 @@ class ProxyLedgerTests(unittest.TestCase):
         self.assertEqual(benchmark["tool_choice"], "auto")
         self.assertNotIn("tools", normal)
 
+    def test_large_report_modules_have_non_truncating_output_reserves(self) -> None:
+        self.assertGreaterEqual(proxy.MAX_OUTPUT_TOKENS, 12_000)
+        self.assertGreaterEqual(proxy.TASK_OUTPUT_RESERVES["module_material_review"], 10_000)
+        self.assertGreaterEqual(proxy.TASK_OUTPUT_RESERVES["module_ranking"], 10_000)
+        self.assertGreaterEqual(proxy.TASK_OUTPUT_RESERVES["module_audience_sp_scene"], 10_000)
+
     def test_same_running_task_is_not_submitted_twice(self) -> None:
         first_request_id = "d4f81b86-1a5b-4e39-830e-1271165bb8ee"
         second_request_id = "e4f81b86-1a5b-4e39-830e-1271165bb8ee"
