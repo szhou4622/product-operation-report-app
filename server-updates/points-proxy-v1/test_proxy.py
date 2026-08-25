@@ -103,6 +103,28 @@ class ProxyLedgerTests(unittest.TestCase):
         finally:
             proxy.WEB_SEARCH_USD_PER_CALL = previous_price
 
+    def test_benchmark_without_explicit_search_event_is_not_labeled_as_search(self) -> None:
+        request_id = "c5f81b86-1a5b-4e39-830e-1271165bb8ee"
+        proxy.reserve_request(
+            self.session, request_id, "report-no-search", "module:v1:benchmark-no-search",
+            "module_benchmark", "gpt-5.6-sol", 1, 1000,
+        )
+        proxy.settle_request(
+            self.session, request_id, "success", "gpt-5.6-sol",
+            {"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 0,
+             "cache_creation_input_tokens": 0},
+            1000, 600, True, search_calls=0,
+        )
+        with proxy.database() as db:
+            request = db.execute(
+                "SELECT search_calls FROM model_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            ledger = db.execute(
+                "SELECT description FROM ledger WHERE request_id=?", (request_id,)
+            ).fetchone()
+        self.assertEqual(request["search_calls"], 0)
+        self.assertEqual(ledger["description"], "M4 对标推荐")
+
     def test_benchmark_search_budget_stops_the_eleventh_upstream_attempt(self) -> None:
         report_id = "report-search-budget"
         previous_limit = proxy.WEB_SEARCH_REPORT_LIMIT
@@ -135,8 +157,91 @@ class ProxyLedgerTests(unittest.TestCase):
         proxy.apply_server_task_options(benchmark, "module_benchmark")
         proxy.apply_server_task_options(normal, "module_product_info")
         self.assertEqual(benchmark["tools"], [{"type": "web_search"}])
-        self.assertEqual(benchmark["tool_choice"], "auto")
+        self.assertEqual(benchmark["tool_choice"], "required")
+        self.assertEqual(benchmark["include"], ["web_search_call.action.sources"])
         self.assertNotIn("tools", normal)
+
+    def test_benchmark_request_is_converted_to_responses_api_shape(self) -> None:
+        body = proxy.responses_request_body({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": "只使用可靠来源"},
+                {"role": "user", "content": "搜索酸菜品牌"},
+            ],
+            "max_completion_tokens": 5000,
+        })
+        self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual(body["instructions"], "只使用可靠来源")
+        self.assertEqual(body["input"], [{"role": "user", "content": "搜索酸菜品牌"}])
+        self.assertEqual(body["tool_choice"], "required")
+        self.assertEqual(body["include"], ["web_search_call.action.sources"])
+        self.assertEqual(body["tools"][0]["type"], "web_search")
+        self.assertTrue(body["tools"][0]["external_web_access"])
+        self.assertEqual(body["tools"][0]["return_token_budget"], "unlimited")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+
+    def test_responses_completed_event_exposes_text_usage_and_search_sources(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "model": "gpt-5.6-sol",
+                "usage": {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150,
+                          "input_tokens_details": {"cached_tokens": 20}},
+                "output": [
+                    {"type": "web_search_call", "id": "search-1", "action": {
+                        "type": "search", "query": "酸菜品牌 天猫",
+                        "sources": [{"title": "旗舰店", "url": "https://brand.tmall.com/store"}],
+                    }},
+                    {"type": "message", "content": [{"type": "output_text", "text": "真实结果"}]},
+                ],
+            },
+        }
+        usage = proxy.provider_usage(event)
+        self.assertEqual(usage["input_tokens"], 120)
+        self.assertEqual(usage["cached_input_tokens"], 20)
+        self.assertEqual(proxy.responses_output_text(event["response"]), "真实结果")
+        calls, evidence = proxy.search_event_details(event)
+        self.assertIn({"callId": "search-1", "query": "酸菜品牌 天猫"}, calls)
+        self.assertEqual(evidence[0]["url"], "https://brand.tmall.com/store")
+
+    def test_benchmark_task_has_a_server_enforced_model_route(self) -> None:
+        self.assertEqual(proxy.model_for_task("module_benchmark", "gpt-5.6-sol"), "gpt-5.6-sol")
+        self.assertEqual(proxy.model_for_task("module_benchmark", "gpt-5.5"), "gpt-5.5")
+        with self.assertRaises(proxy.ApiError):
+            proxy.model_for_task("module_benchmark", "claude-sonnet-4-6")
+        self.assertEqual(proxy.model_for_task("module_product_info", "gpt-5.5"), "gpt-5.5")
+
+    def test_gpt56_sol_price_is_registered_without_changing_gpt55(self) -> None:
+        self.assertEqual(proxy.MODEL_PRICES["gpt-5.5"], (1.25, 7.5, 0.125, 0.8))
+        self.assertEqual(proxy.MODEL_PRICES["gpt-5.6-sol"], (1.25, 10.0, 0.125, 1.0))
+
+    def test_structured_search_events_extract_only_public_evidence(self) -> None:
+        calls, evidence = proxy.search_event_details({
+            "type": "response.web_search_call.completed",
+            "id": "search-1",
+            "action": {
+                "query": "酸菜品牌 天猫",
+                "sources": [
+                    {"title": "品牌旗舰店", "url": "https://example.tmall.com/store"},
+                    {"title": "本机", "url": "http://127.0.0.1/private"},
+                    {"title": "危险", "url": "javascript:alert(1)"},
+                ],
+            },
+        })
+        self.assertEqual(calls, [{"callId": "search-1", "query": "酸菜品牌 天猫"}])
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["url"], "https://example.tmall.com/store")
+        self.assertEqual(evidence[0]["platform"], "天猫")
+
+    def test_citations_without_a_search_call_do_not_fake_an_invocation(self) -> None:
+        calls, evidence = proxy.search_event_details({
+            "choices": [{"delta": {"annotations": [{
+                "type": "url_citation",
+                "url_citation": {"title": "公开页面", "url": "https://example.com/page"},
+            }]}}],
+        })
+        self.assertEqual(calls, [])
+        self.assertEqual(len(evidence), 1)
 
     def test_large_report_modules_have_non_truncating_output_reserves(self) -> None:
         self.assertGreaterEqual(proxy.MAX_OUTPUT_TOKENS, 12_000)

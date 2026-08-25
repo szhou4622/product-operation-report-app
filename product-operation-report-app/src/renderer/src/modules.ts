@@ -4,6 +4,8 @@ import type {
   ModuleKey,
   ModulePrompt,
   ReportModule,
+  SearchEvidence,
+  SearchVerificationStatus,
   SourceKindV1,
   ModuleRunState
 } from '../../shared/types'
@@ -29,6 +31,11 @@ export interface SourceSufficiency {
   skipped: Map<ModuleKey, string>
   partial: Map<ModuleKey, string>
   blocked: string | null
+}
+
+export interface BenchmarkVerification {
+  status: SearchVerificationStatus
+  evidence: SearchEvidence[]
 }
 
 export const SOURCE_KIND_LABELS: Record<SourceKindV1, string> = {
@@ -91,10 +98,54 @@ export function fingerprintModuleMessages(messages: ChatMessage[]): string {
   return `v1-${(hash >>> 0).toString(16).padStart(8, '0')}-${value.length}`
 }
 
-export function normalizeBenchmarkDimension(dimension: string, raw: string): string {
+const BENCHMARK_PLATFORMS = ['天猫', '抖音', '视频号', '小红书'] as const
+const BENCHMARK_PLACEHOLDER = /品牌\s*[A-Z甲乙丙丁]|某品牌|示例品牌|TOP\s*\d+|自有框架\d+|竞品框架\d+/iu
+
+function benchmarkCoverage(evidence: SearchEvidence[]): string {
+  const found = new Set(evidence.map((item) => item.platform))
+  return `平台覆盖：${[
+    ...BENCHMARK_PLATFORMS.map((platform) => `${platform}${found.has(platform) ? '找到可靠来源' : '未找到可靠来源'}`),
+    `其他公开来源${found.has('其他') ? '找到可靠来源' : '未找到可靠来源'}`
+  ].join('｜')}`
+}
+
+function benchmarkEvidenceList(evidence: SearchEvidence[]): string {
+  return evidence.slice(0, 12).map((item, index) =>
+    `${index + 1}. ${item.platform}｜${item.title || '公开页面'}｜${item.url}`
+  ).join('\n')
+}
+
+function verifiedRecommendationBlocks(body: string, evidence: SearchEvidence[]): string[] {
+  const evidenceUrls = new Set(evidence.map((item) => item.url))
+  return body.split(/(?=推荐\s*\d+)/u).flatMap((block) => {
+    if (!/^推荐\s*\d+/u.test(block.trim())) return []
+    const brand = block.match(/品牌\s*[：:]\s*([^\r\n]+)/u)?.[1]?.trim() || ''
+    if (!brand || BENCHMARK_PLACEHOLDER.test(brand)) return []
+    if (!/对标产品\/系列\s*[：:]\s*\S/u.test(block)) return []
+    if (!/匹配点\s*[：:]\s*\S/u.test(block) || !/推荐理由\s*[：:]\s*\S/u.test(block)) return []
+    const urls = block.match(/https?:\/\/[^\s)>\]｜]+/gu) || []
+    if (!urls.some((url) => evidenceUrls.has(url.replace(/[，。；,.;]+$/u, '')))) return []
+    return [block.trim()]
+  }).slice(0, 3)
+}
+
+export function normalizeBenchmarkDimension(
+  dimension: string,
+  raw: string,
+  verification?: BenchmarkVerification
+): string {
   const value = raw.trim()
+  const unavailable = (reason: string): string => [
+    `### ${dimension}`,
+    verification?.status === 'attempted' ? '检索状态：已尝试联网检索，但未取得可核验来源' : '检索状态：仅基于已上传资料',
+    benchmarkCoverage([]),
+    '',
+    '暂无可靠对标',
+    '',
+    `说明：${reason}`
+  ].join('\n')
   if (!value || /暂无可靠对标/u.test(value) && value.length < 120) {
-    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+    return unavailable('本轮没有取得可追溯的公开页面、官方账号或用户资料证据。')
   }
   const heading = new RegExp(`#{1,6}\\s*${dimension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'u')
   const match = heading.exec(value)
@@ -103,14 +154,52 @@ export function normalizeBenchmarkDimension(dimension: string, raw: string): str
     .filter((line) => !/^\s*(?:我会|我正在|接下来|下面将|本次将)/u.test(line))
     .join('\n')
     .trim()
+  if (verification) {
+    const evidence = verification.evidence.filter((item, index, all) =>
+      all.findIndex((candidate) => candidate.url === item.url) === index
+    )
+    if (verification.status === 'verified' && evidence.length) {
+      const recommendations = verifiedRecommendationBlocks(body, evidence)
+      if (!recommendations.length) {
+        return [
+          `### ${dimension}`,
+          `检索状态：已核验公开来源 ${evidence.length} 条`,
+          benchmarkCoverage(evidence),
+          '',
+          '暂无可靠对标',
+          '',
+          '说明：公开来源已返回，但模型没有给出字段完整、来源可反查的品牌推荐。',
+          '',
+          '已核验来源：',
+          benchmarkEvidenceList(evidence)
+        ].join('\n')
+      }
+      const latest = evidence.map((item) => Date.parse(item.retrievedAt)).filter(Number.isFinite).sort((a, b) => b - a)[0]
+      return [
+        `### ${dimension}`,
+        `检索状态：已核验公开来源 ${evidence.length} 条`,
+        latest ? `检索时间：${new Date(latest).toISOString()}` : '',
+        benchmarkCoverage(evidence),
+        '',
+        recommendations.join('\n\n'),
+        '',
+        '已核验来源：',
+        benchmarkEvidenceList(evidence)
+      ].filter(Boolean).join('\n')
+    }
+    if (/来源\s*[：:]\s*用户资料/u.test(body) && /品牌\s*[：:]\s*\S/u.test(body) && !BENCHMARK_PLACEHOLDER.test(body)) {
+      return `### ${dimension}\n检索状态：仅基于已上传资料\n${benchmarkCoverage([])}\n\n${body}`
+    }
+    return unavailable('CCG没有返回同时包含结构化搜索调用和公网来源链接的结果，软件未将模型记忆当作搜索证据。')
+  }
   if (
     !/品牌\s*[：:]/u.test(body) &&
     /联网检索工具|无法联网检索|未完成联网检索|未完成检索|未执行.*联网检索/u.test(body)
   ) {
-    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+    return unavailable('本轮没有取得可追溯的公开页面或官方账号结果。')
   }
   if (!/品牌\s*[：:]/u.test(body) && !/来源\s*[：:]/u.test(body)) {
-    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+    return unavailable('本轮没有取得可追溯的公开页面或官方账号结果。')
   }
   return `### ${dimension}\n${body || '暂无可靠对标'}`
 }
@@ -246,6 +335,7 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
   if (key === 'benchmark-brands' && !ordered(value, ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案'])) {
     errors.push('对标模块必须完整包含7个固定维度并保持顺序')
   }
+  if (key === 'benchmark-brands' && BENCHMARK_PLACEHOLDER.test(value)) errors.push('对标模块包含无明确对象的占位品牌或排名')
   if (key === 'selling-points' && !/品质|价格|健康|情感/u.test(value)) errors.push('产品卖点缺少四大需求分类')
   if (key === 'voc' && (!/频次/u.test(value) || !/占比/u.test(value))) errors.push('VOC结果必须包含频次和占比')
   if (key === 'selling-point-ranking' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')

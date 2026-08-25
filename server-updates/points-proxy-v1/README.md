@@ -31,7 +31,7 @@ sudo /usr/local/sbin/product-report-rotate-key set \
   --profile ccg-main \
   --key-id 2026-08-b \
   --base-url https://ccg-cli.online/v1 \
-  --models gpt-5.5,claude-sonnet-4-6,gemini-3-flash,kimi-k2.6 \
+  --models gpt-5.5,gpt-5.6-sol,claude-sonnet-4-6,gemini-3-flash,kimi-k2.6 \
   --activate
 ```
 

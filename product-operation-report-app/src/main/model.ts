@@ -5,6 +5,8 @@ import type {
   ModelListResult,
   ModelProfile,
   ModelTokenUsage,
+  SearchEvidence,
+  SearchVerificationStatus,
   TestModelOptions,
   TestModelResult
 } from '../shared/types'
@@ -82,6 +84,49 @@ function missingUsage(model: string): ModelTokenUsage {
     cacheCreationInputTokens: 0,
     totalTokens: 0,
     model: model.slice(0, 200)
+  }
+}
+
+function safePublicSearchUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value || value.length > 4096) return undefined
+  try {
+    const parsed = new URL(value)
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return undefined
+    const host = parsed.hostname.replace(/^\[|\]$/gu, '').replace(/\.$/u, '').toLowerCase()
+    if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return undefined
+    const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u)?.slice(1).map(Number)
+    if (ipv4 && (
+      ipv4.some((part) => part > 255) || ipv4[0] === 0 || ipv4[0] === 10 || ipv4[0] === 127 ||
+      (ipv4[0] === 169 && ipv4[1] === 254) || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31) ||
+      (ipv4[0] === 192 && ipv4[1] === 168) || ipv4[0] >= 224
+    )) return undefined
+    if (host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:')) return undefined
+    return value
+  } catch {
+    return undefined
+  }
+}
+
+function normalizeSearchEvidence(raw: unknown): SearchEvidence | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const row = raw as Record<string, unknown>
+  const url = safePublicSearchUrl(row.url)
+  const callId = typeof row.callId === 'string' ? row.callId.slice(0, 200) : ''
+  const retrievedAt = typeof row.retrievedAt === 'string' && Number.isFinite(Date.parse(row.retrievedAt))
+    ? row.retrievedAt
+    : ''
+  const allowedPlatforms = new Set<SearchEvidence['platform']>(['天猫', '抖音', '视频号', '小红书', '其他'])
+  const platform = typeof row.platform === 'string' && allowedPlatforms.has(row.platform as SearchEvidence['platform'])
+    ? row.platform as SearchEvidence['platform']
+    : '其他'
+  if (!url || !callId || !retrievedAt) return undefined
+  return {
+    callId,
+    url,
+    platform,
+    ...(typeof row.query === 'string' && row.query ? { query: row.query.slice(0, 500) } : {}),
+    ...(typeof row.title === 'string' && row.title ? { title: row.title.slice(0, 300) } : {}),
+    retrievedAt
   }
 }
 
@@ -309,6 +354,7 @@ export async function chatStream(
 ): Promise<void> {
   let full = ''
   let latestUsage: ModelTokenUsage | undefined
+  const seenSearchEvidence = new Set<string>()
   let timeoutReason: 'first-byte' | 'idle' | 'absolute' | undefined
   let idleTimer: ReturnType<typeof setTimeout> | undefined
   let receivedBodyChunk = false
@@ -449,6 +495,11 @@ export async function chatStream(
       }
       try {
         const json = JSON.parse(payload) as {
+          type?: string
+          status?: SearchVerificationStatus
+          search_calls?: number
+          evidence_count?: number
+          evidence?: unknown
           error?: { message?: string } | string
           choices?: {
             delta?: { content?: string }
@@ -457,6 +508,25 @@ export async function chatStream(
           }[]
           usage?: unknown
           model?: unknown
+        }
+        if (json.type === 'por.search_status') {
+          if (json.status === 'verified' || json.status === 'attempted' || json.status === 'unavailable') {
+            onEvent({
+              type: 'search_status',
+              status: json.status,
+              searchCalls: tokenNumber(json.search_calls),
+              evidenceCount: tokenNumber(json.evidence_count)
+            })
+          }
+          return 'continue'
+        }
+        if (json.type === 'por.search_evidence') {
+          const evidence = normalizeSearchEvidence(json.evidence)
+          if (evidence && !seenSearchEvidence.has(evidence.url)) {
+            seenSearchEvidence.add(evidence.url)
+            onEvent({ type: 'search_evidence', evidence })
+          }
+          return 'continue'
         }
         emitUsage(json.usage, json.model)
         if (json.error) {

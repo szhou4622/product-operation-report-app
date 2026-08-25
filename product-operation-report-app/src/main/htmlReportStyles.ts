@@ -498,6 +498,26 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     gap: clamp(28px, 4vw, 56px);
   }
   .profile-board { display: grid; gap: 34px; }
+  .profile-platform-index {
+    display: flex;
+    gap: 18px;
+    align-items: center;
+    justify-content: space-between;
+    margin: 0 0 26px;
+    padding: 14px 0;
+    border-top: 1px solid var(--line-strong);
+    border-bottom: 1px solid var(--line);
+  }
+  .profile-platform-index strong { font-size: 14px; }
+  .profile-platform-index div { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .profile-platform-index span {
+    padding: 6px 10px;
+    color: var(--accent-strong);
+    background: var(--paper-soft);
+    border: 1px solid var(--line);
+    font-size: 12px;
+    font-weight: 750;
+  }
   .profile-panel {
     padding: 0 0 26px;
     border-bottom: 1px solid var(--line-strong);
@@ -1027,6 +1047,8 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     .signal-strip { grid-template-columns: minmax(0, 1fr); }
     .signal-strip > div { padding: 17px 0; border-right: 0; border-bottom: 1px solid var(--line); }
     .signal-strip > div:last-child { border-bottom: 0; }
+    .profile-platform-index { display: grid; justify-content: stretch; }
+    .profile-platform-index div { justify-content: flex-start; }
     .decision-dashboard, .chapter-index { padding: 42px 22px; }
     .priority-lane { grid-template-columns: 46px minmax(0, 1fr); gap: 14px; }
     .priority-lane p { grid-column: 2; }

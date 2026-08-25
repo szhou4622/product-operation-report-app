@@ -1,10 +1,24 @@
-import type { ChatStreamEvent, ModelProfile } from '../shared/types'
+import type { ChatStreamEvent, ModelProfile, ModelTaskType } from '../shared/types'
 
 const RECOVERABLE_FAILURES = new Set([
   'empty_output',
   'model_unavailable',
   'provider_route_unavailable'
 ])
+
+export function profilesForTask(profiles: ModelProfile[], taskType: ModelTaskType): ModelProfile[] {
+  if (taskType !== 'module_benchmark' || !profiles.length) return profiles
+  const gpt55 = profiles.find((profile) => profile.model.toLowerCase() === 'gpt-5.5') || profiles[0]
+  return [
+    {
+      ...gpt55,
+      id: `${gpt55.id}-benchmark-sol`,
+      name: '内置对标研究服务',
+      model: 'gpt-5.6-sol'
+    },
+    { ...gpt55, id: `${gpt55.id}-benchmark-fallback`, model: 'gpt-5.5' }
+  ]
+}
 
 export interface ModelFallbackDecisionInput {
   failureKind?: string

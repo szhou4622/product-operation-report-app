@@ -216,6 +216,17 @@ export interface ChatMessage {
   content: string | ContentPart[]
 }
 
+export type SearchVerificationStatus = 'verified' | 'attempted' | 'unavailable'
+
+export interface SearchEvidence {
+  callId: string
+  query?: string
+  title?: string
+  url: string
+  platform: '天猫' | '抖音' | '视频号' | '小红书' | '其他'
+  retrievedAt: string
+}
+
 /** 模型请求在一份报告中的用途。字段名会沿用到后续服务器代理。 */
 export type ModelTaskType =
   | 'source_clean'
@@ -522,6 +533,8 @@ export interface ProjectTaskSnapshot {
   coverage?: CleaningCoverage
   /** Hash of the exact source/upstream/prompt context used to create this result. */
   inputFingerprint?: string
+  searchStatus?: SearchVerificationStatus
+  searchEvidence?: SearchEvidence[]
   updatedAt: string
 }
 
@@ -612,6 +625,8 @@ export interface ParsedFile {
 export type ChatStreamEvent =
   | { type: 'chunk'; delta: string }
   | { type: 'usage'; usage: ModelTokenUsage }
+  | { type: 'search_status'; status: SearchVerificationStatus; searchCalls: number; evidenceCount: number }
+  | { type: 'search_evidence'; evidence: SearchEvidence }
   | { type: 'done'; full: string; usage: ModelTokenUsage }
   | { type: 'error'; message: string; usage: ModelTokenUsage }
 

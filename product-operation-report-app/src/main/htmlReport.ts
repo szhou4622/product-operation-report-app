@@ -487,7 +487,7 @@ function renderFactsVisual(
 
 function renderPercentBars(
   plan: HtmlReportSectionPresentation,
-  title = '一方数据分口径对比'
+  title = '分口径数据对比'
 ): string {
   const facets = plan.percentFacets
   if (facets.length === 0) return ''
@@ -502,13 +502,13 @@ function renderPercentBars(
   )
   return renderFigure(
     title,
-    `<div class="profile-board">${grouped
-      .map(([groupName, groupFacets], groupIndex) => {
+    `${grouped.length > 1 ? `<div class="profile-platform-index"><strong>已识别 ${grouped.length} 个平台</strong><div>${grouped.map(([groupName]) => `<span>${escapeHtml(shorten(groupName, 28))}</span>`).join('')}</div></div>` : ''}<div class="profile-board">${grouped
+      .map(([groupName, groupFacets]) => {
         const statFacets = groupFacets.filter((facet) => facet.mode === 'stat')
         const barFacets = groupFacets.filter((facet) => facet.mode === 'bars')
         return `<section class="profile-panel">
           <header class="profile-panel__head">
-            <span>${String(groupIndex + 1).padStart(2, '0')}</span>
+            <span>平台</span>
             <h3>${escapeHtml(shorten(groupName, 52))}</h3>
           </header>
           ${
@@ -1014,7 +1014,7 @@ function renderSectionVisual(
       visual = renderFactsVisual(section, plan)
       break
     case 'percent-facets':
-      visual = renderPercentBars(plan)
+      visual = renderPercentBars(plan, section.number === 'M2' ? '平台成交画像' : '分口径数据对比')
       break
     case 'material-methods':
       visual = renderMaterialVisual(section, plan)

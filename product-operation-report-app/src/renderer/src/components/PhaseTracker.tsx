@@ -13,7 +13,7 @@ const ANALYSIS_COPY: Record<number, { title: string; desc: string }> = {
   1: { title: '产品信息', desc: '9维客观产品事实' },
   2: { title: '平台人群数据', desc: '按平台隔离成交画像' },
   3: { title: '内容素材判断', desc: '自有与竞品框架汇总' },
-  4: { title: '对标推荐', desc: '7维真实品牌搜索' },
+  4: { title: '对标推荐', desc: '7维公开资料对标' },
   5: { title: '产品卖点', desc: '四大需求买点翻译' },
   6: { title: '用户真实需求VOC', desc: '频次、占比与代表原话' },
   7: { title: '总结卖点排序', desc: '真实卖点TOP10分档' },
@@ -57,7 +57,9 @@ export default function PhaseTracker(): JSX.Element {
     id: module.id,
     key: module.key,
     title: ANALYSIS_COPY[module.id]?.title ?? module.title,
-    desc: ANALYSIS_COPY[module.id]?.desc ?? ''
+    desc: module.key === 'benchmark-brands' && moduleStates[module.key]?.status === 'done' && moduleStates[module.key]?.message
+      ? moduleStates[module.key]!.message!
+      : ANALYSIS_COPY[module.id]?.desc ?? ''
   }))
   const isTaskDone = (id: number): boolean => {
     return Boolean(artifacts[id])

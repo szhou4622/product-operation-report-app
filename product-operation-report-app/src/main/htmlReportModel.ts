@@ -307,8 +307,10 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
   }
   if (number === 'M2') {
     const dimensions = /^(?:\d+[.、]\s*)?(?:性别|年龄|地域|地区|人群属性|消费力|购买偏好|婚育|城市线级)$/u
+    const regionCategory = /(?:省|市|自治区|特别行政区|地区|区域|一线|二线|三线|四线|五线|华东|华南|华北|华中|东北|西北|西南|全国)$/u
     let platform = '平台待确认'
     const rows: string[][] = []
+    const seenRows = new Set<string>()
     for (let index = 0; index < lines.length; index++) {
       if (/^平台\s*[：:]/u.test(lines[index])) {
         platform = valueAfter(lines[index], '平台') || platform
@@ -316,13 +318,20 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
       }
       if (!dimensions.test(lines[index])) continue
       const dimension = lines[index].replace(/^\d+[.、]\s*/u, '')
-      const info = lines.slice(index + 1, index + 5).find((line) => /^信息\s*[：:]/u.test(line)) || ''
+      const info = lines.slice(index + 1, index + 5).find((line) => /^信息(?:冲突)?\s*[：:]/u.test(line)) || ''
       const source = lines.slice(index + 1, index + 6).find((line) => /^来源\s*[：:]/u.test(line)) || ''
-      const value = valueAfter(info, '信息')
+      const value = info.replace(/^信息(?:冲突)?\s*[：:]\s*/u, '').trim()
       const items = value.split(/[，,；;]/u).map((item) => item.trim()).filter(Boolean)
       for (const item of items.length ? items : [value || '暂无分析']) {
         const metric = item.match(/^(.*?)([+-]?\d+(?:\.\d+)?\s*%)$/u)
-        rows.push([platform, dimension, metric?.[1]?.trim() || dimension, metric?.[2] || item, valueAfter(source, '来源') || '来源未标注'])
+        const category = metric?.[1]?.trim() || dimension
+        const effectiveDimension = /^(?:地域|地区)$/u.test(dimension) && !regionCategory.test(category) ? '' : dimension
+        if (!effectiveDimension) continue
+        const row = [platform, effectiveDimension, category, metric?.[2] || item, valueAfter(source, '来源') || '来源未标注']
+        const key = row.slice(0, 4).join('\u0000')
+        if (seenRows.has(key)) continue
+        seenRows.add(key)
+        rows.push(row)
       }
     }
     return rows.length ? [{ context: '分平台成交画像', headers: ['平台', '维度', '类别', '数据', '来源'], rows }] : []

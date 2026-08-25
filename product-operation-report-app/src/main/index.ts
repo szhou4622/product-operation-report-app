@@ -20,7 +20,7 @@ import type {
 import { getActiveProfile, getActiveProfiles, loadRendererSettings, saveRendererSettings } from './settings'
 import { getManagedModelState } from './managedModel'
 import { chatStream, listModels, testModel } from './model'
-import { runModelFallbackSequence } from './modelFallback'
+import { profilesForTask, runModelFallbackSequence } from './modelFallback'
 import {
   cancelParsingForOwner,
   disposeParseService,
@@ -652,7 +652,7 @@ ipcMain.on(
     }
     let profiles = getActiveProfiles()
     const managedState = getManagedModelState()
-    const primaryProfile = profiles[0]
+    let primaryProfile = profiles[0]
     if (!primaryProfile) {
       const managed = getManagedModelState()
       event.sender.send(channel, {
@@ -673,6 +673,8 @@ ipcMain.on(
       })
       return
     }
+    profiles = profilesForTask(profiles, context.taskType)
+    primaryProfile = profiles[0]
     const controller = new AbortController()
     try {
       chatRequests.claim(id, event.sender.id, controller)
@@ -751,7 +753,7 @@ ipcMain.on(
                 if (ev.delta.trim()) hasVisibleOutput = true
               }
               else if (ev.type === 'usage') usage = ev.usage
-              else {
+              else if (ev.type === 'done' || ev.type === 'error') {
                 terminal = ev
                 usage = ev.usage
                 if (ev.type === 'done') outputChars = ev.full.length

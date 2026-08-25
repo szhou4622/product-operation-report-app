@@ -1,10 +1,16 @@
-import type { ChatMessage, ModelTaskContext } from '../../../shared/types'
+import type { ChatMessage, ModelTaskContext, SearchEvidence, SearchVerificationStatus } from '../../../shared/types'
 import { buildFinalReportPartMessages, type PriorOutput } from '../sop'
 import { FINAL_REPORT_PARTS } from '../reportTemplate'
 import { validateFinalReportPart } from '../validate'
 import { friendlyError } from './errors'
 
-export interface ModelRunResult { ok: boolean; text: string; error?: string }
+export interface ModelRunResult {
+  ok: boolean
+  text: string
+  error?: string
+  searchStatus?: SearchVerificationStatus
+  searchEvidence?: SearchEvidence[]
+}
 
 export function runModel(
   messages: ChatMessage[],
@@ -17,6 +23,9 @@ export function runModel(
     let settled = false
     let publishTimer: number | null = null
     let lastPublished = ''
+    let searchStatus: SearchVerificationStatus | undefined
+    const searchEvidence: SearchEvidence[] = []
+    const seenSearchUrls = new Set<string>()
     const publish = (text: string): void => {
       if (text === lastPublished) return
       lastPublished = text
@@ -47,15 +56,21 @@ export function runModel(
             }, 60)
           }
         },
-        onDone: (full) => done({ ok: true, text: full || acc }),
-        onError: (message) => done({ ok: false, text: acc, error: friendlyError(message) })
+        onSearchStatus: (status) => { searchStatus = status },
+        onSearchEvidence: (evidence) => {
+          if (seenSearchUrls.has(evidence.url)) return
+          seenSearchUrls.add(evidence.url)
+          searchEvidence.push(evidence)
+        },
+        onDone: (full) => done({ ok: true, text: full || acc, searchStatus, searchEvidence }),
+        onError: (message) => done({ ok: false, text: acc, error: friendlyError(message), searchStatus, searchEvidence })
       })
       setAbort(() => {
         handle.abort()
-        done({ ok: false, text: acc, error: '已停止' })
+        done({ ok: false, text: acc, error: '已停止', searchStatus, searchEvidence })
       })
     } catch (error) {
-      done({ ok: false, text: acc, error: friendlyError(error) })
+      done({ ok: false, text: acc, error: friendlyError(error), searchStatus, searchEvidence })
     }
   })
 }

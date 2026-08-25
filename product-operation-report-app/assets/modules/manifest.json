@@ -29,9 +29,9 @@
       "id": "M4",
       "title": "对标推荐",
       "fileName": "M4-benchmark-brands.md",
-      "systemPromptSha256": "edb08ebe8cf2cd65158936be07b9f21670b554f6830ee96ad640a5f6597efbd5",
-      "systemPromptChars": 4987,
-      "outputTemplateChars": 489
+      "systemPromptSha256": "89bf1a6718de32b6d7f4cc43745f78d52f0f428c56bd65328f8320782b6277ba",
+      "systemPromptChars": 5409,
+      "outputTemplateChars": 588
     },
     {
       "id": "M5",

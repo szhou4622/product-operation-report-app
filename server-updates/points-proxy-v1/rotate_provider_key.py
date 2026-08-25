@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-ALLOWED_MODELS = ("gpt-5.5", "claude-sonnet-4-6", "gemini-3-flash", "kimi-k2.6")
+ALLOWED_MODELS = ("gpt-5.5", "gpt-5.6-sol", "claude-sonnet-4-6", "gemini-3-flash", "kimi-k2.6")
 DEFAULT_PATH = os.environ.get("POR_PROVIDER_KEYS_FILE", "/etc/product-operation-report/provider-keys.json")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 

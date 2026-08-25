@@ -118,9 +118,41 @@ describe('v1 report modules', () => {
     expect(fingerprintModuleMessages(base)).toBe(fingerprintModuleMessages(base))
     expect(fingerprintModuleMessages(base)).not.toBe(fingerprintModuleMessages([{ role: 'user', content: 'B' }]))
     expect(normalizeBenchmarkDimension('同人群', '我会先核验。### 同人群\n推荐1\n品牌：A')).toBe('### 同人群\n推荐1\n品牌：A')
-    expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toContain('平台覆盖：天猫｜抖音｜视频号｜小红书')
-    expect(normalizeBenchmarkDimension('同产品', '平台覆盖：天猫未检索\n当前环境未提供联网检索工具')).toContain('已按四平台要求执行公开检索')
+    expect(normalizeBenchmarkDimension('同情绪', '暂无可靠对标')).toContain('天猫未找到可靠来源')
+    expect(normalizeBenchmarkDimension('同产品', '平台覆盖：天猫未检索\n当前环境未提供联网检索工具')).not.toContain('已执行公开检索')
     expect(normalizeBenchmarkOutput('### 同产品\n当前环境未提供联网检索工具')).toContain('### 同解决方案')
+  })
+
+  it('accepts only verified public URLs for a new benchmark recommendation', () => {
+    const output = normalizeBenchmarkDimension('同产品', [
+      '### 同产品',
+      '推荐1',
+      '品牌：真实品牌',
+      '对标产品/系列：旗舰系列',
+      '匹配点：同类产品形态',
+      '推荐理由：公开旗舰店仍在售',
+      '来源：https://brand.tmall.com/store'
+    ].join('\n'), {
+      status: 'verified',
+      evidence: [{
+        callId: 'search-1', query: '真实品牌 天猫', title: '旗舰店',
+        url: 'https://brand.tmall.com/store', platform: '天猫', retrievedAt: '2026-08-25T00:00:00Z'
+      }]
+    })
+    expect(output).toContain('检索状态：已核验公开来源 1 条')
+    expect(output).toContain('品牌：真实品牌')
+    expect(output).toContain('天猫找到可靠来源')
+  })
+
+  it('does not present model memory or placeholder brands as verified search', () => {
+    const unverified = normalizeBenchmarkDimension('同卖点', '推荐1\n品牌：某品牌\n来源：模型记忆', {
+      status: 'unavailable', evidence: []
+    })
+    expect(unverified).toContain('暂无可靠对标')
+    expect(unverified).toContain('仅基于已上传资料')
+    expect(validateModuleOutput('benchmark-brands', '同产品\n同类目\n同人群\n同卖点\n同痛点\n同情绪\n同解决方案\n品牌A')).toContain(
+      '对标模块包含无明确对象的占位品牌或排名'
+    )
   })
 
   it('infers a platform from filenames and parsed evidence without guessing ambiguous files', () => {

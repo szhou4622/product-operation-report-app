@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -27,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from provider_keyring import ProviderKeyring, ProviderRouteSnapshot
@@ -61,7 +62,7 @@ POINTS_PER_CNY = max(1.0, float(os.environ.get("POR_POINTS_PER_CNY", "100")))
 COST_RATE = max(0.01, min(1.0, float(os.environ.get("POR_COST_RATE", "0.5"))))
 CHARGE_MULTIPLIER = 1.0 / COST_RATE
 WEB_SEARCH_USD_PER_CALL = max(0.0, float(os.environ.get("POR_WEB_SEARCH_USD_PER_CALL", "0")))
-WEB_SEARCH_REPORT_LIMIT = max(1, min(50, int(os.environ.get("POR_WEB_SEARCH_REPORT_LIMIT", "10"))))
+WEB_SEARCH_REPORT_LIMIT = max(1, min(50, int(os.environ.get("POR_WEB_SEARCH_REPORT_LIMIT", "14"))))
 MAX_BODY_BYTES = 96 * 1024 * 1024
 MAX_MESSAGES = 64
 MAX_TEXT_CHARS = 2_000_000
@@ -87,7 +88,7 @@ STREAM_HEARTBEAT_SECONDS = 20.0
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?::fallback:[1-3])?$", re.I)
 SAFE_TEXT_RE = re.compile(r"^[\w.:-]{1,200}$", re.UNICODE)
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-ALLOWED_MODELS = ("gpt-5.5", "claude-sonnet-4-6", "gemini-3-flash", "kimi-k2.6")
+ALLOWED_MODELS = ("gpt-5.5", "gpt-5.6-sol", "claude-sonnet-4-6", "gemini-3-flash", "kimi-k2.6")
 ALLOWED_TASK_TYPES = (
     "source_clean", "summary", "analysis_step", "final_part", "revision_part",
     "module_product_info", "module_platform_audience", "module_material_review",
@@ -96,15 +97,22 @@ ALLOWED_TASK_TYPES = (
 )
 MODEL_PRICES = {
     "gpt-5.5": (1.25, 7.5, 0.125, 0.8),
+    "gpt-5.6-sol": (1.25, 10.0, 0.125, 1.0),
     "claude-sonnet-4-6": (0.4, 2.0, 0.04, 0.2),
     "gemini-3-flash": (1.2, 6.0, 0.12, 0.6),
     "kimi-k2.6": (0.8, 4.0, 0.08, 0.4),
 }
 MODEL_ENV_PREFIXES = {
     "gpt-5.5": "GPT55",
+    "gpt-5.6-sol": "GPT56_SOL",
     "claude-sonnet-4-6": "CLAUDE_SONNET_46",
     "gemini-3-flash": "GEMINI_3_FLASH",
     "kimi-k2.6": "KIMI_K26",
+}
+TASK_MODEL_ROUTES = {
+    # The packaged client chooses this ordered pair. The server still enforces
+    # that an untrusted renderer cannot use another model for benchmark work.
+    "module_benchmark": ("gpt-5.6-sol", "gpt-5.5"),
 }
 PROVIDER_ROUTES = {
     model: (
@@ -781,6 +789,193 @@ def validate_messages(body: dict[str, Any]) -> tuple[str, int]:
     return model, approximate_tokens
 
 
+def model_for_task(task_type: str, requested_model: str) -> str:
+    allowed = TASK_MODEL_ROUTES.get(task_type)
+    if allowed is None:
+        return requested_model
+    if requested_model not in allowed:
+        raise ApiError(400, "当前任务的模型路由无效。")
+    return requested_model
+
+
+def safe_public_search_url(value: Any) -> str:
+    candidate = text(value, 4096).strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address and (
+        address.is_private or address.is_loopback or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    ):
+        return ""
+    return candidate
+
+
+def search_platform(url: str, title: str = "") -> str:
+    value = f"{url} {title}".lower()
+    if any(token in value for token in ("tmall.", "taobao.", "天猫", "淘宝")):
+        return "天猫"
+    if any(token in value for token in ("douyin.", "iesdouyin.", "抖音")):
+        return "抖音"
+    if any(token in value for token in ("channels.weixin.", "weixin.qq.", "视频号")):
+        return "视频号"
+    if any(token in value for token in ("xiaohongshu.", "xhslink.", "小红书")):
+        return "小红书"
+    return "其他"
+
+
+def search_event_details(event: dict[str, Any]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Extract only bounded, structured search calls and public URL citations."""
+    calls: list[dict[str, str]] = []
+    evidence: list[dict[str, str]] = []
+    event_type = text(event.get("type"), 120)
+    action = event.get("action") if isinstance(event.get("action"), dict) else {}
+    response = event.get("response") if isinstance(event.get("response"), dict) else {}
+    response_output = response.get("output") if isinstance(response.get("output"), list) else []
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    items = [item, *[candidate for candidate in response_output[:32] if isinstance(candidate, dict)]]
+    if "web_search" in event_type or "search_call" in event_type:
+        calls.append({
+            "callId": text(event.get("id"), 200) or f"search-{hashlib.sha256(event_type.encode()).hexdigest()[:12]}",
+            "query": text(event.get("query") or action.get("query"), 500),
+        })
+    for output_item in items:
+        item_type = text(output_item.get("type"), 120)
+        if "web_search" not in item_type and "search_call" not in item_type:
+            continue
+        item_action = output_item.get("action") if isinstance(output_item.get("action"), dict) else {}
+        calls.append({
+            "callId": text(output_item.get("id"), 200) or f"search-item-{len(calls) + 1}",
+            "query": text(output_item.get("query") or item_action.get("query"), 500),
+        })
+
+    choices = event.get("choices") if isinstance(event.get("choices"), list) else []
+    containers: list[dict[str, Any]] = [event, action, response, item]
+    for output_item in items:
+        containers.append(output_item)
+        item_action = output_item.get("action") if isinstance(output_item.get("action"), dict) else None
+        if item_action:
+            containers.append(item_action)
+        content = output_item.get("content") if isinstance(output_item.get("content"), list) else []
+        containers.extend(candidate for candidate in content[:32] if isinstance(candidate, dict))
+    for choice in choices[:8]:
+        if not isinstance(choice, dict):
+            continue
+        for key in ("delta", "message"):
+            value = choice.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []
+        for tool_call in tool_calls[:16]:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            call_type = text(tool_call.get("type"), 80)
+            call_name = text(function.get("name"), 120)
+            if "web_search" not in f"{call_type} {call_name}":
+                continue
+            query = ""
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and len(arguments) <= 4096:
+                try:
+                    parsed_arguments = json.loads(arguments)
+                    if isinstance(parsed_arguments, dict):
+                        query = text(parsed_arguments.get("query") or parsed_arguments.get("q"), 500)
+                except Exception:
+                    pass
+            calls.append({
+                "callId": text(tool_call.get("id"), 200) or f"tool-{len(calls) + 1}",
+                "query": query,
+            })
+
+    for container in containers[:24]:
+        candidates: list[Any] = []
+        for key in ("sources", "results", "citations", "annotations"):
+            value = container.get(key)
+            if isinstance(value, list):
+                candidates.extend(value[:50])
+        for candidate in candidates[:100]:
+            if isinstance(candidate, str):
+                url = safe_public_search_url(candidate)
+                title = ""
+            elif isinstance(candidate, dict):
+                citation = candidate.get("url_citation") if isinstance(candidate.get("url_citation"), dict) else candidate
+                url = safe_public_search_url(citation.get("url") or citation.get("link"))
+                title = text(citation.get("title") or citation.get("name"), 300)
+            else:
+                continue
+            if not url:
+                continue
+            evidence.append({
+                "title": title,
+                "url": url,
+                "platform": search_platform(url, title),
+            })
+    return calls, evidence
+
+
+def responses_request_body(chat_body: dict[str, Any]) -> dict[str, Any]:
+    instructions: list[str] = []
+    input_items: list[dict[str, Any]] = []
+    for message in chat_body.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system" and isinstance(content, str):
+            instructions.append(content)
+            continue
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        input_items.append({"role": role, "content": content})
+    if not input_items:
+        raise ApiError(400, "对标搜索输入为空。")
+    return {
+        "model": chat_body["model"],
+        "instructions": "\n\n".join(instructions),
+        "input": input_items,
+        "stream": True,
+        "max_output_tokens": chat_body.get("max_completion_tokens", 5000),
+        "reasoning": {"effort": "high"},
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "high",
+            "external_web_access": True,
+            "return_token_budget": "unlimited",
+        }],
+        "tool_choice": "required",
+        "include": ["web_search_call.action.sources"],
+    }
+
+
+def responses_output_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    chunks: list[str] = []
+    output = response.get("output") if isinstance(response.get("output"), list) else []
+    for item in output[:64]:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content") if isinstance(item.get("content"), list) else []
+        for part in content[:64]:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+    return "".join(chunks)
+
+
 def points_for_usage(model: str, input_tokens: int, output_tokens: int, cached: int = 0, created: int = 0) -> tuple[int, float]:
     input_rate, output_rate, cached_rate, created_rate = MODEL_PRICES[model]
     regular = max(0, input_tokens - cached - created)
@@ -804,13 +999,14 @@ def provider_route_candidates(model: str) -> tuple[ProviderRouteSnapshot, ...]:
 
 
 def open_provider_stream(
-    candidates: tuple[ProviderRouteSnapshot, ...], upstream_data: bytes, request_id: str
+    candidates: tuple[ProviderRouteSnapshot, ...], upstream_data: bytes, request_id: str,
+    endpoint_path: str = "chat/completions",
 ) -> Any:
     """Open one upstream stream, using standby keys only for pre-stream auth failures."""
     last_auth_error: HTTPError | None = None
     for candidate_index, candidate in enumerate(candidates):
         request = Request(
-            f"{candidate.base_url}/chat/completions",
+            f"{candidate.base_url}/{endpoint_path}",
             data=upstream_data,
             method="POST",
             headers={
@@ -1187,10 +1383,15 @@ def settle_request(session: Session, request_id: str, status: str, model: str, u
 
 
 def provider_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
-    usage = payload.get("usage")
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else response.get("usage")
     if not isinstance(usage, dict):
         return None
-    details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    details = (
+        usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict)
+        else usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict)
+        else {}
+    )
     def usage_integer(value: Any) -> int | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
@@ -1205,7 +1406,7 @@ def provider_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
         "output_tokens": output_tokens,
         "cached_input_tokens": cached_tokens,
         "cache_creation_input_tokens": created_tokens,
-        "response_model": text(payload.get("model"), 200),
+        "response_model": text(payload.get("model") or response.get("model"), 200),
     }
     if any(result[name] < 0 or result[name] > 2_000_000_000 for name in (
         "input_tokens", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens"
@@ -1277,6 +1478,7 @@ def provider_request_items(
     candidates: tuple[ProviderRouteSnapshot, ...],
     upstream_data: bytes,
     request_id: str,
+    endpoint_path: str = "chat/completions",
     heartbeat_seconds: float = STREAM_HEARTBEAT_SECONDS,
 ):
     """Open and read an upstream request while heartbeats are already flowing.
@@ -1291,7 +1493,7 @@ def provider_request_items(
 
     def open_and_read() -> None:
         try:
-            upstream = open_provider_stream(candidates, upstream_data, request_id)
+            upstream = open_provider_stream(candidates, upstream_data, request_id, endpoint_path)
             with upstream:
                 for raw_line in upstream:
                     events.put(("line", raw_line))
@@ -1322,7 +1524,8 @@ def provider_stream_completed(saw_done: bool, finish_reason: str, usage: dict[st
 def apply_server_task_options(upstream_body: dict[str, Any], task_type: str) -> None:
     if task_type == "module_benchmark":
         upstream_body["tools"] = [{"type": "web_search"}]
-        upstream_body["tool_choice"] = "auto"
+        upstream_body["tool_choice"] = "required"
+        upstream_body["include"] = ["web_search_call.action.sources"]
 
 
 def mark_upstream_submitted(request_id: str) -> None:
@@ -1470,10 +1673,7 @@ class Handler(BaseHTTPRequestHandler):
     def proxy_chat(self) -> None:
         session = require_session(self.headers, verify=True)
         body = self.read_json()
-        model, input_estimate = validate_messages(body)
-        provider_candidates = provider_route_candidates(model)
-        if not provider_candidates:
-            raise ApiError(503, "模型服务密钥尚未在服务器配置。")
+        requested_model, input_estimate = validate_messages(body)
         request_id = text(self.headers.get("x-request-id"), 240)
         billing_request_id = text(self.headers.get("x-billing-request-id"), 240)
         report_id = text(self.headers.get("x-report-session-id"), 200)
@@ -1496,6 +1696,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "模型任务类型无效。")
         if attempt < 1 or attempt > 20:
             raise ApiError(400, "模型任务尝试次数无效。")
+        model = model_for_task(task_type, requested_model)
+        provider_candidates = provider_route_candidates(model)
+        if not provider_candidates:
+            raise ApiError(503, "模型服务密钥尚未在服务器配置。")
         temperature = body.get("temperature")
         if temperature is not None and (
             isinstance(temperature, bool) or not isinstance(temperature, (int, float))
@@ -1519,6 +1723,10 @@ class Handler(BaseHTTPRequestHandler):
             upstream_body["reasoning_effort"] = "low"
         # The server, not the untrusted client, decides which task may search.
         apply_server_task_options(upstream_body, task_type)
+        uses_responses_api = task_type == "module_benchmark"
+        if uses_responses_api:
+            upstream_body = responses_request_body(upstream_body)
+        upstream_endpoint_path = "responses" if uses_responses_api else "chat/completions"
         reserve_request(
             session, request_id, report_id, task_key, task_type, model, attempt,
             input_estimate, billing_request_id,
@@ -1527,12 +1735,63 @@ class Handler(BaseHTTPRequestHandler):
         mark_upstream_submitted(request_id)
         usage: dict[str, int] | None = None
         search_call_ids: set[str] = set()
+        search_queries: dict[str, str] = {}
+        search_evidence: dict[str, dict[str, str]] = {}
+        search_metadata_sent = False
         output_chars = 0
         sent_content = False
         client_open = True
         final_status = "failed"
         saw_done = False
         finish_reason = ""
+        def send_search_metadata() -> None:
+            nonlocal client_open, search_metadata_sent
+            if task_type != "module_benchmark" or search_metadata_sent or not client_open:
+                return
+            search_metadata_sent = True
+            verified = bool(search_call_ids and search_evidence)
+            status = "verified" if verified else "attempted" if search_call_ids else "unavailable"
+            call_ids = sorted(search_call_ids)
+            status_payload = {
+                "type": "por.search_status",
+                "status": status,
+                "search_calls": len(call_ids),
+                "evidence_count": len(search_evidence) if verified else 0,
+            }
+            payloads: list[dict[str, Any]] = [status_payload]
+            if verified:
+                fallback_call_id = call_ids[0]
+                for evidence_item in search_evidence.values():
+                    payloads.append({
+                        "type": "por.search_evidence",
+                        "evidence": {
+                            **evidence_item,
+                            "callId": fallback_call_id,
+                            "query": search_queries.get(fallback_call_id, ""),
+                            "retrievedAt": utc_now(),
+                        },
+                    })
+            try:
+                for item in payloads:
+                    encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    self.wfile.write(b"data: " + encoded + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                client_open = False
+        def send_chat_delta(delta: str) -> None:
+            nonlocal client_open
+            if not delta or not client_open:
+                return
+            payload = json.dumps(
+                {"choices": [{"delta": {"content": delta}}]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            try:
+                self.wfile.write(b"data: " + payload + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                client_open = False
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1541,8 +1800,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 for item_type, raw_line in provider_request_items(
-                    provider_candidates, upstream_data, request_id
+                    provider_candidates, upstream_data, request_id, upstream_endpoint_path
                 ):
+                    forward_raw_line = not uses_responses_api
                     if item_type == "heartbeat":
                         if client_open:
                             try:
@@ -1560,33 +1820,58 @@ class Handler(BaseHTTPRequestHandler):
                         elif data:
                             try:
                                 event = as_object(json.loads(data.decode("utf-8", "replace")))
-                                usage = merge_provider_usage(usage, provider_usage(event))
                                 event_type = text(event.get("type"), 120)
-                                if task_type == "module_benchmark" and "web_search" in event_type:
-                                    search_call_ids.add(text(event.get("id"), 200) or event_type)
+                                if event_type in ("por.search_status", "por.search_evidence"):
+                                    # Only this proxy may emit trusted internal metadata events.
+                                    forward_raw_line = False
+                                usage = merge_provider_usage(usage, provider_usage(event))
+                                if task_type == "module_benchmark":
+                                    calls, evidence_items = search_event_details(event)
+                                    for call in calls:
+                                        call_id = call["callId"]
+                                        search_call_ids.add(call_id)
+                                        if call.get("query"):
+                                            search_queries[call_id] = call["query"]
+                                    for evidence_item in evidence_items:
+                                        search_evidence.setdefault(evidence_item["url"], evidence_item)
+                                if uses_responses_api:
+                                    response_delta = ""
+                                    if event_type == "response.output_text.delta":
+                                        response_delta = text(event.get("delta"), 2_000_000)
+                                    elif event_type == "response.completed":
+                                        finish_reason = "stop"
+                                        if not sent_content:
+                                            response_delta = responses_output_text(event.get("response"))
+                                    elif event_type in ("response.failed", "response.incomplete", "error"):
+                                        finish_reason = "error"
+                                        error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                                        message = text(error.get("message") or event.get("message"), 500) or "Responses API返回失败。"
+                                        if client_open:
+                                            payload = json.dumps({"error": {"message": message}}, ensure_ascii=False).encode("utf-8")
+                                            try:
+                                                self.wfile.write(b"data: " + payload + b"\n\n")
+                                                self.wfile.flush()
+                                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                                client_open = False
+                                    if response_delta:
+                                        output_chars += len(response_delta)
+                                        sent_content = True
+                                        send_chat_delta(response_delta)
                                 choices = event.get("choices")
                                 if isinstance(choices, list):
                                     for choice in choices:
                                         if isinstance(choice, dict) and choice.get("finish_reason") is not None:
                                             finish_reason = text(choice.get("finish_reason"), 80)
                                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                                        tool_calls = delta.get("tool_calls") if isinstance(delta, dict) else None
-                                        if task_type == "module_benchmark" and isinstance(tool_calls, list):
-                                            for tool_call in tool_calls:
-                                                if not isinstance(tool_call, dict):
-                                                    continue
-                                                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-                                                call_type = text(tool_call.get("type"), 80)
-                                                call_name = text(function.get("name"), 120)
-                                                if "web_search" in f"{call_type} {call_name}":
-                                                    search_call_ids.add(text(tool_call.get("id"), 200) or f"tool-{len(search_call_ids) + 1}")
                                         content = delta.get("content") if isinstance(delta, dict) else None
                                         if isinstance(content, str) and content:
                                             output_chars += len(content)
                                             sent_content = True
                             except Exception:
                                 pass
-                    if client_open:
+                    if raw_line.startswith(b"data:") and raw_line[5:].strip() == b"[DONE]":
+                        send_search_metadata()
+                    if client_open and forward_raw_line:
                         try:
                             self.wfile.write(raw_line)
                             self.wfile.flush()
@@ -1617,7 +1902,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         client_open = False
-            completed = provider_stream_completed(saw_done, finish_reason, usage, sent_content)
+            completed = finish_reason != "error" and provider_stream_completed(saw_done, finish_reason, usage, sent_content)
+            send_search_metadata()
             if completed and not saw_done and client_open:
                 try:
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -1634,10 +1920,6 @@ class Handler(BaseHTTPRequestHandler):
             final_status = "partial" if sent_content else "failed"
         finally:
             search_calls = len(search_call_ids)
-            if task_type == "module_benchmark" and sent_content and search_calls == 0:
-                # Some compatible providers execute built-in search without
-                # streaming tool-call metadata. Count the benchmark attempt once.
-                search_calls = 1
             settle_request(session, request_id, final_status, model, usage, input_estimate, output_chars, sent_content, search_calls)
 
 

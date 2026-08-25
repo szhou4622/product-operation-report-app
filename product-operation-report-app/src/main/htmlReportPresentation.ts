@@ -982,6 +982,8 @@ function metricCandidates(model: HtmlReportModel): MetricCandidate[] {
     if (!baseScore) continue
     section.tables.forEach((table, tableIndex) => {
       const platformIndex = findHeaderIndex(table, /平台|渠道|数据来源|来源/)
+      const m2DimensionIndex = section.number === 'M2' ? findHeaderIndex(table, /^维度$/u) : -1
+      const m2CategoryIndex = section.number === 'M2' ? findHeaderIndex(table, /类别|标签|细分|选项|区间/u) : -1
       table.rows.forEach((row, rowIndex) => {
         if (row.some((cell) => PLACEHOLDER_PATTERN.test(text(cell)))) return
         row.forEach((cell, columnIndex) => {
@@ -992,15 +994,17 @@ function metricCandidates(model: HtmlReportModel): MetricCandidate[] {
           const value = hits[0].replace(/\s+/g, '')
           const header = text(table.headers[columnIndex] || '')
           if (/年龄|岁|日期|时间|编号|序号/.test(header)) return
-          const labelCellIndex = row.findIndex(
+          const fallbackLabelCellIndex = row.findIndex(
             (candidate, index) =>
               index !== columnIndex &&
               index !== platformIndex &&
               Boolean(text(candidate)) &&
               !HAS_METRIC_PATTERN.test(text(candidate))
           )
+          const labelCellIndex = m2CategoryIndex >= 0 ? m2CategoryIndex : fallbackLabelCellIndex
           const platform = platformIndex >= 0 ? shorten(row[platformIndex] || '', 24) : ''
           const dimension = shorten(row[labelCellIndex] || header || '关键数据', 22)
+          const m2Dimension = m2DimensionIndex >= 0 ? shorten(row[m2DimensionIndex] || '', 22) : ''
           const semanticText = `${header} ${dimension} ${raw}`
           if (/规格|包装|SKU|型号|净含量|容量|尺寸|价格|单价|原价|到手价|数量|件数/.test(semanticText)) {
             return
@@ -1018,10 +1022,14 @@ function metricCandidates(model: HtmlReportModel): MetricCandidate[] {
               ? `${dimension}占比`
               : dimension)
           const label = shorten(
-            [platform || table.context, metricMeaning].filter(Boolean).join(' / ') || '关键数据',
+            section.number === 'M2'
+              ? metricMeaning || '关键数据'
+              : [platform || table.context, metricMeaning].filter(Boolean).join(' / ') || '关键数据',
             34
           )
-          const sourceLabel = [platform, table.context, header].filter(Boolean).join(' / ') || `第 ${section.number} 章`
+          const sourceLabel = section.number === 'M2'
+            ? [platform, m2Dimension || table.context].filter(Boolean).join(' / ') || '平台成交画像'
+            : [platform, table.context, header].filter(Boolean).join(' / ') || `第 ${section.number} 章`
           const key = `${section.number}|${label}|${value}|${sourceLabel}`
           if (seen.has(key)) return
           seen.add(key)

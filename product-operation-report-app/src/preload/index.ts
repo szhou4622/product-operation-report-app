@@ -29,6 +29,8 @@ import type {
   ReportResultCacheStats,
   ReportResultCacheStoreResult,
   SavedProject,
+  SearchEvidence,
+  SearchVerificationStatus,
   SourceCleanCacheInput,
   SourceCleanCacheLookupResult,
   SourceCleanCacheStats,
@@ -44,6 +46,8 @@ import type {
 export interface ChatHandlers {
   onChunk?: (delta: string) => void
   onUsage?: (usage: ModelTokenUsage) => void
+  onSearchStatus?: (status: SearchVerificationStatus, searchCalls: number, evidenceCount: number) => void
+  onSearchEvidence?: (evidence: SearchEvidence) => void
   onDone?: (full: string) => void
   onError?: (message: string) => void
 }
@@ -218,6 +222,8 @@ const api = {
     const listener = (_e: unknown, ev: ChatStreamEvent): void => {
       if (ev.type === 'chunk') handlers.onChunk?.(ev.delta)
       else if (ev.type === 'usage') handlers.onUsage?.(ev.usage)
+      else if (ev.type === 'search_status') handlers.onSearchStatus?.(ev.status, ev.searchCalls, ev.evidenceCount)
+      else if (ev.type === 'search_evidence') handlers.onSearchEvidence?.(ev.evidence)
       else if (ev.type === 'done') {
         cleanup()
         handlers.onDone?.(ev.full)

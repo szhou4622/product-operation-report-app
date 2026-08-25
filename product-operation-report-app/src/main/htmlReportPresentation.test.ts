@@ -102,4 +102,38 @@ describe('v1 M1-M8 visual planning', () => {
     expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('selling-point-matrix')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M8')?.visualKind).toBe('audience-map')
   })
+
+  it('keeps every M2 platform, names the actual category and rejects audience tags as regions', () => {
+    const markdown = [
+      '# 产品经营报告',
+      '## M2 平台人群数据',
+      '平台：视频号',
+      '1. 性别',
+      '信息：女性64.64%，男性35.36%',
+      '来源：视频号截图｜性别分布',
+      '2. 地域',
+      '信息：都市银发48.90%，小镇中老年28.57%',
+      '来源：错误地域字段',
+      '3. 人群属性',
+      '信息：都市银发48.90%，小镇中老年28.57%',
+      '来源：视频号截图｜人群属性',
+      '平台：抖店罗盘',
+      '1. 性别',
+      '信息：女性78.14%，男性21.86%',
+      '来源：抖店画像表｜性别分布',
+      '2. 地域',
+      '信息：江苏省19.09%，山东省10.95%',
+      '来源：抖店画像表｜省份分布'
+    ].join('\n')
+    const model = parseHtmlReportModel(markdown)
+    const table = model.sections[0]?.tables[0]
+    expect(new Set(table?.rows.map((row) => row[0]))).toEqual(new Set(['视频号', '抖店罗盘']))
+    expect(table?.rows.filter((row) => row[1] === '地域').map((row) => row[2])).toEqual(['江苏省', '山东省'])
+    expect(table?.rows.filter((row) => row[1] === '人群属性' && row[2] === '都市银发')).toHaveLength(1)
+    const presentation = buildHtmlReportPresentation(model)
+    const m2 = presentation.sections.find((section) => section.sectionNumber === 'M2')
+    expect(new Set(m2?.percentFacets.map((facet) => facet.group))).toEqual(new Set(['视频号', '抖店罗盘']))
+    expect(presentation.mainMetric?.label).toBe('女性占比')
+    expect(presentation.mainMetric?.sourceLabel).toBe('视频号 / 性别')
+  })
 })

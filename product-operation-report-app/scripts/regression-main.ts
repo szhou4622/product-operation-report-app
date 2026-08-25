@@ -38,7 +38,7 @@ import {
   saveSettings
 } from '../src/main/settings'
 import { getManagedModelState, managedModelInternals } from '../src/main/managedModel'
-import { runModelFallbackSequence, shouldTryModelFallback } from '../src/main/modelFallback'
+import { profilesForTask, runModelFallbackSequence, shouldTryModelFallback } from '../src/main/modelFallback'
 import {
   ChatRequestRegistry,
   validateChatStartPayload
@@ -2196,6 +2196,9 @@ function testRepairPlanStaticContracts(): void {
   )
   assert.match(store, /completedSummaryGroups/u)
   assert.match(store, /analysisEvidenceSeed/u)
+  assert.match(store, /await worker\(1\)/u, 'M4 must probe search capability before launching all dimensions')
+  assert.match(store, /dimensionSnapshots\[0\]\?\.status === 'unavailable'/u, 'M4 stops after a provider exposes no search events')
+  assert.match(store, /已停止其余维度调用/u, 'the user sees why M4 stopped before spending more points')
   assert.match(store, /:evidence_digest:v2:/u)
   assert.match(store, /cleanedData: analysisInput/u)
   assert.match(workflow, /npm run test:regression/u)
@@ -2220,6 +2223,16 @@ async function testModelFallbackSequence(): Promise<void> {
     supportsVision: true
   }))
   const attempts: string[] = []
+  assert.deepEqual(
+    profilesForTask(profiles, 'module_benchmark').map((item) => item.model),
+    ['gpt-5.6-sol', 'gpt-5.5'],
+    'only M4 receives the dedicated sol to gpt-5.5 sequence'
+  )
+  assert.deepEqual(
+    profilesForTask(profiles, 'module_product_info').map((item) => item.model),
+    profiles.map((item) => item.model),
+    'other report modules retain their existing gpt-5.5 fallback sequence'
+  )
   const usageModels: string[] = []
   const recovered = await runModelFallbackSequence(profiles, async (current, index) => {
     attempts.push(current.model)
@@ -2690,6 +2703,22 @@ async function testStrictModelCompletion(): Promise<void> {
     assert.equal(normalEvents.at(-1)?.type, 'done')
     assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.full : '', '完整')
     assert.equal(normalEvents.at(-1)?.type === 'done' ? normalEvents.at(-1)?.usage.totalTokens : 0, 150)
+
+    const searchEvents: ChatStreamEvent[] = []
+    globalThis.fetch = (async () => responseStream([
+      'data: {"choices":[{"delta":{"content":"对标结果"},"finish_reason":"stop"}]}\n\n',
+      'data: {"type":"por.search_status","status":"verified","search_calls":1,"evidence_count":2}\n\n',
+      'data: {"type":"por.search_evidence","evidence":{"callId":"search-1","query":"品牌 天猫","title":"旗舰店","url":"https://brand.tmall.com/store","platform":"天猫","retrievedAt":"2026-08-25T00:00:00Z"}}\n\n',
+      'data: {"type":"por.search_evidence","evidence":{"callId":"search-1","title":"私网","url":"http://127.0.0.1/private","platform":"其他","retrievedAt":"2026-08-25T00:00:00Z"}}\n\n',
+      'data: [DONE]\n\n'
+    ])) as typeof fetch
+    await chatStream(profile, [{ role: 'user', content: '测试搜索证据' }], (event) => searchEvents.push(event))
+    const searchStatus = searchEvents.find((event) => event.type === 'search_status')
+    const evidenceEvents = searchEvents.filter((event) => event.type === 'search_evidence')
+    assert.equal(searchStatus?.type === 'search_status' ? searchStatus.status : '', 'verified')
+    assert.equal(evidenceEvents.length, 1, 'private or dangerous search URLs are discarded in the client')
+    assert.equal(evidenceEvents[0]?.type === 'search_evidence' ? evidenceEvents[0].evidence.platform : '', '天猫')
+    assert.equal(searchEvents.at(-1)?.type, 'done')
 
     const jsonEvents: ChatStreamEvent[] = []
     globalThis.fetch = (async () =>
@@ -4836,7 +4865,7 @@ async function testHtmlReportRenderer(): Promise<void> {
   assert.match(html, /class="chapter-index"/)
   assert.match(html, /data-source-value=/)
   assert.match(html, /data-source-cell-count=/)
-  assert.match(html, /一方数据分口径对比/)
+  assert.match(html, /分口径数据对比/)
   assert.match(html, /证据如何进入经营判断/)
   assert.match(html, /用户决策顺序/)
   assert.match(html, /人群、场景与卖点匹配/)

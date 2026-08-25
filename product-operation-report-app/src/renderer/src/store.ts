@@ -48,6 +48,7 @@ import {
 } from './cleaningPlan'
 import {
   MODULE_TASK_TYPES,
+  type BenchmarkVerification,
   assembleModuleReport,
   buildModuleMessages,
   evaluateSourceSufficiency,
@@ -125,6 +126,7 @@ const MAX_SINGLE_FILE_BYTES = 40 * 1024 * 1024
 const MAX_TOTAL_UPLOAD_BYTES = 350 * 1024 * 1024
 const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024
 const MAX_SOURCE_FILES = 50
+const BENCHMARK_EVIDENCE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 let cleaningCheckpointSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 function formatPointsValue(value: number): string {
@@ -2452,17 +2454,24 @@ export const useStore = create<StoreState>((set, get) => ({
             ? normalizeMaterialReviewOutput(saved.output)
             : saved.output
         set((state) => ({ artifacts: { ...state.artifacts, [module.id]: output } }))
-        updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
+        const benchmarkMessage = module.key === 'benchmark-brands'
+          ? saved.searchStatus === 'verified' && saved.searchEvidence?.length
+            ? `已核验公开来源 ${saved.searchEvidence.length} 条`
+            : '仅基于已上传资料'
+          : undefined
+        updateModuleState(module.key, { status: 'done', message: benchmarkMessage, updatedAt: saved.updatedAt })
         return
       }
       if (module.key === 'benchmark-brands') {
         const dimensions = ['同产品', '同类目', '同人群', '同卖点', '同痛点', '同情绪', '同解决方案']
         const dimensionOutputs: string[] = new Array(dimensions.length)
+        const dimensionSnapshots: BenchmarkVerification[] = new Array(dimensions.length)
         let nextDimension = 0
-        let retryBudget = 3
-        const worker = async (): Promise<void> => {
-          while (nextDimension < dimensions.length && isCurrentSession()) {
+        const worker = async (maximumJobs = Number.POSITIVE_INFINITY): Promise<void> => {
+          let completedJobs = 0
+          while (nextDimension < dimensions.length && isCurrentSession() && completedJobs < maximumJobs) {
             const index = nextDimension++
+            completedJobs += 1
             const dimension = dimensions[index]
             const taskId = `${savedTaskId}:search:${index + 1}`
             const cached = get().taskJournal[taskId]
@@ -2472,16 +2481,29 @@ export const useStore = create<StoreState>((set, get) => ({
                 role: 'user' as const,
                 content: [
                   `本次只完成“${dimension}”这一维度，必须实际使用联网检索工具，不得仅凭模型记忆。`,
-                  '把当前产品名、品类、人群、卖点、痛点或场景与以下四个平台分别组合检索：天猫、抖音、视频号、小红书。可使用公开店铺页、官方账号页、公开笔记/视频索引页及被搜索引擎收录的页面。',
-                  '先覆盖四个平台，再从全部结果中选择最多3个证据最可靠的真实品牌；每个品牌必须写清品牌、平台、公开页面或账号名称、匹配点、推荐理由和可追溯来源。',
-                  '某个平台没有可靠结果时，在“平台覆盖”中明确写“未找到可靠公开结果”；只有四个平台都检索后仍无可靠品牌，才输出暂无可靠对标。',
-                  `严格以“### ${dimension}”开头，随后输出“平台覆盖：天猫…｜抖音…｜视频号…｜小红书…”。不要输出搜索计划、思考过程或“我会/我正在”等过程文字。`
+                  '优先把当前产品名、品类、人群、卖点、痛点或场景与天猫、抖音、视频号、小红书分别组合检索，但搜索范围不得仅限这四个平台。',
+                  '社交平台或天猫无法访问、需要登录或没有可靠结果时，必须继续搜索品牌官网、京东公开商品页、其他公开电商商品页、新闻媒体、食品行业媒体及中国市场可访问的公开零售页面。不得因为上传资料没有竞品名称而停止检索。',
+                  '从全部公开结果中选择最多3个证据最可靠的真实品牌；每个品牌必须写清品牌、对标产品/系列、平台或来源类型、公开页面或账号名称、匹配点、推荐理由，并在“来源”中填写完整 http/https 链接。',
+                  '禁止输出“品牌A、某品牌、示例品牌、TOP1、自有框架1、竞品框架1”等占位名称。没有明确品牌名和来源链接的结果不得推荐。',
+                  '如果只能使用已上传资料，必须逐条写“来源：用户资料｜具体文件或上游模块”；不得把模型记忆写成用户资料或公开检索结果。',
+                  '某个平台没有可靠结果时，在“平台覆盖”中明确写“未找到可靠公开结果”；只有继续检索其他公开来源后仍无可靠品牌，才输出暂无可靠对标。',
+                  `严格以“### ${dimension}”开头，随后输出“平台覆盖：天猫…｜抖音…｜视频号…｜小红书…｜其他公开来源…”。不要输出搜索计划、思考过程或“我会/我正在”等过程文字。`
                 ].join('\n')
               }
             ]
             const dimensionFingerprint = fingerprintModuleMessages(focusedMessages)
-            if (cached?.status === 'complete' && cached.inputFingerprint === dimensionFingerprint && cached.output?.trim()) {
-              dimensionOutputs[index] = normalizeBenchmarkDimension(dimension, cached.output)
+            const cachedAt = Date.parse(cached?.updatedAt || '')
+            const cachedFresh = Number.isFinite(cachedAt) && Date.now() - cachedAt <= BENCHMARK_EVIDENCE_TTL_MS
+            if (
+              cached?.status === 'complete' && cached.inputFingerprint === dimensionFingerprint && cached.output?.trim() &&
+              cached.searchStatus && cachedFresh
+            ) {
+              const verification = {
+                status: cached.searchStatus,
+                evidence: cached.searchEvidence || []
+              }
+              dimensionSnapshots[index] = verification
+              dimensionOutputs[index] = normalizeBenchmarkDimension(dimension, cached.output, verification)
               continue
             }
             let result = await runModelRetry(
@@ -2498,23 +2520,18 @@ export const useStore = create<StoreState>((set, get) => ({
               }
             )
             const searchBudgetExhausted = /搜索(?:预算|次数)|search[_\s-]*(?:budget|limit)/iu.test(result.error || '')
-            const missingSearchExecution = result.ok && /未提供可用的?联网检索工具|无法联网检索|未完成联网检索|未完成检索/u.test(result.text)
             if (
-              retryBudget > 0 &&
               !isUserStop(result.error) &&
               !searchBudgetExhausted &&
-              (!result.ok || missingSearchExecution)
+              (!result.ok || result.searchStatus === 'attempted')
             ) {
-              retryBudget -= 1
-              const retryMessages = missingSearchExecution
-                ? [
-                    ...focusedMessages,
-                    {
-                      role: 'user' as const,
-                      content: '上一轮没有执行联网搜索。本次必须调用可用的 web_search 工具完成实际检索；不要再次声称没有工具。若四个平台实际检索后没有可靠证据，再如实写未找到。'
-                    }
-                  ]
-                : focusedMessages
+              const retryMessages = [
+                ...focusedMessages,
+                {
+                  role: 'user' as const,
+                  content: '上一轮没有取得可核验的搜索调用和来源链接。本次再尝试一次 web_search；每个推荐的“来源”必须填写完整 http/https 链接。若仍无可核验来源，只能引用明确标注“来源：用户资料”的已上传内容，其余写“暂无可靠公开资料”。'
+                }
+              ]
               result = await runModelRetry(
                 retryMessages, () => {}, (fn) => set({ abortFn: fn }), undefined, 0,
                 {
@@ -2529,22 +2546,69 @@ export const useStore = create<StoreState>((set, get) => ({
                 }
               )
             }
+            const verification = {
+              status: result.searchStatus || 'unavailable' as const,
+              evidence: result.searchEvidence || []
+            }
             const output = normalizeBenchmarkDimension(
               dimension,
-              result.ok && result.text.trim() ? result.text : '暂无可靠对标'
+              result.text.trim() ? result.text : '暂无可靠对标',
+              verification
             )
+            dimensionSnapshots[index] = verification
             dimensionOutputs[index] = output
             set((state) => ({
               taskJournal: {
                 ...state.taskJournal,
-                [taskId]: { kind: 'module', status: 'complete', output, inputFingerprint: dimensionFingerprint, updatedAt: new Date().toISOString() }
+                [taskId]: {
+                  kind: 'module',
+                  status: 'complete',
+                  output,
+                  inputFingerprint: dimensionFingerprint,
+                  searchStatus: verification.status,
+                  searchEvidence: verification.evidence,
+                  updatedAt: new Date().toISOString()
+                }
               }
             }))
             await window.api.saveLastProject(buildProjectSnapshot(get()))
           }
         }
-        await Promise.all(Array.from({ length: 3 }, () => worker()))
+        await worker(1)
+        if (dimensionSnapshots[0]?.status === 'unavailable') {
+          for (let index = 1; index < dimensions.length; index++) {
+            const dimension = dimensions[index]
+            const taskId = `${savedTaskId}:search:${index + 1}`
+            const verification = { status: 'unavailable' as const, evidence: [] }
+            const output = normalizeBenchmarkDimension(dimension, '暂无可靠对标', verification)
+            dimensionSnapshots[index] = verification
+            dimensionOutputs[index] = output
+            set((state) => ({
+              taskJournal: {
+                ...state.taskJournal,
+                [taskId]: {
+                  kind: 'module', status: 'complete', output,
+                  searchStatus: verification.status, searchEvidence: [], updatedAt: new Date().toISOString()
+                }
+              }
+            }))
+          }
+          get()._post('assistant', 'CCG没有返回可验证的联网搜索事件，已停止其余维度调用，避免继续消耗积分。', 'narration')
+        } else {
+          await Promise.all(Array.from({ length: 2 }, () => worker()))
+        }
         const benchmarkOutput = dimensionOutputs.join('\n\n')
+        const benchmarkEvidence = dimensionSnapshots.flatMap((item) => item?.evidence || []).filter((item, index, all) =>
+          all.findIndex((candidate) => candidate.url === item.url) === index
+        )
+        const benchmarkSearchStatus = benchmarkEvidence.length
+          ? 'verified' as const
+          : dimensionSnapshots.some((item) => item?.status === 'attempted')
+            ? 'attempted' as const
+            : 'unavailable' as const
+        const benchmarkMessage = benchmarkEvidence.length
+          ? `已核验公开来源 ${benchmarkEvidence.length} 条`
+          : '仅基于已上传资料'
         const benchmarkValidationErrors = validateModuleOutput(module.key, benchmarkOutput)
         if (benchmarkValidationErrors.length) {
           const message = benchmarkValidationErrors.join('；')
@@ -2552,7 +2616,10 @@ export const useStore = create<StoreState>((set, get) => ({
           set((state) => ({
             taskJournal: {
               ...state.taskJournal,
-              [savedTaskId]: { kind: 'module', status: 'failed', output: benchmarkOutput, inputFingerprint, updatedAt: new Date().toISOString() }
+              [savedTaskId]: {
+                kind: 'module', status: 'failed', output: benchmarkOutput, inputFingerprint,
+                searchStatus: benchmarkSearchStatus, searchEvidence: benchmarkEvidence, updatedAt: new Date().toISOString()
+              }
             }
           }))
           return
@@ -2561,10 +2628,13 @@ export const useStore = create<StoreState>((set, get) => ({
           artifacts: { ...state.artifacts, [module.id]: benchmarkOutput },
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'complete', output: benchmarkOutput, inputFingerprint, updatedAt: new Date().toISOString() }
+            [savedTaskId]: {
+              kind: 'module', status: 'complete', output: benchmarkOutput, inputFingerprint,
+              searchStatus: benchmarkSearchStatus, searchEvidence: benchmarkEvidence, updatedAt: new Date().toISOString()
+            }
           }
         }))
-        updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
+        updateModuleState(module.key, { status: 'done', message: benchmarkMessage, updatedAt: new Date().toISOString() })
         return
       }
       const moduleTaskContext = {
