@@ -647,6 +647,31 @@ function buildKeywordCloud(section: HtmlReportSection): HtmlReportKeywordCloudPr
     )
     .map(({ index }) => index)
   if (sellingPointColumns.length === 0) return null
+  if (section.number === 'M5') {
+    const columnIndex = sellingPointColumns[0]
+    const ordered = new Map<string, { label: string; count: number; sources: HtmlReportSourceRef[] }>()
+    table.rows.forEach((row, rowIndex) => {
+      const label = text(row[columnIndex] || '').split('｜')[0].replace(/^TOP\s*\d+\s*/iu, '').trim()
+      if (!label || /暂无|需补充|未知/u.test(label)) return
+      const key = label.toLocaleLowerCase('zh-CN')
+      const current = ordered.get(key) || { label, count: 0, sources: [] }
+      current.count += 1
+      current.sources.push(sourceRef(section, tableIndex, rowIndex, columnIndex))
+      ordered.set(key, current)
+    })
+    const items = Array.from(ordered.values()).slice(0, 12)
+    if (items.length >= 3) {
+      return {
+        title: '真实卖点清单',
+        tableIndex,
+        totalOccurrences: items.reduce((sum, item) => sum + item.count, 0),
+        items: items.map((item, index) => ({
+          ...item,
+          weight: Math.max(1, 5 - Math.floor(index / 3)) as 1 | 2 | 3 | 4 | 5
+        }))
+      }
+    }
+  }
   const entries = new Map<
     string,
     { label: string; count: number; sources: Map<string, HtmlReportSourceRef> }

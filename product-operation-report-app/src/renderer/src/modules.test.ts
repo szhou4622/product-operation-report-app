@@ -9,6 +9,7 @@ import {
   isNoAnalysisOutput,
   normalizeBenchmarkDimension,
   normalizeBenchmarkOutput,
+  normalizeMaterialReviewOutput,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
@@ -105,6 +106,11 @@ describe('v1 report modules', () => {
     expect(validateModuleOutput('material-review', truncated)).toEqual(
       expect.arrayContaining(['素材模块缺少自有框架2', '素材模块缺少竞品框架2', '素材模块缺少机会2'])
     )
+  })
+
+  it('replaces generic M3 headings with the actual inferred framework name', () => {
+    const output = '### 自有框架1\n\n框架类型：\n3.1｜厨房制作型｜痛点开头｜烹饪展示｜推荐\n\n可复用方向：\n继续更换菜品'
+    expect(normalizeMaterialReviewOutput(output)).toContain('### 自有素材TOP1｜3.1｜厨房制作型｜痛点开头｜烹饪展示｜推荐')
   })
 
   it('fingerprints exact module inputs and normalizes every benchmark dimension', () => {

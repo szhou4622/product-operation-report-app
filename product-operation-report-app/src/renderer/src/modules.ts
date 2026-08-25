@@ -122,6 +122,18 @@ export function normalizeBenchmarkOutput(raw: string): string {
   }).join('\n\n')
 }
 
+export function normalizeMaterialReviewOutput(raw: string): string {
+  const replaceGroup = (value: string, pattern: RegExp, label: string, field: string): string =>
+    value.replace(pattern, (full, hashes: string, rank: string, body: string) => {
+      const match = body.match(new RegExp(`${field}\\s*[：:]\\s*(?:\\r?\\n\\s*)?([^\\r\\n]+)`, 'u'))
+      const framework = match?.[1]?.trim()
+      return framework ? `${hashes}${label}TOP${rank}｜${framework}${body}` : full
+    })
+  let value = replaceGroup(raw, /^(#{1,6}\s*)自有框架([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '自有素材', '框架类型')
+  value = replaceGroup(value, /^(#{1,6}\s*)竞品框架([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '竞品素材', '框架类型')
+  return replaceGroup(value, /^(#{1,6}\s*)机会([1-5])([\s\S]*?)(?=^#{1,6}\s*|(?![\s\S]))/gmu, '补充机会', '机会框架')
+}
+
 export function findStaleModuleKeys(
   modules: ReportModule[],
   states: Partial<Record<ModuleKey, ModuleRunState>>
@@ -218,9 +230,9 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
   }
   if (key === 'platform-audience' && !/平台|成交人群/u.test(value)) errors.push('平台人群模块缺少平台或成交人群结果')
   if (key === 'material-review') {
-    for (const prefix of ['自有框架', '竞品框架', '机会']) {
+    for (const [prefix, normalized] of [['自有框架', '自有素材TOP'], ['竞品框架', '竞品素材TOP'], ['机会', '补充机会TOP']]) {
       for (let index = 1; index <= 5; index++) {
-        if (!value.includes(`${prefix}${index}`)) errors.push(`素材模块缺少${prefix}${index}`)
+        if (!value.includes(`${prefix}${index}`) && !value.includes(`${normalized}${index}`)) errors.push(`素材模块缺少${prefix}${index}`)
       }
     }
     if ((value.match(/可复用方向\s*[：:]/gu) || []).length < 10) errors.push('素材模块缺少自有或竞品可复用方向')

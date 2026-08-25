@@ -56,6 +56,7 @@ import {
   isNoAnalysisOutput,
   normalizeBenchmarkDimension,
   normalizeBenchmarkOutput,
+  normalizeMaterialReviewOutput,
   normalizeNoAnalysisOutput,
   validateModuleOutput
 } from './modules'
@@ -914,6 +915,14 @@ export const useStore = create<StoreState>((set, get) => ({
         const task = taskEntry?.[1]
         if (module.key === 'benchmark-brands' && task?.output) {
           const normalized = normalizeBenchmarkOutput(task.output)
+          if (normalized !== task.output) {
+            restoredTaskJournal[taskEntry![0]] = { ...task, output: normalized, updatedAt: new Date().toISOString() }
+            restoredArtifacts[module.id] = normalized
+            recoveredValidatedModule = true
+          }
+        }
+        if (module.key === 'material-review' && task?.output) {
+          const normalized = normalizeMaterialReviewOutput(task.output)
           if (normalized !== task.output) {
             restoredTaskJournal[taskEntry![0]] = { ...task, output: normalized, updatedAt: new Date().toISOString() }
             restoredArtifacts[module.id] = normalized
@@ -2437,7 +2446,11 @@ export const useStore = create<StoreState>((set, get) => ({
         return
       }
       if (reusableInput && saved?.status === 'complete' && saved.output?.trim()) {
-        const output = module.key === 'benchmark-brands' ? normalizeBenchmarkOutput(saved.output) : saved.output
+        const output = module.key === 'benchmark-brands'
+          ? normalizeBenchmarkOutput(saved.output)
+          : module.key === 'material-review'
+            ? normalizeMaterialReviewOutput(saved.output)
+            : saved.output
         set((state) => ({ artifacts: { ...state.artifacts, [module.id]: output } }))
         updateModuleState(module.key, { status: 'done', updatedAt: saved.updatedAt })
         return
@@ -2587,20 +2600,23 @@ export const useStore = create<StoreState>((set, get) => ({
         }))
         return
       }
-      const validationErrors = validateModuleOutput(module.key, result.text)
+      const moduleOutput = module.key === 'material-review'
+        ? normalizeMaterialReviewOutput(result.text)
+        : result.text
+      const validationErrors = validateModuleOutput(module.key, moduleOutput)
       if (validationErrors.length) {
         const message = validationErrors.join('；')
         updateModuleState(module.key, { status: 'failed', message, updatedAt: new Date().toISOString() })
         set((state) => ({
           taskJournal: {
             ...state.taskJournal,
-            [savedTaskId]: { kind: 'module', status: 'failed', output: result.text, inputFingerprint, updatedAt: new Date().toISOString() }
+            [savedTaskId]: { kind: 'module', status: 'failed', output: moduleOutput, inputFingerprint, updatedAt: new Date().toISOString() }
           }
         }))
         return
       }
-      if (isNoAnalysisOutput(result.text)) {
-        const output = normalizeNoAnalysisOutput(result.text)
+      if (isNoAnalysisOutput(moduleOutput)) {
+        const output = normalizeNoAnalysisOutput(moduleOutput)
         set((state) => ({
           taskJournal: {
             ...state.taskJournal,
@@ -2612,10 +2628,10 @@ export const useStore = create<StoreState>((set, get) => ({
         return
       }
       set((state) => ({
-        artifacts: { ...state.artifacts, [module.id]: result.text },
+        artifacts: { ...state.artifacts, [module.id]: moduleOutput },
         taskJournal: {
           ...state.taskJournal,
-          [savedTaskId]: { kind: 'module', status: 'complete', output: result.text, inputFingerprint, updatedAt: new Date().toISOString() }
+          [savedTaskId]: { kind: 'module', status: 'complete', output: moduleOutput, inputFingerprint, updatedAt: new Date().toISOString() }
         }
       }))
       updateModuleState(module.key, { status: 'done', updatedAt: new Date().toISOString() })
