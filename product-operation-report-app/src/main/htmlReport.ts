@@ -1109,10 +1109,12 @@ function renderSectionVisual(
 }
 
 function renderHero(model: HtmlReportModel, presentation: HtmlReportPresentation): string {
+  const primaryAudience = presentation.primaryAudience
   const mainMetric = presentation.mainMetric
   const displayTitle = model.title.replace(/\s*产品经营报告\s*$/u, '').trim() || model.title
-  const sourceAttrs = mainMetric
-    ? ` data-source-section="${escapeHtml(mainMetric.source.sectionNumber)}" data-source-table="${mainMetric.source.tableIndex ?? ''}" data-source-row="${mainMetric.source.rowIndex ?? ''}" data-source-column="${mainMetric.source.columnIndex ?? ''}" data-source-value="${escapeHtml(mainMetric.source.rawValue)}"`
+  const heroSource = primaryAudience?.source || mainMetric?.source
+  const sourceAttrs = heroSource
+    ? ` data-source-section="${escapeHtml(heroSource.sectionNumber)}" data-source-table="${heroSource.tableIndex ?? ''}" data-source-row="${heroSource.rowIndex ?? ''}" data-source-column="${heroSource.columnIndex ?? ''}" data-source-value="${escapeHtml(heroSource.rawValue)}"`
     : ''
   return `<header class="story-stat-hero">
     <div class="story-stat-hero__meta">
@@ -1121,7 +1123,13 @@ function renderHero(model: HtmlReportModel, presentation: HtmlReportPresentation
     </div>
     <div class="story-stat-hero__grid">
       ${
-        mainMetric
+        primaryAudience
+          ? `<div class="hero-figure hero-figure--audience"${sourceAttrs}>
+              <strong>${escapeHtml(primaryAudience.audience)}</strong>
+              <span>${escapeHtml(primaryAudience.rank)} · 跨平台核心人群</span>
+              <small>${escapeHtml(shorten(primaryAudience.judgment, 86))}</small>
+            </div>`
+          : mainMetric
           ? `<div class="hero-figure"${sourceAttrs}>
               <strong>${escapeHtml(mainMetric.value)}</strong>
               <span>${escapeHtml(mainMetric.label)}</span>
@@ -1155,10 +1163,11 @@ function renderHero(model: HtmlReportModel, presentation: HtmlReportPresentation
 
 function renderDecisionDashboard(presentation: HtmlReportPresentation): string {
   if (presentation.priorities.length === 0) return ''
+  const fromAudienceModule = presentation.priorities[0]?.source.sectionNumber === 'M2'
   return `<section class="decision-dashboard" aria-labelledby="decision-dashboard-title">
     <div class="decision-dashboard__head">
-      <h2 id="decision-dashboard-title">先做什么，再验证什么</h2>
-      <p>以下顺序直接来自第 0 章的人群优先级表，只表达经营先后，不代表人群占比。</p>
+      <h2 id="decision-dashboard-title">${fromAudienceModule ? '跨平台核心人群优先级' : '先做什么，再验证什么'}</h2>
+      <p>${fromAudienceModule ? '以下顺序来自M2多平台核心人群TOP5，综合视频号与抖店罗盘，不把不同平台百分比直接相加。' : '以下顺序直接来自第 0 章的人群优先级表，只表达经营先后，不代表人群占比。'}</p>
     </div>
     <div class="priority-lanes">${presentation.priorities
       .map(

@@ -118,6 +118,7 @@ export interface HtmlReportSectionPresentation {
 
 export interface HtmlReportPresentation {
   thesis: string
+  primaryAudience: HtmlReportPriorityPresentation | null
   mainMetric: HtmlReportMetricPresentation | null
   supportingSignals: HtmlReportMetricPresentation[]
   priorities: HtmlReportPriorityPresentation[]
@@ -1082,20 +1083,23 @@ function metricCandidates(model: HtmlReportModel): MetricCandidate[] {
 }
 
 function buildPriorities(model: HtmlReportModel): HtmlReportPriorityPresentation[] {
-  const section = model.sections.find((candidate) => candidate.number === '0')
+  const section = model.sections.find((candidate) => candidate.number === '0') ||
+    model.sections.find((candidate) => candidate.number === 'M2')
   if (!section) return []
-  const tableIndex = section.tables.findIndex((table) => tableMatches(table, [/优先级/, /核心人群/]))
+  const tableIndex = section.tables.findIndex((table) =>
+    tableMatches(table, [/优先级/, /核心人群|人群标签/])
+  )
   if (tableIndex < 0) return []
   const table = section.tables[tableIndex]
   const rankIndex = Math.max(0, findHeaderIndex(table, /优先级/))
-  const audienceIndex = Math.max(0, findHeaderIndex(table, /核心人群/))
-  const judgmentIndex = Math.max(0, findHeaderIndex(table, /关键判断|判断/))
+  const audienceIndex = Math.max(0, findHeaderIndex(table, /核心人群|人群标签/))
+  const judgmentIndex = Math.max(0, findHeaderIndex(table, /关键判断|判断|决策动机/))
   return table.rows.slice(0, 4).map((row, rowIndex) => ({
     rank: shorten(row[rankIndex] || `P${rowIndex + 1}`, 8),
     audience: shorten(row[audienceIndex] || '', 54),
     judgment: shorten(row[judgmentIndex] || row[2] || '', 112),
     source: {
-      sectionNumber: '0',
+      sectionNumber: section.number,
       tableIndex,
       rowIndex,
       columnIndex: audienceIndex,
@@ -1103,6 +1107,39 @@ function buildPriorities(model: HtmlReportModel): HtmlReportPriorityPresentation
       rawValue: row[audienceIndex] || ''
     }
   }))
+}
+
+function balancedSupportingSignals(metrics: MetricCandidate[]): HtmlReportMetricPresentation[] {
+  const m2 = metrics.filter((metric) => metric.source.sectionNumber === 'M2')
+  const platformOf = (metric: HtmlReportMetricPresentation): string =>
+    metric.sourceLabel.split('/')[0]?.trim() || ''
+  const platforms = Array.from(new Set(m2.map(platformOf).filter(Boolean)))
+  if (platforms.length <= 1) return metrics.slice(0, 3)
+
+  const coverageByLabel = new Map<string, Set<string>>()
+  for (const metric of m2) {
+    const platform = platformOf(metric)
+    if (!platform) continue
+    const coverage = coverageByLabel.get(metric.label) || new Set<string>()
+    coverage.add(platform)
+    coverageByLabel.set(metric.label, coverage)
+  }
+  const preference = (label: string): number =>
+    /女性占比/u.test(label) ? 3 : /年龄|消费/u.test(label) ? 2 : 1
+  const commonLabel = Array.from(coverageByLabel.entries())
+    .filter(([, coverage]) => coverage.size >= 2)
+    .sort((left, right) => preference(right[0]) - preference(left[0]) || right[1].size - left[1].size)[0]?.[0]
+
+  const selected: HtmlReportMetricPresentation[] = []
+  const usedPlatforms = new Set<string>()
+  for (const metric of commonLabel ? m2.filter((item) => item.label === commonLabel) : m2) {
+    const platform = platformOf(metric)
+    if (!platform || usedPlatforms.has(platform)) continue
+    selected.push(metric)
+    usedPlatforms.add(platform)
+    if (selected.length >= 3) break
+  }
+  return selected.length >= 2 ? selected : metrics.slice(0, 3)
 }
 
 export function buildHtmlReportPresentation(model: HtmlReportModel): HtmlReportPresentation {
@@ -1113,11 +1150,14 @@ export function buildHtmlReportPresentation(model: HtmlReportModel): HtmlReportP
     productModule?.paragraphs.find((paragraph) => !/^来源\s*[：:]/u.test(paragraph)) ||
     '报告结论与关键证据见下方各章节。'
   const metrics = metricCandidates(model).filter((metric) => metric.score >= 55)
+  const priorities = buildPriorities(model)
+  const primaryAudience = priorities.find((item) => item.source.sectionNumber === 'M2') || null
   return {
     thesis,
-    mainMetric: metrics[0] || null,
-    supportingSignals: metrics.slice(1, 4),
-    priorities: buildPriorities(model),
+    primaryAudience,
+    mainMetric: primaryAudience ? null : metrics[0] || null,
+    supportingSignals: primaryAudience ? balancedSupportingSignals(metrics) : metrics.slice(1, 4),
+    priorities,
     sections: model.sections.map(buildSectionPresentation)
   }
 }

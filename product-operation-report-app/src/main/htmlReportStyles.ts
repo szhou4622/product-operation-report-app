@@ -174,6 +174,13 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     letter-spacing: -.07em;
     white-space: nowrap;
   }
+  .hero-figure--audience strong {
+    max-width: 12em;
+    font: 850 clamp(28px, 4.2vw, 54px)/1.08 var(--font-display);
+    letter-spacing: -.035em;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .hero-figure span {
     max-width: 28ch;
     margin-top: 22px;

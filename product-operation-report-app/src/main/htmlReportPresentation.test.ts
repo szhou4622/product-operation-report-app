@@ -139,6 +139,32 @@ describe('v1 M1-M8 visual planning', () => {
 })
 
 describe('v2 M1-M6 visual planning', () => {
+  it('uses the cross-platform TOP1 as hero and balances one signal per platform', () => {
+    const markdown = [
+      '# 产品经营报告',
+      '## M2 成交人群分析',
+      '## 平台：视频号',
+      '### 1. 性别',
+      '信息：女性64.64%，男性35.36%',
+      '来源：视频号画像',
+      '## 平台：抖店罗盘',
+      '### 1. 性别',
+      '信息：女性78.14%，男性21.86%',
+      '来源：抖店画像',
+      '# 多平台核心人群TOP5',
+      '| 优先级 | 人群标签 | 占比/特征 | 决策动机 | 内容语言 |',
+      '| --- | --- | --- | --- | --- |',
+      '| 第一主力 | 31-40岁女性｜家庭决策者 | 双平台女性占比均较高 | 家庭采购 | 放心、省事 |'
+    ].join('\n')
+    const presentation = buildHtmlReportPresentation(parseHtmlReportModel(markdown))
+    expect(presentation.primaryAudience?.audience).toContain('家庭决策者')
+    expect(presentation.mainMetric).toBeNull()
+    expect(presentation.supportingSignals.map((metric) => metric.label)).toEqual(['女性占比', '女性占比'])
+    expect(new Set(presentation.supportingSignals.map((metric) => metric.sourceLabel.split('/')[0]?.trim()))).toEqual(
+      new Set(['视频号', '抖店罗盘'])
+    )
+  })
+
   it('renders platform facets, the fused selling-point matrix and ranking, VOC, and the audience route', () => {
     const markdown = [
       '# 产品经营报告',
