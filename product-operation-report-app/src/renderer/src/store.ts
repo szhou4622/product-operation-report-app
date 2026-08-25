@@ -896,6 +896,7 @@ export const useStore = create<StoreState>((set, get) => ({
     const restoredTaskJournal = { ...(lastProject?.taskJournal || {}) }
     const restoredModuleStates = { ...(lastProject?.moduleStates || {}) }
     let recoveredNoAnalysisModule = false
+    let recoveredValidatedModule = false
     let staleModules: ModuleKey[] = []
     if (lastProject?.engineVersion === 'v1') {
       for (const module of REPORT_MODULES) {
@@ -903,12 +904,19 @@ export const useStore = create<StoreState>((set, get) => ({
           taskId.endsWith(`:module:v1:${module.key}`)
         )
         const task = taskEntry?.[1]
-        if (restoredModuleStates[module.key]?.status !== 'failed' || !task?.output || !isNoAnalysisOutput(task.output)) continue
-        const output = normalizeNoAnalysisOutput(task.output)
-        restoredTaskJournal[taskEntry![0]] = { ...task, status: 'complete', output, updatedAt: new Date().toISOString() }
-        restoredModuleStates[module.key] = { status: 'skipped', message: output, updatedAt: new Date().toISOString() }
-        delete restoredArtifacts[module.id]
-        recoveredNoAnalysisModule = true
+        if (restoredModuleStates[module.key]?.status !== 'failed' || !task?.output) continue
+        if (isNoAnalysisOutput(task.output)) {
+          const output = normalizeNoAnalysisOutput(task.output)
+          restoredTaskJournal[taskEntry![0]] = { ...task, status: 'complete', output, updatedAt: new Date().toISOString() }
+          restoredModuleStates[module.key] = { status: 'skipped', message: output, updatedAt: new Date().toISOString() }
+          delete restoredArtifacts[module.id]
+          recoveredNoAnalysisModule = true
+        } else if (validateModuleOutput(module.key, task.output).length === 0) {
+          restoredTaskJournal[taskEntry![0]] = { ...task, status: 'complete', updatedAt: new Date().toISOString() }
+          restoredModuleStates[module.key] = { status: 'done', updatedAt: new Date().toISOString() }
+          restoredArtifacts[module.id] = task.output
+          recoveredValidatedModule = true
+        }
       }
       staleModules = [...findStaleModuleKeys(REPORT_MODULES, restoredModuleStates)]
       for (const key of staleModules) {
@@ -924,7 +932,7 @@ export const useStore = create<StoreState>((set, get) => ({
           if (taskId.includes(`:module:v1:${key}`)) delete restoredTaskJournal[taskId]
         }
       }
-      if (recoveredNoAnalysisModule || staleModules.length > 0) {
+      if (recoveredNoAnalysisModule || recoveredValidatedModule || staleModules.length > 0) {
         const outputByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredArtifacts[module.id]]))
         const messageByKey = Object.fromEntries(REPORT_MODULES.map((module) => [module.key, restoredModuleStates[module.key]?.message]))
         restoredReport = assembleModuleReport(REPORT_MODULES, outputByKey, messageByKey)
@@ -968,6 +976,14 @@ export const useStore = create<StoreState>((set, get) => ({
         role: 'assistant',
         kind: 'narration',
         text: '已将证据不足、明确无有效结果的模块恢复为“暂无分析”，现有有效模块和报告内容均已保留。'
+      })
+    }
+    if (recoveredValidatedModule) {
+      restoredMessages.push({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        kind: 'narration',
+        text: '已恢复符合新版校验规则的完整模块结果，没有重新调用模型，也没有重复扣分。'
       })
     }
     if (staleModules.length > 0) {

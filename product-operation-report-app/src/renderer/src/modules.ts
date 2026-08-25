@@ -195,8 +195,15 @@ export function validateModuleOutput(key: ModuleKey, text: string): string[] {
   if (key === 'selling-point-ranking' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')
   if (key === 'audience-sp-scene') {
     if (!ordered(value, ['TOP1', 'TOP2', 'TOP3', 'TOP4', 'TOP5'])) errors.push('人群卖点场景模块缺少TOP1-TOP5')
-    for (const label of ['核心人群', '核心卖点', '真实场景', '人群来源', '卖点来源', '场景来源']) {
-      if (!value.includes(label)) errors.push(`人群卖点场景模块缺少${label}`)
+    for (const requirement of [
+      { label: '核心人群', pattern: /核心人群/u },
+      { label: '核心卖点', pattern: /核心卖点/u },
+      { label: '真实场景', pattern: /真实场景/u },
+      { label: '人群来源或依据', pattern: /人群(?:来源|依据)/u },
+      { label: '卖点来源或依据', pattern: /卖点(?:来源|依据)/u },
+      { label: '场景来源或依据', pattern: /场景(?:来源|依据)/u }
+    ]) {
+      if (!requirement.pattern.test(value)) errors.push(`人群卖点场景模块缺少${requirement.label}`)
     }
   }
   return errors

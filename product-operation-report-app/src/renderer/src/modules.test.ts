@@ -74,6 +74,19 @@ describe('v1 report modules', () => {
     expect(normalizeNoAnalysisOutput(output)).toMatch(/^暂无分析：/u)
   })
 
+  it('accepts 来源 and 依据 as equivalent evidence labels in M8', () => {
+    const blocks = Array.from({ length: 5 }, (_, index) => [
+      `TOP${index + 1}`,
+      '核心人群：家庭用户',
+      '核心卖点：免洗即食',
+      '真实场景：家庭下饭',
+      '人群依据：成交画像',
+      '卖点依据：产品手卡',
+      '场景依据：自有素材'
+    ].join('\n')).join('\n\n')
+    expect(validateModuleOutput('audience-sp-scene', blocks)).toEqual([])
+  })
+
   it('fingerprints exact module inputs and normalizes every benchmark dimension', () => {
     const base = [{ role: 'user' as const, content: 'A' }]
     expect(fingerprintModuleMessages(base)).toBe(fingerprintModuleMessages(base))

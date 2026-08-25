@@ -356,16 +356,19 @@ function synthesizeModuleTables(number: string, markdown: string): HtmlReportTab
   }
   if (number === 'M8') {
     const blocks = splitBlocks(lines, /^TOP\s*[1-5]\b/iu)
-    const read = (block: { lines: string[] }, label: string): string => {
-      const line = block.lines.find((item) => new RegExp(`^${label}\\s*[：:]`, 'u').test(item)) || ''
-      return valueAfter(line, label)
+    const read = (block: { lines: string[] }, labels: string[]): string => {
+      for (const label of labels) {
+        const line = block.lines.find((item) => new RegExp(`^${label}\\s*[：:]`, 'u').test(item)) || ''
+        if (line) return valueAfter(line, label)
+      }
+      return ''
     }
     const rows = blocks.map((block) => [
       block.title.replace(/\s+/g, ''),
-      read(block, '核心人群'),
-      read(block, '核心卖点'),
-      read(block, '真实场景'),
-      [read(block, '人群来源'), read(block, '卖点来源'), read(block, '场景来源')].filter(Boolean).join('；')
+      read(block, ['核心人群']),
+      read(block, ['核心卖点']),
+      read(block, ['真实场景']),
+      [read(block, ['人群来源', '人群依据']), read(block, ['卖点来源', '卖点依据']), read(block, ['场景来源', '场景依据'])].filter(Boolean).join('；')
     ])
     return rows.length ? [{ context: '人群卖点场景匹配', headers: ['排序', '成交人群', '核心卖点', '核心场景', '数据依据'], rows }] : []
   }
