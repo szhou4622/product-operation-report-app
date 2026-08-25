@@ -107,6 +107,9 @@ export function normalizeBenchmarkDimension(dimension: string, raw: string): str
   ) {
     return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
   }
+  if (!/品牌\s*[：:]/u.test(body) && !/来源\s*[：:]/u.test(body)) {
+    return `### ${dimension}\n平台覆盖：天猫｜抖音｜视频号｜小红书\n\n暂无可靠对标\n\n说明：已按四平台要求执行公开检索，但本轮没有取得可追溯的公开页面或官方账号结果。`
+  }
   return `### ${dimension}\n${body || '暂无可靠对标'}`
 }
 
