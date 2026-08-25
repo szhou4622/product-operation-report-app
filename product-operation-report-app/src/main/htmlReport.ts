@@ -680,6 +680,41 @@ function renderOrdinalVisual(
   )
 }
 
+function renderVocInsights(
+  section: HtmlReportSection,
+  plan: HtmlReportSectionPresentation
+): string {
+  const tables = plannedTables(section, plan)
+  if (!tables.length) return ''
+  return renderFigure(
+    '用户需求、顾虑与真实反馈',
+    `<div class="voc-board">${tables
+      .map((table) => {
+        const rankIndex = Math.max(0, table.headers.findIndex((header) => /排名/u.test(header)))
+        const termIndex = Math.max(0, table.headers.findIndex((header) => /需求词/u.test(header)))
+        const frequencyIndex = Math.max(0, table.headers.findIndex((header) => /频次/u.test(header)))
+        const shareIndex = Math.max(0, table.headers.findIndex((header) => /占比/u.test(header)))
+        const quoteIndex = Math.max(0, table.headers.findIndex((header) => /代表原话/u.test(header)))
+        const sourceIndex = Math.max(0, table.headers.findIndex((header) => /^来源$/u.test(header)))
+        return `<section class="voc-group">
+          <header><div><small>用户声音分类</small><h3>${escapeHtml(table.context || '用户需求')}</h3></div><span>展示前5条</span></header>
+          <div class="voc-list">${table.rows.slice(0, 5).map((row) => `<article class="voc-item">
+            <span class="voc-rank">${escapeHtml(shorten(row[rankIndex] || '', 8))}</span>
+            <div class="voc-item__main">
+              <strong>${escapeHtml(shorten(row[termIndex] || '未命名需求', 34))}</strong>
+              <div class="voc-metrics"><span>${escapeHtml(row[frequencyIndex] || '频次未标注')}</span><span>${escapeHtml(row[shareIndex] || '占比未标注')}</span></div>
+              ${row[quoteIndex] ? `<blockquote>“${escapeHtml(shorten(row[quoteIndex], 74))}”</blockquote>` : ''}
+              ${row[sourceIndex] ? `<small class="voc-source">${escapeHtml(shorten(row[sourceIndex], 82))}</small>` : ''}
+            </div>
+          </article>`).join('')}</div>
+        </section>`
+      })
+      .join('')}</div>
+      <p class="visual-note">TOP只表示排序，不参与需求词统计。每组先展示前5条，完整TOP10、原话与来源保留在下方“查看完整VOC明细”中。</p>`,
+    'voc-visual'
+  )
+}
+
 function renderSellingStrategy(
   section: HtmlReportSection,
   plan: HtmlReportSectionPresentation
@@ -1041,6 +1076,9 @@ function renderSectionVisual(
     case 'selling-strategy':
       visual = renderSellingStrategy(section, plan)
       break
+    case 'voc-insights':
+      visual = renderVocInsights(section, plan)
+      break
     case 'ordinal-path':
       visual = renderOrdinalVisual(section, plan)
       break
@@ -1240,7 +1278,12 @@ function wrapSections(
       current.section.number === '0' && presentation.priorities.length > 0
         ? ''
         : renderSectionVisual(current.section, sectionPlan)
-    if (visual) segment = segment.replace(/<\/h2>/, `</h2>${visual}`)
+    if (visual && current.section.number === 'M5' && /VOC|用户真实需求/iu.test(current.section.title)) {
+      const headingEnd = segment.indexOf('</h2>') + '</h2>'.length
+      const heading = segment.slice(0, headingEnd)
+      const detail = segment.slice(headingEnd)
+      segment = `${heading}${visual}<details class="evidence-disclosure voc-details"><summary><span>查看完整VOC明细</span><small>4组 · 每组TOP10 · 含原话与来源</small></summary><div class="voc-raw-detail">${detail}</div></details>`
+    } else if (visual) segment = segment.replace(/<\/h2>/, `</h2>${visual}`)
     output += `<section class="report-section" data-section="${escapeHtml(current.section.number)}">${segment}</section>`
   }
   return output

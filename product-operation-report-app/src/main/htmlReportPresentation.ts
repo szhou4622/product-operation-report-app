@@ -12,6 +12,7 @@ export type HtmlReportVisualKind =
   | 'material-methods'
   | 'selling-point-matrix'
   | 'selling-strategy'
+  | 'voc-insights'
   | 'ordinal-path'
   | 'audience-map'
   | 'content-mix'
@@ -848,6 +849,8 @@ function findVisualSourceIndexes(section: HtmlReportSection, kind: HtmlReportVis
         tableMatches(table, [/卖点维度/, /我方产品卖点/]) ||
         tableMatches(table, [/排序/, /真实卖点/])
       ).slice(0, 2)
+    case 'voc-insights':
+      return matches((table) => tableMatches(table, [/排名/, /需求词/, /频次/, /占比/, /代表原话/])).slice(0, 4)
     case 'ordinal-path':
       return matches((table) => tableMatches(table, [/排序/, /用户视角卖点/])).slice(0, 1)
     case 'audience-map':
@@ -868,7 +871,7 @@ function visualKindForSection(section: HtmlReportSection): HtmlReportVisualKind 
     return findVisualSourceIndexes(section, 'selling-strategy').length > 0 ? 'selling-strategy' : 'summary-only'
   }
   if (section.number === 'M5' && /VOC|用户真实需求/iu.test(section.title)) {
-    return findVisualSourceIndexes(section, 'ordinal-path').length > 0 ? 'ordinal-path' : 'summary-only'
+    return findVisualSourceIndexes(section, 'voc-insights').length > 0 ? 'voc-insights' : 'summary-only'
   }
   if (section.number === 'M6' && /人群.*卖点.*场景/u.test(section.title)) {
     return findVisualSourceIndexes(section, 'audience-map').length > 0 ? 'audience-map' : 'summary-only'

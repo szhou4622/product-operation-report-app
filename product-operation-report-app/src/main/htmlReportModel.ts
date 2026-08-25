@@ -409,9 +409,35 @@ function synthesizeModuleTables(number: string, title: string, markdown: string)
     return tables
   }
   if ((number === 'M5' && /VOC|用户真实需求/iu.test(title)) || (number === 'M6' && !/人群.*卖点.*场景/u.test(title))) {
-    const blocks = splitBlocks(lines, /^(?:TOP\s*\d+|\d+[.、])/iu)
-    const rows = blocks.map((block, index) => [String(index + 1), block.title, '', block.lines.find((line) => /频次/u.test(line)) || '', block.lines.find((line) => /占比|来源/u.test(line)) || block.lines.join('；')])
-    return rows.length ? [{ context: 'VOC需求优先级', headers: ['排序', '用户视角卖点', '分类', '频次', '依据'], rows }] : []
+    const groups = splitBlocks(lines, /^\d+[.、]\s*(?:隐形需求|购买顾虑|高频问题|正向反馈)\s*TOP10$/iu)
+    return groups.flatMap((group) => {
+      const groupName = group.title.replace(/^\d+[.、]\s*/u, '').replace(/\s*TOP10$/iu, '')
+      const termLabel = groupName === '购买顾虑' ? '顾虑' : groupName === '高频问题' ? '问题' : groupName === '正向反馈' ? '反馈' : '需求'
+      const items = splitBlocks(group.lines, /^TOP\s*\d+$/iu)
+      const rows = items.map((item) => {
+        const frequencyLine = labeledValue(item.lines, ['频次'])
+        const frequency = frequencyLine.match(/\d+(?:\.\d+)?\s*次/u)?.[0] || frequencyLine.split(/[｜|]/u)[0] || ''
+        const share = frequencyLine.match(/占比\s*([\d.]+%)/u)?.[1] || ''
+        return [
+          item.title.replace(/\s+/gu, ''),
+          labeledValue(item.lines, [termLabel]) || '未命名需求',
+          frequency,
+          share,
+          labeledValue(item.lines, ['来源分布']),
+          labeledValue(item.lines, ['代表原话']),
+          labeledValue(item.lines, ['来源']),
+          labeledValue(item.lines, ['认可类型']),
+          labeledValue(item.lines, ['认可价值'])
+        ]
+      })
+      return rows.length
+        ? [{
+            context: groupName,
+            headers: ['排名', '需求词', '频次', '占比', '来源分布', '代表原话', '来源', '认可类型', '认可价值'],
+            rows
+          }]
+        : []
+    })
   }
   if (number === 'M7') {
     const rows: string[][] = []

@@ -175,7 +175,10 @@ describe('v2 M1-M6 visual planning', () => {
       '### TOP1｜九天益生菌发酵',
       '需求类型：品质需求\n买点：酸香更稳定\n自营依据：成交素材\n竞品依据：无\n卖点状态：核心验证卖点\n排序判断：产品事实与成交共同支持\n自营来源：产品手卡\n竞品来源：无',
       '## M5 用户真实需求VOC',
-      'TOP1\n用户视角卖点：开袋方便\n频次：12\n占比：35%\n来源：用户评价',
+      '1. 隐形需求 TOP10',
+      'TOP1\n需求：开袋方便\n频次：12次｜占比35%\n来源分布：自营\n代表原话：打开就能做菜\n来源：用户评价｜001',
+      '2. 购买顾虑 TOP10',
+      'TOP1\n顾虑：价格偏高\n频次：8次｜占比20%\n来源分布：自营\n代表原话：感觉有点贵\n来源：用户评价｜002',
       '## M6 人群×卖点×场景匹配',
       'TOP1\n核心人群：50+家庭女性\n核心卖点：九天益生菌发酵\n真实场景：晚餐给家人做酸菜鱼\n人群依据：视频号画像\n卖点依据：卖点排序TOP1\n场景依据：自有素材'
     ].join('\n')
@@ -188,7 +191,11 @@ describe('v2 M1-M6 visual planning', () => {
     expect(presentation.sections.find((section) => section.sectionNumber === 'M2')?.visualKind).toBe('percent-facets')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M3')?.visualKind).toBe('material-methods')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M4')?.visualKind).toBe('selling-strategy')
-    expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('ordinal-path')
+    const m5 = model.sections.find((section) => section.number === 'M5')
+    expect(m5?.tables[0]?.rows[0]?.[0]).toBe('TOP1')
+    expect(m5?.tables[0]?.rows[0]?.[1]).toBe('开袋方便')
+    expect(m5?.tables[0]?.rows[0]?.[1]).not.toContain('TOP')
+    expect(presentation.sections.find((section) => section.sectionNumber === 'M5')?.visualKind).toBe('voc-insights')
     expect(presentation.sections.find((section) => section.sectionNumber === 'M6')?.visualKind).toBe('audience-map')
   })
 })
