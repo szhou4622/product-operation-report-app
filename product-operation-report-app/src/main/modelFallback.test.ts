@@ -2,9 +2,16 @@ import { describe, expect, it } from 'vitest'
 import { shouldTryModelFallback } from './modelFallback'
 
 describe('task-scoped model fallback', () => {
-  it('allows zero-output provider recovery only for the platform audience module', () => {
+  it('allows zero-output provider recovery for both audience modules', () => {
     expect(shouldTryModelFallback({
       taskType: 'module_platform_audience',
+      failureKind: 'provider_error',
+      outputChars: 0,
+      aborted: false,
+      hasNext: true
+    })).toBe(true)
+    expect(shouldTryModelFallback({
+      taskType: 'module_audience_sp_scene',
       failureKind: 'provider_error',
       outputChars: 0,
       aborted: false,
