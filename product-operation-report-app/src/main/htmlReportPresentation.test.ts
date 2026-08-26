@@ -156,6 +156,12 @@ describe('v2 M1-M6 visual planning', () => {
       platformBlock('视频号', '64.64', '35.36'),
       platformBlock('抖店罗盘', '78.14', '21.86'),
       platformBlock('巨量云图', '71.43', '28.57'),
+      '# 多平台核心人群TOP5',
+      '| 优先级 | 人群标签 | 占比/特征 | 决策动机 | 内容语言 |',
+      '| --- | --- | --- | --- | --- |',
+      '| 第一主力 | 31-50岁女性｜家庭食品购买者 | 三个平台女性占比均较高 | 家庭采购更看重省心与适配 | 家庭使用＋食品场景＋稳定 |',
+      '### 第一主力来源',
+      '来源：视频号画像｜抖店罗盘画像｜巨量云图画像',
       '## M3 内容素材判断',
       '### 自有素材TOP1｜厨房制作型',
       '框架类型：厨房制作型',
@@ -179,6 +185,13 @@ describe('v2 M1-M6 visual planning', () => {
     expect((html.match(/class="material-card"/gu) || [])).toHaveLength(3)
     expect(html).toContain('查看完整平台画像明细')
     expect(html).toContain('查看完整素材判断明细')
+    const coreAudienceIndex = html.search(/<h1[^>]*>多平台核心人群TOP5<\/h1>/u)
+    const profileDetailsIndex = html.indexOf('<details class="evidence-disclosure module-details profile-details">')
+    expect(coreAudienceIndex).toBeGreaterThan(0)
+    expect(profileDetailsIndex).toBeGreaterThan(coreAudienceIndex)
+    expect(html.slice(profileDetailsIndex, html.indexOf('</details>', profileDetailsIndex))).not.toContain(
+      '多平台核心人群TOP5'
+    )
   })
 
   it('uses the cross-platform TOP1 as hero and balances one signal per platform', () => {

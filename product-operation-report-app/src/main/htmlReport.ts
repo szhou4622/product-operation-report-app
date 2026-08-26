@@ -1283,7 +1283,11 @@ function wrapSections(
       const heading = segment.slice(0, headingEnd)
       const detail = segment.slice(headingEnd)
       const platformCount = new Set(sectionPlan?.percentFacets.map((facet) => facet.group).filter(Boolean)).size
-      segment = `${heading}${visual}<details class="evidence-disclosure module-details profile-details"><summary><span>查看完整平台画像明细</span><small>${platformCount || 1}个平台 · 保留原始来源</small></summary><div class="module-raw-detail">${detail}</div></details>`
+      const coreAudienceHeading = /<h[1-4](?:\s[^>]*)?>\s*多平台核心人群\s*TOP\s*5\s*<\/h[1-4]>/iu
+      const coreAudienceIndex = detail.search(coreAudienceHeading)
+      const platformDetail = coreAudienceIndex >= 0 ? detail.slice(0, coreAudienceIndex) : detail
+      const coreAudienceDetail = coreAudienceIndex >= 0 ? detail.slice(coreAudienceIndex) : ''
+      segment = `${heading}${visual}${coreAudienceDetail}<details class="evidence-disclosure module-details profile-details"><summary><span>查看完整平台画像明细</span><small>${platformCount || 1}个平台 · 保留原始来源</small></summary><div class="module-raw-detail">${platformDetail}</div></details>`
     } else if (visual && current.section.number === 'M3') {
       const headingEnd = segment.indexOf('</h2>') + '</h2>'.length
       const heading = segment.slice(0, headingEnd)
