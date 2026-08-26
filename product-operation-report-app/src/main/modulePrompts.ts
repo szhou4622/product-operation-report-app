@@ -40,22 +40,26 @@ export function readBundledModulePrompt(key: ModuleKey, directories: string[]): 
       const path = join(directory, fileName)
       const manifestPath = join(directory, 'manifest.json')
       if (!existsSync(path) || !existsSync(manifestPath)) continue
-      const markdown = readFileSync(path, 'utf8')
-      if (!markdown || markdown.length > 200_000) continue
+      const rawMarkdown = readFileSync(path, 'utf8')
+      if (!rawMarkdown || rawMarkdown.length > 200_000) continue
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as PromptManifest
       const preserveInternalSeparators = fileName === 'M2-audience-analysis.md' || fileName === 'M4-selling-point-strategy.md'
-      const systemPrompt = section(markdown, '系统提示词', ['输出模板', '验证逻辑'], preserveInternalSeparators)
-      const outputTemplate = section(markdown, '输出模板', ['验证逻辑'])
       const expected = manifest.modules?.find((item) => item.fileName === fileName)?.systemPromptSha256
-      const actual = createHash('sha256').update(systemPrompt, 'utf8').digest('hex')
-      if (!systemPrompt || !outputTemplate || !expected || expected !== actual) continue
-      return {
-        key,
-        systemPrompt,
-        outputTemplate,
-        validation: section(markdown, '验证逻辑', []),
-        inputDescription: section(markdown, '输入资料', ['资料包含', '分析目的']),
-        purpose: section(markdown, '分析目的', ['系统提示词'])
+      const normalizedMarkdown = rawMarkdown.replace(/\r\n?/gu, '\n')
+      const candidates = Array.from(new Set([rawMarkdown, normalizedMarkdown, normalizedMarkdown.replace(/\n/gu, '\r\n')]))
+      for (const markdown of candidates) {
+        const systemPrompt = section(markdown, '系统提示词', ['输出模板', '验证逻辑'], preserveInternalSeparators)
+        const outputTemplate = section(markdown, '输出模板', ['验证逻辑'])
+        const actual = createHash('sha256').update(systemPrompt, 'utf8').digest('hex')
+        if (!systemPrompt || !outputTemplate || !expected || expected !== actual) continue
+        return {
+          key,
+          systemPrompt,
+          outputTemplate,
+          validation: section(markdown, '验证逻辑', []),
+          inputDescription: section(markdown, '输入资料', ['资料包含', '分析目的']),
+          purpose: section(markdown, '分析目的', ['系统提示词'])
+        }
       }
     } catch {
       // Continue to the next development/packaged candidate.
