@@ -168,11 +168,28 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Download all installers
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Prepare user-facing release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk -v heading="# ${GITHUB_REF_NAME}" '
+            $0 == heading { collecting = 1; next }
+            collecting && /^# v[0-9]/ { exit }
+            collecting { print }
+          ' product-operation-report-app/release-notes.txt > release-notes.md
+          if ! grep -q '^- ' release-notes.md; then
+            echo "No user-facing release notes found for ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
 
       - name: Publish release
         env:
@@ -182,7 +199,7 @@ jobs:
           release-assets/*
           --repo "${GITHUB_REPOSITORY}"
           --title "产品经营报告 ${GITHUB_REF_NAME}"
-          --generate-notes
+          --notes-file release-notes.md
 
   publish-update-server:
     name: Publish automatic update
@@ -224,11 +241,21 @@ jobs:
           printf '%s\n' "${UPDATE_MANIFEST_SIGNING_PRIVATE_KEY}" > "${RUNNER_TEMP}/update-signing/private.pem"
           chmod 0600 "${RUNNER_TEMP}/update-signing/private.pem"
           version="${GITHUB_REF_NAME#v}"
+          curl --fail --silent --show-error \
+            'https://update.dadaozixun.com/api/update/latest?app_name=ProductOperationReport' \
+            --output previous-update.json
+          min_supported_version="$(node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("previous-update.json", "utf8"));
+            if (body.app_name !== "ProductOperationReport" || typeof body.min_supported_version !== "string" || !body.min_supported_version.trim()) process.exit(1);
+            process.stdout.write(body.min_supported_version.trim());
+          ')"
           args=(
             product-operation-report-app/scripts/prepare-update-release.cjs
             --version "${version}"
             --artifacts-dir release-assets
             --notes-file product-operation-report-app/release-notes.txt
+            --min-supported-version "${min_supported_version}"
             --output update-package/latest.json
             --signing-key "${RUNNER_TEMP}/update-signing/private.pem"
           )
