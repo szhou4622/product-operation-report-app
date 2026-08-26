@@ -323,7 +323,7 @@ function synthesizeModuleTables(number: string, title: string, markdown: string)
       const value = info.replace(/^信息(?:冲突)?\s*[：:]\s*/u, '').trim()
       const items = value.split(/[，,；;]/u).map((item) => item.trim()).filter(Boolean)
       for (const item of items.length ? items : [value || '暂无分析']) {
-        const metric = item.match(/^(.*?)([+-]?\d+(?:\.\d+)?\s*%)$/u)
+        const metric = item.match(/^(.*?)([+-]?\d+(?:\.\d+)?\s*%)(?:\s*(?:（[^）]*）|\([^)]*\)))?\s*[。；;，,]?\s*$/u)
         const category = metric?.[1]?.trim() || dimension
         const effectiveDimension = /^(?:地域|地区)$/u.test(dimension) && !regionCategory.test(category) ? '' : dimension
         if (!effectiveDimension) continue

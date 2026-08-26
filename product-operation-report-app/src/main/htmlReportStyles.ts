@@ -522,7 +522,12 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: clamp(28px, 4vw, 56px);
   }
-  .profile-board { display: grid; gap: 34px; }
+  .profile-board {
+    display: grid;
+    grid-template-columns: repeat(var(--profile-columns, 1), minmax(0, 1fr));
+    gap: 24px;
+    align-items: start;
+  }
   .profile-platform-index {
     display: flex;
     gap: 18px;
@@ -544,8 +549,10 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     font-weight: 750;
   }
   .profile-panel {
-    padding: 0 0 26px;
-    border-bottom: 1px solid var(--line-strong);
+    min-width: 0;
+    padding: 0 18px 22px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
   }
   .profile-panel__head {
     display: grid;
@@ -586,8 +593,8 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
   }
   .profile-facets {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 20px 28px;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 20px 22px;
   }
   .bar-facet, .count-group { min-width: 0; }
   .bar-facet h3, .bar-facet h4, .count-group h3 { margin: 0 0 18px; font-size: 15px; }
@@ -597,7 +604,13 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
   .bar-label strong { font: 800 13px/1.3 var(--font-data); white-space: nowrap; }
   .bar-track { height: 7px; margin-top: 8px; background: var(--line); overflow: hidden; }
   .bar-track span { display: block; width: var(--bar-size); height: 100%; background: var(--series-1); }
-  .method-playbooks { display: grid; gap: 34px; }
+  .method-playbooks {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 24px;
+    align-items: start;
+  }
+  .method-playbook { min-width: 0; padding: 0 18px 18px; border: 1px solid var(--line-strong); background: var(--surface); }
   .method-playbook > header {
     display: grid;
     grid-template-columns: 96px minmax(0, 1fr);
@@ -612,6 +625,16 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     letter-spacing: .06em;
   }
   .method-playbook > header strong { font-size: 16px; }
+  .material-card-list { display: grid; gap: 1px; background: var(--line); }
+  .material-card { min-width: 0; padding: 16px; background: var(--paper); }
+  .material-card > header { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 10px; align-items: start; }
+  .material-card > header span { color: var(--accent); font: 800 12px/1.4 var(--font-data); }
+  .material-card > header strong { font-size: 13px; line-height: 1.55; }
+  .material-card > div, .material-card > footer { margin: 12px 0 0 42px; }
+  .material-card small { display: block; margin-bottom: 4px; color: var(--muted); font-size: 10px; font-weight: 800; }
+  .material-card p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.65; }
+  .module-details { margin-top: 28px; }
+  .module-raw-detail { padding: 18px 20px 22px; color: var(--ink-soft); font-size: 13px; line-height: 1.85; }
   .method-flow-list { border-bottom: 1px solid var(--line); }
   .method-flow-row {
     display: grid;
@@ -1088,6 +1111,7 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     .priority-grid, .method-grid, .mainline-grid, .audience-grid, .source-map, .facet-grid, .count-grid, .profile-facets, .guardrail-grid {
       grid-template-columns: minmax(0, 1fr);
     }
+    .profile-board, .method-playbooks { grid-template-columns: minmax(0, 1fr); }
     .content-mix-dashboard, .donut-pair { grid-template-columns: minmax(0, 1fr); }
     .content-mix-dashboard { gap: 38px; }
     .donut-pair { gap: 42px; }
@@ -1209,6 +1233,9 @@ export function renderReportStyles(tokens: ReportThemeTokens): string {
     .evidence-disclosure.voc-details { display: block !important; border: 0; }
     .evidence-disclosure.voc-details > summary { display: none !important; }
     .voc-raw-detail { padding: 12px 0 0; }
+    .evidence-disclosure.module-details { display: block !important; border: 0; }
+    .evidence-disclosure.module-details > summary { display: none !important; }
+    .module-raw-detail { padding: 12px 0 0; }
     .print-table-copy { display: block !important; }
     .table-wrap { break-inside: auto; }
     .table-wrap.wide-table { page: wide; }

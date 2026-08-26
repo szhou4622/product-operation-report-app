@@ -502,7 +502,7 @@ function renderPercentBars(
   )
   return renderFigure(
     title,
-    `${grouped.length > 1 ? `<div class="profile-platform-index"><strong>已识别 ${grouped.length} 个平台</strong><div>${grouped.map(([groupName]) => `<span>${escapeHtml(shorten(groupName, 28))}</span>`).join('')}</div></div>` : ''}<div class="profile-board">${grouped
+    `${grouped.length > 1 ? `<div class="profile-platform-index"><strong>已识别 ${grouped.length} 个平台</strong><div>${grouped.map(([groupName]) => `<span>${escapeHtml(shorten(groupName, 28))}</span>`).join('')}</div></div>` : ''}<div class="profile-board" style="--profile-columns:${Math.min(grouped.length, 3)}">${grouped
       .map(([groupName, groupFacets]) => {
         const statFacets = groupFacets.filter((facet) => facet.mode === 'stat')
         const barFacets = groupFacets.filter((facet) => facet.mode === 'bars')
@@ -570,24 +570,15 @@ function renderMaterialVisual(
               : table.context === '补充机会'
                 ? '补充机会'
                 : `竞品借鉴${table.context ? ` · ${table.context}` : ''}`
-          )}</span><strong>${escapeHtml(
-            shorten(table.headers.join(' → '), 58)
-          )}</strong></header>
-          <div class="method-flow-list">${table.rows
-            .slice(0, 6)
+          )}</span><strong>${table.rows.length} 个重点方向</strong></header>
+          <div class="material-card-list">${table.rows
+            .slice(0, 5)
             .map(
-              (row, index) => `<div class="method-flow-row">
-                <span class="method-flow-row__index">${String(index + 1).padStart(2, '0')}</span>
-                <div><small>${escapeHtml(shorten(table.headers[0] || '起点', 16))}</small><strong>${escapeHtml(
-                  shorten(row[0] || '素材方向', 52)
-                )}</strong></div>
-                <div><small>${escapeHtml(shorten(table.headers[1] || '方法', 16))}</small><p>${escapeHtml(
-                  shorten(row[1] || '', 86)
-                )}</p></div>
-                <div><small>${escapeHtml(shorten(table.headers[2] || '迁移', 16))}</small><p>${escapeHtml(
-                  shorten(row[2] || '', 92)
-                )}</p></div>
-              </div>`
+              (row, index) => `<article class="material-card">
+                <header><span>${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(shorten(row[0] || '素材方向', 70))}</strong></header>
+                <div><small>${escapeHtml(shorten(table.headers[1] || '数据依据', 16))}</small><p>${escapeHtml(shorten(row[1] || '暂无数据依据', 100))}</p></div>
+                <footer><small>${escapeHtml(shorten(table.headers[2] || '可复用方向', 16))}</small><p>${escapeHtml(shorten(row[2] || '暂无可复用方向', 120))}</p></footer>
+              </article>`
             )
             .join('')}</div>
         </section>`
@@ -1287,7 +1278,19 @@ function wrapSections(
       current.section.number === '0' && presentation.priorities.length > 0
         ? ''
         : renderSectionVisual(current.section, sectionPlan)
-    if (visual && current.section.number === 'M5' && /VOC|用户真实需求/iu.test(current.section.title)) {
+    if (visual && current.section.number === 'M2') {
+      const headingEnd = segment.indexOf('</h2>') + '</h2>'.length
+      const heading = segment.slice(0, headingEnd)
+      const detail = segment.slice(headingEnd)
+      const platformCount = new Set(sectionPlan?.percentFacets.map((facet) => facet.group).filter(Boolean)).size
+      segment = `${heading}${visual}<details class="evidence-disclosure module-details profile-details"><summary><span>查看完整平台画像明细</span><small>${platformCount || 1}个平台 · 保留原始来源</small></summary><div class="module-raw-detail">${detail}</div></details>`
+    } else if (visual && current.section.number === 'M3') {
+      const headingEnd = segment.indexOf('</h2>') + '</h2>'.length
+      const heading = segment.slice(0, headingEnd)
+      const detail = segment.slice(headingEnd)
+      const directionCount = sectionPlan?.visualSourceTableIndexes.reduce((sum, tableIndex) => sum + (current.section.tables[tableIndex]?.rows.length || 0), 0) || 0
+      segment = `${heading}${visual}<details class="evidence-disclosure module-details material-details"><summary><span>查看完整素材判断明细</span><small>${directionCount}个方向 · 含依据与复用建议</small></summary><div class="module-raw-detail">${detail}</div></details>`
+    } else if (visual && current.section.number === 'M5' && /VOC|用户真实需求/iu.test(current.section.title)) {
       const headingEnd = segment.indexOf('</h2>') + '</h2>'.length
       const heading = segment.slice(0, headingEnd)
       const detail = segment.slice(headingEnd)

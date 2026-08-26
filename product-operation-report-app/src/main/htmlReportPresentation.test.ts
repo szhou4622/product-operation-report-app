@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { parseHtmlReportModel } from './htmlReportModel'
 import { buildHtmlReportPresentation } from './htmlReportPresentation'
+import { markdownToHtmlDocument } from './htmlReport'
 
 describe('selling-point keyword cloud', () => {
   it('uses only the selling-point column and rejects file/source metadata noise', () => {
@@ -139,6 +140,47 @@ describe('v1 M1-M8 visual planning', () => {
 })
 
 describe('v2 M1-M6 visual planning', () => {
+  it('renders exactly one independent portrait panel per uploaded platform and three material pools', async () => {
+    const platformBlock = (platform: string, female: string, male: string): string => [
+      `## 平台：${platform}`,
+      '### 1. 性别',
+      `信息：女性${female}%，男性${male}%（平台预测口径）。`,
+      `来源：${platform}画像`,
+      '### 2. 年龄',
+      '信息：31-40岁40%，41-50岁30%',
+      `来源：${platform}画像`
+    ].join('\n')
+    const markdown = [
+      '# 产品经营报告',
+      '## M2 成交人群分析',
+      platformBlock('视频号', '64.64', '35.36'),
+      platformBlock('抖店罗盘', '78.14', '21.86'),
+      platformBlock('巨量云图', '71.43', '28.57'),
+      '## M3 内容素材判断',
+      '### 自有素材TOP1｜厨房制作型',
+      '框架类型：厨房制作型',
+      '数据依据：20条｜占40%',
+      '可复用方向：痛点切入→制作→成品',
+      '### 竞品素材TOP1｜素人种草型',
+      '框架类型：素人种草型',
+      '数据依据：10条｜占30%',
+      '可复用方向：生活场景→体验→推荐',
+      '### 补充机会TOP1｜专家讲解型',
+      '机会框架：专家讲解型',
+      '竞品依据：5条',
+      '可补充方向：顾虑提问→证据解释→建议'
+    ].join('\n')
+    const html = await markdownToHtmlDocument(markdown)
+    expect((html.match(/class="profile-panel"/gu) || [])).toHaveLength(3)
+    expect(html).toContain('视频号')
+    expect(html).toContain('抖店罗盘')
+    expect(html).toContain('巨量云图')
+    expect((html.match(/class="method-playbook"/gu) || [])).toHaveLength(3)
+    expect((html.match(/class="material-card"/gu) || [])).toHaveLength(3)
+    expect(html).toContain('查看完整平台画像明细')
+    expect(html).toContain('查看完整素材判断明细')
+  })
+
   it('uses the cross-platform TOP1 as hero and balances one signal per platform', () => {
     const markdown = [
       '# 产品经营报告',
