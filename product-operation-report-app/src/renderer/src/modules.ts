@@ -366,22 +366,27 @@ function validateVocGroups(value: string): string[] {
     const start = value.indexOf(group.heading)
     const end = index + 1 < VOC_GROUPS.length ? value.indexOf(VOC_GROUPS[index + 1].heading, start + group.heading.length) : value.length
     const section = value.slice(start, end < 0 ? value.length : end)
-    const ranks = [...section.matchAll(/^#{0,6}\s*TOP\s*(\d{1,2})\s*$/gimu)].map((match) => Number(match[1]))
+    const itemMatches = [...section.matchAll(/^#{0,6}\s*TOP\s*(\d{1,2})\s*$/gimu)]
+    const ranks = itemMatches.map((match) => Number(match[1]))
     if (ranks.length !== 10 || ranks.some((rank, rankIndex) => rank !== rankIndex + 1)) {
       errors.push(`${group.heading}必须完整包含TOP1-TOP10`)
     }
-    for (const field of [group.term, '频次', '占比', '来源分布', '代表原话', '来源']) {
-      if ((section.match(new RegExp(`^${field}\\s*[：:]`, 'gmu')) || []).length < 10) {
-        errors.push(`${group.heading}每条都必须包含${field}`)
+    const missingFields = new Set<string>()
+    for (let itemIndex = 0; itemIndex < itemMatches.length; itemIndex++) {
+      const itemStart = itemMatches[itemIndex].index || 0
+      const itemEnd = itemIndex + 1 < itemMatches.length ? itemMatches[itemIndex + 1].index || section.length : section.length
+      const item = section.slice(itemStart, itemEnd)
+      for (const field of [group.term, '频次', '来源分布', '代表原话', '来源']) {
+        if (!new RegExp(`^${field}\\s*[：:]\\s*\\S+`, 'mu').test(item)) missingFields.add(field)
       }
-    }
-    if (group.positive) {
-      for (const field of ['认可类型', '认可价值']) {
-        if ((section.match(new RegExp(`^${field}\\s*[：:]`, 'gmu')) || []).length < 10) {
-          errors.push(`${group.heading}每条都必须包含${field}`)
+      if (!/(?:^|[｜|]\s*)占比(?:\s*[：:]\s*|\s*)\S+/mu.test(item)) missingFields.add('占比')
+      if (group.positive) {
+        for (const field of ['认可类型', '认可价值']) {
+          if (!new RegExp(`^${field}\\s*[：:]\\s*\\S+`, 'mu').test(item)) missingFields.add(field)
         }
       }
     }
+    for (const field of missingFields) errors.push(`${group.heading}每条都必须包含${field}`)
   }
   return errors
 }
@@ -494,7 +499,8 @@ export function moduleValidationRetryInstruction(
         '必须一次性完整输出以下四组，顺序和名称不得改变：1. 隐形需求 TOP10；2. 购买顾虑 TOP10；3. 高频问题 TOP10；4. 正向反馈 TOP10。',
         '每组必须有TOP1到TOP10共10条，不能只输出第一组。',
         '隐形需求每条包含需求、频次、占比、来源分布、代表原话、来源；购买顾虑将需求改为顾虑；高频问题改为问题；正向反馈改为反馈，并额外包含认可类型、认可价值。',
-        'TOP只表示排序，不得作为需求词、顾虑词、问题词或反馈词。'
+        'TOP只表示排序，不得作为需求词、顾虑词、问题词或反馈词。',
+        '没有可靠统计时必须写“频次：无精确频次｜占比无法计算”，不得虚构数字。'
       ]
     : []
   return [

@@ -177,6 +177,7 @@ describe('v2 six-module report engine', () => {
       ].join('\n'))
     ].join('\n')).join('\n\n')
     expect(validateModuleOutput('voc', valid, 'v2')).toEqual([])
+    expect(validateModuleOutput('voc', valid.replace('频次：20次\n占比：10%', '频次：无精确频次｜占比无法计算'), 'v2')).toEqual([])
     expect(validateModuleOutput('voc', valid.split('2. 购买顾虑 TOP10')[0], 'v2')).toContain(
       'VOC必须按顺序完整包含隐形需求、购买顾虑、高频问题、正向反馈四组TOP10'
     )
