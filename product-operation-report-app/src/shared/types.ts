@@ -656,6 +656,18 @@ export type SourceKindV1 =
   | 'audience-data'
   | 'voice-data'
 
+export const SOURCE_KIND_LABELS: Record<SourceKindV1, string> = {
+  'product-supply': '产品与供给资料',
+  'business-data': '经营与交易数据',
+  'material-data': '内容素材与表现数据',
+  'audience-data': '人群与行为画像',
+  'voice-data': '用户声音与反馈'
+}
+
+export function sourceKindLabel(kind: SourceKindV1 | undefined, legacyPurpose = ''): string {
+  return kind ? SOURCE_KIND_LABELS[kind] : legacyPurpose.trim()
+}
+
 export interface ReportModule {
   id: number
   key: ModuleKey

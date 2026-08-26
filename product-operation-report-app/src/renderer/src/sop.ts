@@ -1,4 +1,4 @@
-import type { ChatMessage, SourceImageAttachment } from '../../shared/types'
+import { sourceKindLabel, type ChatMessage, type SourceImageAttachment, type SourceKindV1 } from '../../shared/types'
 import { MODEL_RUNTIME_RULES_VERSION, SOURCE_TEXT_LIMIT } from '../../shared/reportVersions'
 import type { SourceCleanBatchContext } from './sourceCleanBatches'
 import {
@@ -55,6 +55,7 @@ export interface SourceLike {
   attribution?: string // 用户指定归属：自有数据/竞品数据
   platform?: string // 用户指定平台/来源
   purpose?: string // 用户指定信息类型
+  kindV1?: SourceKindV1 // 用户在新版下拉框明确选择的业务资料类型
   note?: string // 用户对这份文件的补充信息
 }
 
@@ -255,7 +256,7 @@ export function buildExtractMessages(
   const userCtx = [
     source.attribution ? `归属：${source.attribution}` : '',
     source.platform ? `平台/来源：${source.platform}` : '',
-    source.purpose ? `信息类型：${source.purpose}` : '',
+    sourceKindLabel(source.kindV1, source.purpose || '') ? `信息类型：${sourceKindLabel(source.kindV1, source.purpose || '')}` : '',
     source.note ? `补充信息：${source.note}` : ''
   ]
     .filter(Boolean)

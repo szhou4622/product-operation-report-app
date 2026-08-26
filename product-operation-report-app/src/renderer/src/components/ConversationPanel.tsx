@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
-import type { SourceKindV1 } from '../../../shared/types'
+import { sourceKindLabel, type SourceKindV1 } from '../../../shared/types'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { derivedSourceCount, evidenceScopeStats, topLevelSourceCount, useStore } from '../store'
@@ -511,7 +511,7 @@ export default function ConversationPanel(): JSX.Element {
                   <span title={s.name}>{s.name}</span>
                   <b>{usable ? s.attribution || '待确认' : '无需确认'}</b>
                   <b>{usable ? s.platform || '平台（选填）' : '—'}</b>
-                  <b>{usable ? s.purpose || '类型（选填）' : '—'}</b>
+                  <b>{usable ? sourceKindLabel(s.kindV1, s.purpose || '') || '资料类型待选择' : '—'}</b>
                   <em>
                     {s.parsing
                       ? '解析中'

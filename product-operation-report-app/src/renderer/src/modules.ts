@@ -10,7 +10,7 @@ import type {
   SourceKindV1,
   ModuleRunState
 } from '../../shared/types'
-import { REPORT_MODULES_V2 } from '../../shared/types'
+import { REPORT_MODULES_V2, SOURCE_KIND_LABELS } from '../../shared/types'
 
 export interface ModuleSourceBlock {
   name: string
@@ -38,14 +38,6 @@ export interface SourceSufficiency {
 export interface BenchmarkVerification {
   status: SearchVerificationStatus
   evidence: SearchEvidence[]
-}
-
-export const SOURCE_KIND_LABELS: Record<SourceKindV1, string> = {
-  'product-supply': '产品与供给资料',
-  'business-data': '经营与交易数据',
-  'material-data': '内容素材与表现数据',
-  'audience-data': '人群与行为画像',
-  'voice-data': '用户声音与反馈'
 }
 
 export function evaluateSourceSufficiency(
@@ -285,7 +277,7 @@ export function buildModuleMessages(module: ReportModule, context: ModuleContext
   const sourceText = context.sources.length
     ? context.sources.map((source, index) => [
         `### 来源 ${index + 1}：${source.name}`,
-        `业务类型：${source.kindV1}`,
+        `业务类型：${SOURCE_KIND_LABELS[source.kindV1]}`,
         source.attribution ? `归属：${source.attribution}` : '',
         source.platform ? `平台：${source.platform}` : '',
         source.text

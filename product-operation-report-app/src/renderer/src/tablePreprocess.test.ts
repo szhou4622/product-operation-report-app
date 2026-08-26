@@ -99,4 +99,18 @@ describe('local structured table preparation', () => {
     expect(result.canSkipModel).toBe(true)
     expect(result.mode).toBe('product')
   })
+
+  it('uses the user-selected business type instead of the legacy purpose field', () => {
+    const text = '标签类型,标签,占比\n年龄,31-40岁,60%'
+    const result = preprocessTableForModel(text)
+    const detail = buildLocalTableCleanDetail({
+      name: '成交画像.csv',
+      kind: 'table',
+      text,
+      kindV1: 'audience-data',
+      purpose: '旧版商品经营数据'
+    }, result)
+    expect(detail).toContain('信息类型：人群与行为画像')
+    expect(detail).not.toContain('旧版商品经营数据')
+  })
 })

@@ -1,5 +1,5 @@
 import Papa from 'papaparse'
-import type { SourceCleanCacheInput } from '../../shared/types'
+import { sourceKindLabel, type SourceCleanCacheInput } from '../../shared/types'
 import { sourceEvidenceId, sourceEvidenceScope } from './sourceCleanBatches'
 
 const MAX_STRUCTURED_TABLE_CHARS = 40 * 1024 * 1024
@@ -241,7 +241,7 @@ export function buildLocalTableCleanDetail(
   if (bodyCount !== result.originalRows || bodyCount !== result.retainedRows) return null
   const attribution = metadataValue(source.attribution, '自有数据')
   const platform = metadataValue(source.platform, '需补充')
-  const purpose = metadataValue(source.purpose, '结构化表格数据')
+  const purpose = sourceKindLabel(source.kindV1, source.purpose || '') || '结构化表格数据'
   const note = source.note?.trim() ? `\n用户补充：${source.note.trim()}` : ''
   const scope = sourceEvidenceScope(source)
   let rowOffset = 0
