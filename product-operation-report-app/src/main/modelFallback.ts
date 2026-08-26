@@ -5,6 +5,17 @@ const RECOVERABLE_FAILURES = new Set([
   'model_unavailable',
   'provider_route_unavailable'
 ])
+const MODULE_PROVIDER_RECOVERY_TASKS = new Set<ModelTaskType>([
+  'source_clean',
+  'module_product_info',
+  'module_platform_audience',
+  'module_material_review',
+  'module_benchmark',
+  'module_selling_points',
+  'module_voc',
+  'module_ranking',
+  'module_audience_sp_scene'
+])
 
 export function profilesForTask(profiles: ModelProfile[], taskType: ModelTaskType): ModelProfile[] {
   if (taskType !== 'module_benchmark' || !profiles.length) return profiles
@@ -34,7 +45,7 @@ export interface ModelFallbackDecisionInput {
  */
 export function shouldTryModelFallback(input: ModelFallbackDecisionInput): boolean {
   const taskSpecificProviderRecovery =
-    (input.taskType === 'source_clean' || input.taskType === 'module_platform_audience' || input.taskType === 'module_audience_sp_scene') &&
+    Boolean(input.taskType && MODULE_PROVIDER_RECOVERY_TASKS.has(input.taskType)) &&
     input.failureKind === 'provider_error'
   return Boolean(
     input.hasNext &&

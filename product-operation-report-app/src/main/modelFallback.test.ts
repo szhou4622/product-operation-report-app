@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { shouldTryModelFallback } from './modelFallback'
 
 describe('task-scoped model fallback', () => {
-  it('allows zero-output provider recovery for both audience modules', () => {
+  it('allows zero-output provider recovery for cleaning and every report module', () => {
     expect(shouldTryModelFallback({
       taskType: 'source_clean',
       failureKind: 'provider_error',
@@ -24,8 +24,22 @@ describe('task-scoped model fallback', () => {
       aborted: false,
       hasNext: true
     })).toBe(true)
+    for (const taskType of [
+      'module_product_info',
+      'module_material_review',
+      'module_selling_points',
+      'module_voc'
+    ] as const) {
+      expect(shouldTryModelFallback({
+        taskType,
+        failureKind: 'provider_error',
+        outputChars: 0,
+        aborted: false,
+        hasNext: true
+      })).toBe(true)
+    }
     expect(shouldTryModelFallback({
-      taskType: 'module_selling_points',
+      taskType: 'final_part',
       failureKind: 'provider_error',
       outputChars: 0,
       aborted: false,
