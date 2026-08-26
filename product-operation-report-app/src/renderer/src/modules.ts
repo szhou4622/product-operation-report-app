@@ -348,6 +348,44 @@ function extractRankedSellingPointNames(value: string): string[] {
     .map((match) => match[2].trim())
 }
 
+const VOC_GROUPS = [
+  { heading: '1. 隐形需求 TOP10', term: '需求', positive: false },
+  { heading: '2. 购买顾虑 TOP10', term: '顾虑', positive: false },
+  { heading: '3. 高频问题 TOP10', term: '问题', positive: false },
+  { heading: '4. 正向反馈 TOP10', term: '反馈', positive: true }
+] as const
+
+function validateVocGroups(value: string): string[] {
+  const errors: string[] = []
+  if (!ordered(value, VOC_GROUPS.map((group) => group.heading))) {
+    errors.push('VOC必须按顺序完整包含隐形需求、购买顾虑、高频问题、正向反馈四组TOP10')
+    return errors
+  }
+  for (let index = 0; index < VOC_GROUPS.length; index++) {
+    const group = VOC_GROUPS[index]
+    const start = value.indexOf(group.heading)
+    const end = index + 1 < VOC_GROUPS.length ? value.indexOf(VOC_GROUPS[index + 1].heading, start + group.heading.length) : value.length
+    const section = value.slice(start, end < 0 ? value.length : end)
+    const ranks = [...section.matchAll(/^#{0,6}\s*TOP\s*(\d{1,2})\s*$/gimu)].map((match) => Number(match[1]))
+    if (ranks.length !== 10 || ranks.some((rank, rankIndex) => rank !== rankIndex + 1)) {
+      errors.push(`${group.heading}必须完整包含TOP1-TOP10`)
+    }
+    for (const field of [group.term, '频次', '占比', '来源分布', '代表原话', '来源']) {
+      if ((section.match(new RegExp(`^${field}\\s*[：:]`, 'gmu')) || []).length < 10) {
+        errors.push(`${group.heading}每条都必须包含${field}`)
+      }
+    }
+    if (group.positive) {
+      for (const field of ['认可类型', '认可价值']) {
+        if ((section.match(new RegExp(`^${field}\\s*[：:]`, 'gmu')) || []).length < 10) {
+          errors.push(`${group.heading}每条都必须包含${field}`)
+        }
+      }
+    }
+  }
+  return errors
+}
+
 export function validateModuleOutput(
   key: ModuleKey,
   text: string,
@@ -420,7 +458,7 @@ export function validateModuleOutput(
       }
     }
   }
-  if (key === 'voc' && (!/频次/u.test(value) || !/占比/u.test(value))) errors.push('VOC结果必须包含频次和占比')
+  if (key === 'voc') errors.push(...validateVocGroups(value))
   if (key === 'selling-point-ranking' && engineVersion === 'v1' && !/TOP\s*10|TOP1|核心主卖点/iu.test(value)) errors.push('卖点排序缺少TOP10或分档')
   if (key === 'audience-sp-scene') {
     if (!ordered(value, ['TOP1', 'TOP2', 'TOP3', 'TOP4', 'TOP5'])) errors.push('人群卖点场景模块缺少TOP1-TOP5')
@@ -451,12 +489,21 @@ export function moduleValidationRetryInstruction(
     voc: '1. 隐形需求 TOP10',
     'audience-sp-scene': '核心人群 × 卖点 × 场景 TOP5'
   }
+  const vocRequirements = module.key === 'voc'
+    ? [
+        '必须一次性完整输出以下四组，顺序和名称不得改变：1. 隐形需求 TOP10；2. 购买顾虑 TOP10；3. 高频问题 TOP10；4. 正向反馈 TOP10。',
+        '每组必须有TOP1到TOP10共10条，不能只输出第一组。',
+        '隐形需求每条包含需求、频次、占比、来源分布、代表原话、来源；购买顾虑将需求改为顾虑；高频问题改为问题；正向反馈改为反馈，并额外包含认可类型、认可价值。',
+        'TOP只表示排序，不得作为需求词、顾虑词、问题词或反馈词。'
+      ]
+    : []
   return [
     `这是第${pass}次结构纠正。上一轮输出未通过校验：${errors.slice(0, 8).join('；')}。`,
     `请完全替换上一轮输出，从头输出M${module.id} ${module.title}的最终结果。`,
     requiredFirstLine[module.key] ? `第一行必须直接是：${requiredFirstLine[module.key]}` : '',
     '禁止输出“我在整理、我会分析、正在对齐、接下来”等过程说明，禁止只返回计划或解释。',
     '严格遵守系统提示词和固定模板；资料缺失写“无”或“暂无分析”，不得省略固定字段。',
+    ...vocRequirements,
     '只输出最终结果。'
   ].filter(Boolean).join('\n')
 }

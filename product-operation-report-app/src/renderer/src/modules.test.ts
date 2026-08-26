@@ -156,6 +156,34 @@ describe('v2 six-module report engine', () => {
     )
   })
 
+  it('requires all four VOC groups and keeps TOP labels separate from user terms', () => {
+    const groups = [
+      { heading: '1. 隐形需求 TOP10', field: '需求', positive: false },
+      { heading: '2. 购买顾虑 TOP10', field: '顾虑', positive: false },
+      { heading: '3. 高频问题 TOP10', field: '问题', positive: false },
+      { heading: '4. 正向反馈 TOP10', field: '反馈', positive: true }
+    ]
+    const valid = groups.map((group) => [
+      group.heading,
+      ...Array.from({ length: 10 }, (_, index) => [
+        `TOP${index + 1}`,
+        `${group.field}：真实词${index + 1}`,
+        ...(group.positive ? ['认可类型：产品体验', '认可价值：使用更方便'] : []),
+        `频次：${20 - index}次`,
+        `占比：${10 - index / 2}%`,
+        '来源分布：自营',
+        `代表原话：用户原话${index + 1}`,
+        `来源：评价表｜${index + 1}`
+      ].join('\n'))
+    ].join('\n')).join('\n\n')
+    expect(validateModuleOutput('voc', valid, 'v2')).toEqual([])
+    expect(validateModuleOutput('voc', valid.split('2. 购买顾虑 TOP10')[0], 'v2')).toContain(
+      'VOC必须按顺序完整包含隐形需求、购买顾虑、高频问题、正向反馈四组TOP10'
+    )
+    const module = REPORT_MODULES_V2.find((item) => item.key === 'voc')!
+    expect(moduleValidationRetryInstruction(module, ['缺少三组'], 1)).toContain('不能只输出第一组')
+  })
+
   it('assembles M1-M6 in order and keeps the old benchmark only as an appendix', () => {
     const outputs = Object.fromEntries(REPORT_MODULES_V2.map((module) => [module.key, `结果${module.id}`]))
     const report = assembleModuleReport(REPORT_MODULES_V2, outputs, {}, '旧版对标内容')
