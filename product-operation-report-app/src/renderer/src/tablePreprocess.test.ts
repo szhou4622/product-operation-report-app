@@ -92,4 +92,11 @@ describe('local structured table preparation', () => {
     expect(results.every(({ result }) => result.canSkipModel && result.retainedRows === 100)).toBe(true)
     expect(results.every(({ detail }) => (detail?.match(/POR-R-/gu) || []).length === 100)).toBe(true)
   })
+
+  it('classifies product transaction tables as product even when they contain percentage columns', () => {
+    const text = '商品名称,成交金额,退款率,评价好评率\n产品A,1000,2%,98%'
+    const result = preprocessTableForModel(text)
+    expect(result.canSkipModel).toBe(true)
+    expect(result.mode).toBe('product')
+  })
 })

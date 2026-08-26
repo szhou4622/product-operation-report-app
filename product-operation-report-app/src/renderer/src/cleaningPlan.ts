@@ -40,6 +40,7 @@ export interface CleaningPlanSource extends SourceCleanCacheInput {
 }
 
 const SEMANTIC_HEADER = /评论|评价|反馈|用户声音|完整文案|脚本文案|口播文案|口播字幕|字幕|脚本|标题文案|素材文案|内容原文/iu
+const AGGREGATED_METRIC_HEADER = /(?:率|数|量|金额|订单|人数|次数|占比|比例|得分|评分|星级|等级|均值|平均值|ID|编号)$/iu
 const MAX_SILENT_MODEL_BATCHES = 20
 
 function firstTableHeaders(text: string): string[] {
@@ -50,7 +51,7 @@ function firstTableHeaders(text: string): string[] {
 
 export function tableNeedsSemanticModel(text: string): boolean {
   const headers = firstTableHeaders(text)
-  return headers.some((header) => SEMANTIC_HEADER.test(header))
+  return headers.some((header) => SEMANTIC_HEADER.test(header) && !AGGREGATED_METRIC_HEADER.test(header))
 }
 
 function visionCount(source: CleaningPlanSource): number {
@@ -116,5 +117,6 @@ export function buildCleaningPlan(sources: CleaningPlanSource[]): CleaningPlan {
 
 export const cleaningPlanInternals = {
   MAX_SILENT_MODEL_BATCHES,
-  SEMANTIC_HEADER
+  SEMANTIC_HEADER,
+  AGGREGATED_METRIC_HEADER
 }

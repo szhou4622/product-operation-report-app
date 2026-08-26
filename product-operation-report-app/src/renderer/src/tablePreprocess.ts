@@ -150,8 +150,8 @@ function duplicateColumns(headers: string[], body: string[][]): Set<number> {
 function tableMode(headers: string[]): TablePreprocessResult['mode'] {
   const text = headers.join('|')
   if (/3秒|文案|素材|视角分析|内容形式|场景标签|卖点排序/u.test(text)) return 'material'
-  if (/标签类型|人群|画像|年龄|性别|地区|占比|比例/u.test(text)) return 'profile'
   if (/商品|产品|SKU|货品|成交|销售|订单|金额|消耗|曝光|点击|转化|退款/u.test(text)) return 'product'
+  if (/标签类型|人群|画像|年龄|性别|地区|占比|比例/u.test(text)) return 'profile'
   return 'original'
 }
 

@@ -45,4 +45,15 @@ describe('cleaning planner', () => {
     expect(plan.modelFileCount).toBe(0)
     expect(plan.expectedModelJobs).toBe(0)
   })
+
+  it('does not mistake numeric evaluation metrics for raw review text', () => {
+    const text = [
+      '商品名称,成交金额,成交订单数,评价好评率,评价差评率,商品差评订单数,投诉工单量',
+      '产品A,1000,20,98%,2%,1,0',
+      '产品B,800,15,97%,3%,1,0'
+    ].join('\n')
+    const plan = buildCleaningPlan([{ id: 'products', name: '经营版_商品列表.xlsx', kind: 'table', text }])
+    expect(plan.entries[0].method).toBe('local_exact')
+    expect(plan.expectedModelJobs).toBe(0)
+  })
 })

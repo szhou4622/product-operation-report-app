@@ -34,7 +34,7 @@ export interface ModelFallbackDecisionInput {
  */
 export function shouldTryModelFallback(input: ModelFallbackDecisionInput): boolean {
   const taskSpecificProviderRecovery =
-    (input.taskType === 'module_platform_audience' || input.taskType === 'module_audience_sp_scene') &&
+    (input.taskType === 'source_clean' || input.taskType === 'module_platform_audience' || input.taskType === 'module_audience_sp_scene') &&
     input.failureKind === 'provider_error'
   return Boolean(
     input.hasNext &&

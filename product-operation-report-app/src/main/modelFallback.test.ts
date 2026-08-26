@@ -4,6 +4,13 @@ import { shouldTryModelFallback } from './modelFallback'
 describe('task-scoped model fallback', () => {
   it('allows zero-output provider recovery for both audience modules', () => {
     expect(shouldTryModelFallback({
+      taskType: 'source_clean',
+      failureKind: 'provider_error',
+      outputChars: 0,
+      aborted: false,
+      hasNext: true
+    })).toBe(true)
+    expect(shouldTryModelFallback({
       taskType: 'module_platform_audience',
       failureKind: 'provider_error',
       outputChars: 0,
